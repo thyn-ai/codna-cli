@@ -5,10 +5,12 @@ authorization grant), then self-serve onboards the free tier and mints the first
 generic product-onboard route (`POST /v1/products/codna/onboard`). The key is stored in the OS keychain
 as ``CODNA_API_KEY`` (codna.keystore) for control-plane calls.
 
-Unlike telys/algenta, codna's runtime license is **HS256** and its Telys memory runtime is already
-bundled in the wheel (+ the embedded OEM umbrella license), so login does NOT register an RS256
-per-device license or download a runtime — it is purely codna account auth + the API key. BYOK provider
-keys stay local and are handled separately (`codna key`).
+The runtime-provisioning half of `codna login` is deliberately NOT in :func:`login`: that stays
+purely codna account auth + the API key. :func:`run` below (the `codna login` command body) chains
+it with ``telys_onboarding`` (per-device RS256 license + signed runtime install), reusing this
+flow's Supabase access token so the user authorizes ONCE — the uniform fleet model
+(`telys login` / `algenta login` / `sqai login`). BYOK provider keys stay local and are handled
+separately (`codna key`).
 
 Hosts are env-overridable (``CODNA_ACCOUNTS_URL`` / ``CODNA_API_URL``) for staging or a local mock; the
 defaults are the shared accounts portal and codna's public API.
@@ -123,7 +125,12 @@ def onboard(*, api: str, access_token: str) -> str:
 
 # ── orchestration: the whole `codna login` in one call ───────────────────────────────────────────────────
 def login(*, access_token: str | None = None, open_browser: bool = True) -> dict:
-    """Device-login → onboard → store CODNA_API_KEY. Returns a status dict (never echoes the key)."""
+    """Device-login → onboard → store CODNA_API_KEY. Returns a status dict (never echoes the key).
+
+    The dict also carries the device flow's Supabase ``access_token``: ``cmd_login`` reuses it for
+    the same-command runtime provisioning (telys_onboarding) so the user authorizes ONCE. It is a
+    credential — callers must never print, log, or persist it beyond this process.
+    """
     accounts, api = accounts_url(), api_url()
     token = access_token or os.environ.get("CODNA_TOKEN")
     if token:
@@ -147,5 +154,91 @@ def login(*, access_token: str | None = None, open_browser: bool = True) -> dict
         stored = "env (this process) — set CODNA_API_KEY to persist; no OS keychain available"
 
     # Return ONLY where the key was stored (a literal location) — never the key or any prefix derived from
-    # it, so no credential-tainted value can reach a logging sink (CodeQL: clear-text logging of secrets).
-    return {"ok": True, "api_key_stored": stored}
+    # it — plus the device flow's access token for the provisioning step. No credential-tainted value may
+    # reach a logging sink (CodeQL: clear-text logging of sensitive information).
+    return {"ok": True, "api_key_stored": stored, "access_token": token}
+
+
+# ── `codna login` command body (kept here so cli.py stays under the module-size ceiling) ───────────
+def run(args, *, runtime_keys) -> int:
+    """One-time device authorization that ALSO installs the on-device runtime — one command.
+
+    Uniform with `telys login` / `algenta login` / `sqai login`: device-code auth via the accounts
+    portal → self-serve free-tier onboard → the first Codna API key (stored in the OS keychain as
+    CODNA_API_KEY) → a local LLM provider key check so `codna fix` runs on-device → the per-device
+    Telys license + signed memory runtime (telys_onboarding), reusing the SAME device-flow access
+    token so the user authorizes once. After this one command every `codna mcp` tool — including
+    `codna_recall` — works, fully offline thereafter.
+
+    Idempotent: an already fully provisioned device skips re-provisioning (no network). A partial
+    failure (Codna key stored, runtime fetch failed) is completed by re-running `codna login`.
+    Exit codes: 0 = signed in AND provisioned (or already provisioned); 1 = sign-in failed;
+    2 = signed in but runtime provisioning incomplete (needs network on first run — re-run).
+
+    ``runtime_keys`` is the CLI's key-resolution callable (passed in, never imported, so this
+    module stays free of cli.py).
+    """
+    import sys
+
+    try:
+        # The return is bound for exactly one field — the device flow's access token, handed to the
+        # provisioning step below so the user authorizes ONCE. It is a credential and never reaches
+        # output: the status JSON at the end is built from literals + non-secret fields only (the
+        # account key itself is stored by login() and never returned). CodeQL: clear-text logging
+        # of sensitive information.
+        login_result = login(
+            access_token=getattr(args, "token", None),
+            open_browser=not getattr(args, "no_browser", False),
+        )
+    except LoginError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, indent=2), file=sys.stderr)
+        return 1
+
+    # After sign-in, make sure a local LLM provider key exists so `codna fix` can run on-device. The
+    # provider key stays on the machine (OS keychain) — never sent to the cloud (distinct from the account
+    # API key just minted). See `codna key`.
+    from . import byok_cli
+    provider_status = byok_cli.ensure_local_provider_key(
+        interactive=sys.stdin.isatty() and sys.stdout.isatty(),
+        runtime_keys=runtime_keys(include_keychain=False),
+    )
+
+    # The fleet-uniform half: provision the per-device license + signed on-device runtime so
+    # `codna_recall` works after ONE command (not only triage/secure). Already provisioned → an
+    # offline no-op. Offline first run → a clear, actionable error (never a traceback); re-running
+    # resumes provisioning without corrupting state.
+    from . import memory
+    from . import telys_onboarding
+
+    try:
+        provisioning = telys_onboarding.ensure_provisioned(
+            access_token=login_result.get("access_token"),
+            open_browser=not getattr(args, "no_browser", False),
+        )
+    except telys_onboarding.OnboardingError as exc:
+        print(json.dumps({
+            "ok": False,
+            "error": str(exc),
+            "hint": ("You are signed in and your Codna key is stored, but the on-device runtime is "
+                     "not fully provisioned — that step needs network access on this first run. "
+                     "Check your connection and re-run `codna login` (safe to re-run: it finishes "
+                     "provisioning without corrupting state). Everything runs offline after that."),
+        }, indent=2), file=sys.stderr)
+        return 2
+    except memory.CodeMemoryError as exc:
+        # A local runtime misconfig (e.g. TELYS_KERNEL pointing at a missing file, or a corrupt
+        # packaged-runtime manifest): not a network problem — surface the actionable message the
+        # memory layer already wrote, cleanly (never a traceback).
+        print(json.dumps({"ok": False, "error": str(exc)}, indent=2), file=sys.stderr)
+        return 2
+
+    # login() raised on failure and provisioning returned, so reaching here means signed-in AND
+    # provisioned. Report ONLY sign-in + BYOK + non-secret provisioning status — never anything on
+    # the account-key dataflow (login() already stored the key in the keychain; no credential-tainted
+    # value reaches this sink). CodeQL: clear-text logging of sensitive information.
+    print(json.dumps({
+        "ok": True,
+        "provider_key": provider_status,
+        "runtime": provisioning,
+    }, indent=2))
+    return 0

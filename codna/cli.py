@@ -720,44 +720,14 @@ def cmd_status(args) -> int:
 
 
 def cmd_login(args) -> int:
-    """Sign this machine into a Codna account (device-code login) — consistent with telys/algenta.
+    """One-time device authorization that also installs the on-device runtime — one command.
 
-    Device-code auth via the accounts portal → self-serve free-tier onboard → the first Codna API key
-    (stored in the OS keychain as CODNA_API_KEY). Then ensures a local LLM provider key so `codna fix`
-    runs on-device. Codna's Telys memory runtime is bundled in the wheel (+ embedded OEM license), so no
-    separate per-device provisioning is needed.
+    The body lives in ``codna.login.run`` (cli.py is at the module-size ceiling). Exit codes:
+    0 = signed in AND provisioned (or already provisioned); 1 = sign-in failed; 2 = signed in but
+    runtime provisioning incomplete (needs network on first run — re-run).
     """
-    from .login import LoginError, login as codna_login
-
-    try:
-        # Call for effect: stores the account key in the keychain, raises LoginError on failure. The
-        # return (which touches the API-key dataflow) is intentionally NOT bound/logged.
-        codna_login(
-            access_token=getattr(args, "token", None),
-            open_browser=not getattr(args, "no_browser", False),
-        )
-    except LoginError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, indent=2), file=sys.stderr)
-        return 1
-
-    # After sign-in, make sure a local LLM provider key exists so `codna fix` can run on-device. The
-    # provider key stays on the machine (OS keychain) — never sent to the cloud (distinct from the account
-    # API key just minted). See `codna key`.
-    from . import byok_cli
-    provider_status = byok_cli.ensure_local_provider_key(
-        interactive=sys.stdin.isatty() and sys.stdout.isatty(),
-        runtime_keys=_runtime_keys(include_keychain=False),
-    )
-
-    # login() raised on failure, so reaching here means signed-in. Report ONLY sign-in + BYOK status —
-    # never anything on the account-key dataflow (login() already stored the key in the keychain; its
-    # return is deliberately not logged, so no credential-tainted value reaches this sink). CodeQL:
-    # clear-text logging of sensitive information.
-    print(json.dumps({
-        "ok": True,
-        "provider_key": provider_status,
-    }, indent=2))
-    return 0
+    from .login import run as login_run
+    return login_run(args, runtime_keys=_runtime_keys)
 
 
 def cmd_doctor(args) -> int:
@@ -936,7 +906,7 @@ def build_parser() -> argparse.ArgumentParser:
     _register_ci(sub)
     _register_report(sub)
 
-    pl = sub.add_parser("login", help="Sign this machine into a Codna account (device-code login).")
+    pl = sub.add_parser("login", help="Authorize this device and install the on-device runtime (one-time, free).")
     pl.add_argument("--token", help="headless access token (or env CODNA_TOKEN) — skips the browser step")
     pl.add_argument("--no-browser", dest="no_browser", action="store_true",
                     help="do not open a browser; print the verification URL + code to authorize elsewhere")

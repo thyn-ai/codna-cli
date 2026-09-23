@@ -178,13 +178,15 @@ def test_kernel_and_runtime_hints_point_at_codna_login():
 # ---- cli `codna login` -------------------------------------------------------------------------
 
 def test_cmd_login_prints_ok_and_no_raw_key(monkeypatch, capsys):
-    # `codna login` is now codna's own device-code account login (codna.login), not telys onboarding.
+    # `codna login` is codna's own device-code account login (codna.login) PLUS runtime provisioning
+    # (telys_onboarding.ensure_provisioned) — both seams faked here.
     from codna import cli
     from codna import keystore
 
     def fake_login(*, access_token, open_browser):
         # returns where the account key was stored — never key material to the caller/output.
-        return {"ok": True, "api_key_prefix": "ak_…", "api_key_stored": "keychain"}
+        return {"ok": True, "api_key_prefix": "ak_…", "api_key_stored": "keychain",
+                "access_token": "supa-jwt"}
 
     def forbidden_keychain_read():
         raise AssertionError("codna login status reporting must not read OS keychain secrets")
@@ -192,6 +194,10 @@ def test_cmd_login_prints_ok_and_no_raw_key(monkeypatch, capsys):
     monkeypatch.setattr("codna.login.login", fake_login)
     monkeypatch.setattr(keystore, "config_values", forbidden_keychain_read)
     monkeypatch.setattr("codna.byok_cli.ensure_local_provider_key", lambda **kwargs: "present")
+    monkeypatch.setattr(
+        "codna.telys_onboarding.ensure_provisioned",
+        lambda **kwargs: {"provisioned": True, "already_provisioned": True},
+    )
 
     args = SimpleNamespace(token=None, no_browser=True)
     rc = cli.cmd_login(args)
@@ -199,9 +205,11 @@ def test_cmd_login_prints_ok_and_no_raw_key(monkeypatch, capsys):
     assert rc == 0
     assert '"ok": true' in out
     assert "provider_key" in out   # BYOK status; the account-key dataflow is never printed
+    assert "runtime" in out        # provisioning status is reported (non-secret fields only)
     # never echo anything key-derived (CodeQL: clear-text logging of sensitive info)
     assert "ak_" not in out
     assert "api_key" not in out
+    assert "supa-jwt" not in out   # the device-flow access token is never printed either
 
 
 def test_cmd_login_reports_login_error(monkeypatch, capsys):
@@ -211,7 +219,11 @@ def test_cmd_login_reports_login_error(monkeypatch, capsys):
     def fake_login(**kwargs):
         raise LoginError("device authorization failed: invalid_client")
 
+    def provisioning_must_not_run(**kwargs):
+        raise AssertionError("sign-in failed — runtime provisioning must not be attempted")
+
     monkeypatch.setattr("codna.login.login", fake_login)
+    monkeypatch.setattr("codna.telys_onboarding.ensure_provisioned", provisioning_must_not_run)
     args = SimpleNamespace(token=None, no_browser=True)
     rc = cli.cmd_login(args)
     err = capsys.readouterr().err

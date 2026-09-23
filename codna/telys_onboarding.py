@@ -100,7 +100,10 @@ def run_login(
     except getattr(telys_login, "LoginError", Exception) as exc:
         raise OnboardingError(f"Codna device authorization failed: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - surface any onboarding failure with remediation
-        raise OnboardingError(f"Codna device authorization failed: {type(exc).__name__}: {exc}") from exc
+        # Non-LoginError failures past the auth step are provisioning failures (the signed-runtime
+        # download/verify, e.g. telys.installer.InstallError "could not reach install host" when
+        # offline) — name them accurately so `codna login` can point at the network, not at auth.
+        raise OnboardingError(f"Codna runtime provisioning failed: {type(exc).__name__}: {exc}") from exc
 
     # Make the device license discoverable by codna.memory in this process (belt-and-suspenders; the
     # cross-process default is the codna:onboarding-license source in memory._configured_license_token).
@@ -108,6 +111,58 @@ def run_login(
     if lic.is_file():
         os.environ.setdefault("CODNA_TELYS_LICENSE_PATH", str(lic))
     return result
+
+
+def provision_status() -> dict:
+    """Offline, non-raising precheck: does this device already have a Telys license + a resolvable
+    kernel? Same two memory seams :func:`ensure_licensed` uses, but safe to call anywhere — no
+    network, no device flow, no raise. ``codna login`` uses it to stay idempotent: an already
+    fully provisioned device skips re-provisioning (and its download) entirely."""
+    from codna import memory
+
+    try:
+        token, source = memory._configured_license_token()
+    except memory.CodeMemoryError:
+        token, source = None, None
+    kernel = memory._resolve_telys_kernel(configure_env=False)
+    return {
+        "provisioned": bool(token and kernel.get("found")),
+        "license_source": source if token else None,
+        "kernel_source": kernel.get("source") if kernel.get("found") else None,
+    }
+
+
+def ensure_provisioned(*, access_token: str | None = None, plan: str = _DEFAULT_PLAN,
+                       open_browser: bool | None = None) -> dict:
+    """Guarantee this device has its per-device license AND the signed on-device runtime.
+
+    This is the provisioning half of `codna login` — the uniform fleet model (`telys login` /
+    `algenta login` / `sqai login` all authorize AND provision in one command). When the device is
+    already fully provisioned this is a pure offline status read (no network). Otherwise it runs
+    :func:`run_login`, reusing ``access_token`` from the codna device flow so the user authorizes
+    ONCE, and downloads the runtime only when no kernel already resolves. Re-running after a
+    partial failure is safe: the flow re-mints the device credentials and the runtime installer
+    promotes atomically, so a second `codna login` completes provisioning without corrupting state.
+
+    Returns a non-secret status dict (safe to print). Raises :class:`OnboardingError` with
+    remediation when provisioning cannot complete (e.g. offline first run).
+    """
+    status = provision_status()
+    if status["provisioned"]:
+        status["already_provisioned"] = True
+        return status
+    result = run_login(
+        token=access_token,
+        plan=plan,
+        install=status["kernel_source"] is None,
+        open_browser=open_browser,
+    )
+    return {
+        "provisioned": True,
+        "already_provisioned": False,
+        "runtime_installed": bool(result.get("installed")),
+        "tier": result.get("tier"),
+    }
 
 
 def ensure_licensed(*, allow_interactive_login: bool = False) -> dict:
@@ -120,13 +175,9 @@ def ensure_licensed(*, allow_interactive_login: bool = False) -> dict:
     """
     from codna import memory
 
-    try:
-        token, source = memory._configured_license_token()
-    except memory.CodeMemoryError:
-        token, source = None, None
-    kernel = memory._resolve_telys_kernel(configure_env=False)
-    if token and kernel.get("found"):
-        return {"provisioned": True, "license_source": source, "kernel_source": kernel.get("source")}
+    status = provision_status()
+    if status["provisioned"]:
+        return status
 
     if allow_interactive_login:
         import sys

@@ -66,7 +66,7 @@ crashes the server:
 | --- | --- | --- |
 | `codna_triage` | Understand a repo and locate the code relevant to an issue. Deterministic, 0 LLM tokens. | free `codna login` |
 | `codna_secure` | Prove which SARIF scanner findings (CodeQL, Semgrep, Snyk, Trivy) are reachable. Read-only, 0 LLM tokens. | free `codna login` |
-| `codna_recall` | Recall code from local on-device memory — semantic + lexical search, fully offline. | free `codna login` (+ on-device runtime from the login-gated install) |
+| `codna_recall` | Recall code from local on-device memory — semantic + lexical search, fully offline. | free `codna login` (which also installs the on-device runtime) |
 | `codna_fix` | Root-cause and plan a fix (read-only by default); with `open_pr=true` pushes a branch and opens a real PR. | free `codna login` + provider key (BYOK; + `GITHUB_TOKEN` for `open_pr=true`) |
 | `codna_report_bug` | File a bug, feature, or question to thyn-ai/feedback. | free `codna login` + `GITHUB_TOKEN` (else returns a pre-filled URL) |
 
@@ -74,15 +74,15 @@ Introspection (`initialize`/`tools/list`) needs no credentials. Executing any of
 requires the one-time free community login (`codna login` — device authorization, free community
 license) — fully offline thereafter. `codna_fix` additionally needs a provider key (BYOK, e.g.
 `ANTHROPIC_API_KEY`); `codna_report_bug` needs `GITHUB_TOKEN` or it returns a pre-filled issue
-URL; `codna_recall` additionally uses the on-device memory runtime from the login-gated install.
+URL; `codna_recall` additionally uses the on-device memory runtime that the same `codna login`
+installs.
 Full reference:
 [docs.codna.ai/guides/mcp](https://docs.codna.ai/guides/mcp).
 
 ## Code memory
 
 Code memory and recall run on your machine after a one-time free `codna login` (device
-authorization); the signed on-device runtime arrives via the login-gated install. From then on,
-recall runs fully
+authorization), which also installs the signed on-device runtime. From then on, recall runs fully
 offline: no key, no network calls. The optional
 `codna[memory]` extra adds the on-device semantic reranker; without it, recall ranks lexically.
 
