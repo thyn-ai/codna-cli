@@ -66,17 +66,23 @@ crashes the server:
 | --- | --- | --- |
 | `codna_triage` | Understand a repo and locate the code relevant to an issue. Deterministic, 0 LLM tokens. | none |
 | `codna_secure` | Prove which SARIF scanner findings (CodeQL, Semgrep, Snyk, Trivy) are reachable. Read-only, 0 LLM tokens. | none |
-| `codna_recall` | Recall code from local on-device memory — semantic + lexical search, fully offline. | none |
+| `codna_recall` | Recall code from local on-device memory — semantic + lexical search, fully offline. | no key — one-time free `codna login` (device authorization) |
 | `codna_fix` | Root-cause and plan a fix (read-only by default); with `open_pr=true` pushes a branch and opens a real PR. | provider key (+ `GITHUB_TOKEN` for `open_pr=true`) |
 | `codna_report_bug` | File a bug, feature, or question to thyn-ai/feedback. | `GITHUB_TOKEN` (else returns a pre-filled URL) |
 
-**3 of 5 tools need no key at all** — `codna_triage`, `codna_secure` and `codna_recall` run with
-zero credentials and zero network calls. Full reference:
+Introspection (`initialize`/`tools/list`) needs no credentials. Executing tools requires a free
+community login (`codna login` — one-time device authorization that installs the on-device
+runtime) — fully offline thereafter. Zero-credential exceptions: `codna_triage` and
+`codna_secure` run fully local with no login and no key. `codna_fix` additionally needs a
+provider key (BYOK, e.g. `ANTHROPIC_API_KEY`); `codna_report_bug` needs `GITHUB_TOKEN` or it
+returns a pre-filled issue URL. Full reference:
 [docs.codna.ai/guides/mcp](https://docs.codna.ai/guides/mcp).
 
 ## Code memory
 
-Code memory and recall run on your machine with no login and no extra install. The optional
+Code memory and recall run on your machine after a one-time free `codna login` (device
+authorization — it provisions the signed on-device runtime). From then on, recall runs fully
+offline: no key, no network calls. The optional
 `codna[memory]` extra adds the on-device semantic reranker; without it, recall ranks lexically.
 
 ## What leaves your machine

@@ -289,7 +289,9 @@ def _build_server():
         Use when you need the code behind a concept ("where is SARIF provenance validated?")
         rather than a whole-repo map (codna_triage) — and when you want it offline. The index
         is built on first use (an empty index auto-indexes the repo, once) and is stored
-        outside the git checkout.
+        outside the git checkout. On a fresh machine, first use requires the one-time free
+        `codna login` device authorization (it provisions the on-device memory runtime);
+        after that, recall is fully offline with no key and no network calls.
 
         repo: a local path or git URL (default: current directory, or the server default set
           by `codna mcp start --repo`).

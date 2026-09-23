@@ -583,6 +583,30 @@ def _terminal_states_meaning_success(task_kind: str) -> set[str]:
     return {"succeeded"}
 
 
+_MISSING_PROVIDER_KEY_RE = re.compile(r"no API key in env for '([^']+)' \(tried: ([^)]+)\)")
+
+
+def _run_failed_message(error: object, *, task_kind: str) -> str:
+    """Message for `agent_core_run_failed` — actionable when the cause is known.
+
+    The common fresh-machine failure is a missing BYOK provider key: agent-core's provider
+    adapter aborts the run and the final frame carries
+    "no API key in env for '<provider>' (tried: <ENV_NAMES>)". Name the fix instead of hiding
+    it behind the generic line. The code and details payload are unchanged either way, and any
+    other failure keeps the original message verbatim.
+    """
+    if isinstance(error, str):
+        missing_key = _MISSING_PROVIDER_KEY_RE.search(error)
+        if missing_key:
+            provider, env_names = missing_key.group(1), missing_key.group(2)
+            return (
+                f"codna {task_kind} needs a provider key — set {env_names} (or store one with "
+                f"`codna key set {provider}`, or configure another provider). The local engine "
+                "itself needs no login."
+            )
+    return "Local agent-core did not complete the packaged fix run successfully."
+
+
 def _parse_final_frame(body: str, *, sidecar_url: str, task_kind: str = "fix") -> dict[str, Any]:
     final: dict[str, Any] | None = None
     for line in body.splitlines():
@@ -610,7 +634,7 @@ def _parse_final_frame(body: str, *, sidecar_url: str, task_kind: str = "fix") -
     if terminal_state not in accepted and status not in {"succeeded", "success", "completed"}:
         raise PackagedRepositoryAdvancedError(
             "agent_core_run_failed",
-            "Local agent-core did not complete the packaged fix run successfully.",
+            _run_failed_message(final.get("error"), task_kind=task_kind),
             {
                 "sidecar_url": sidecar_url,
                 "status": status,

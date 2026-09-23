@@ -27,7 +27,7 @@
       "environmentVariables": [
         {
           "name": "ANTHROPIC_API_KEY",
-          "description": "Provider key for codna_fix's planner (or store one with `codna key set`). codna_triage, codna_secure and codna_recall need no key at all.",
+          "description": "Provider key for codna_fix's planner (or store one with `codna key set`). codna_triage and codna_secure need no key at all; codna_recall needs no key but requires the one-time free `codna login` device authorization.",
           "isRequired": false,
           "isSecret": true
         },
