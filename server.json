@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://codna.ai",
-  "version": "0.2.83",
+  "version": "0.2.84",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "codna",
-      "version": "0.2.83",
+      "version": "0.2.84",
       "transport": {
         "type": "stdio"
       },
