@@ -14,7 +14,28 @@ import json
 import os
 from pathlib import Path
 
-from .cli import _client, _dump, _register
+from .cli import _api_key, _client, _dump, _register, _runtime_keys
+
+LOGIN_REQUIRED_MESSAGE = (
+    "requires the one-time free `codna login` device authorization (free community license); "
+    "run `codna login` once — fully offline thereafter"
+)
+
+
+def _login_required_error(tool: str) -> str | None:
+    """Uniform execution gate: every MCP tool call requires the free community login.
+
+    All codna tools execute under the same licensing model (algenta house pattern — sqai returns
+    `login_required`, algenta-mcp an auth error; introspection stays credential-free, execution
+    needs the login). The `codna login` artifact is the codna account key, resolved through the
+    same key layer the CLI/status paths use: env first, then the OS keychain via the non-secret
+    name index (a clean machine is never prompted), never the network — offline after the one
+    login. The key's presence proves the login state; it is not validated against the control
+    plane (offline by design). Returns the structured error line, or None when authorized.
+    """
+    if _api_key(_runtime_keys(include_keychain=True)):
+        return None
+    return f"{tool} error: {LOGIN_REQUIRED_MESSAGE}"
 
 
 def _default_repo(repo: str) -> str:
@@ -44,6 +65,9 @@ def _mcp_memory_db_path(repo: str) -> str:
 def recall_json(repo: str = ".", query: str = "", service: str = "", language: str = "",
                 final_k: int = 8) -> str:
     """Return local Telys memory recall as JSON without crashing the MCP server."""
+    gate = _login_required_error("codna_recall")
+    if gate:
+        return gate
     if not query:
         return "codna_recall error: query is required"
     repo = _default_repo(repo)
@@ -69,6 +93,9 @@ def report_bug_json(
     """File a report to thyn-ai/feedback and return the result as JSON, without crashing the MCP
     server. Same submission path `codna report` (the CLI) uses, so an agent and a human land in
     the same place with the same fields."""
+    gate = _login_required_error("codna_report_bug")
+    if gate:
+        return gate
     if not title:
         return "codna_report_bug error: title is required"
     try:
@@ -90,6 +117,9 @@ def secure_json(repo: str = ".", sarif_path: str = "", ref: str = "") -> str:
 
     MCP secure is read-only and local by default: it must not start or depend on the agent sidecar.
     """
+    gate = _login_required_error("codna_secure")
+    if gate:
+        return gate
     del ref  # local reference classification is SARIF-only; repo is included for caller traceability.
     repo = _default_repo(repo)
     try:
@@ -134,6 +164,9 @@ def fix_json(
     runs it in a worker thread so local repository-intelligence calls can safely use their own
     event loop internally.
     """
+    gate = _login_required_error("codna_fix")
+    if gate:
+        return gate
     repo = _default_repo(repo)
     try:
         c = _client(include_keychain=True)
@@ -212,10 +245,16 @@ def _build_server():
     def codna_triage(repo: str = ".", issue: str = "") -> str:
         """Understand a repository and locate the code relevant to an issue.
 
+        Requires the one-time free `codna login` device authorization (free community
+        license); fully offline thereafter.
+
         repo: a local path or a git URL (default: current directory).
         issue: optional description of what you're looking for.
         Returns suspect files + the context-reduction the engine achieved (0 LLM tokens).
         """
+        gate = _login_required_error("codna_triage")
+        if gate:
+            return gate
         repo = _default_repo(repo)
         try:
             c = _client()
@@ -246,6 +285,10 @@ def _build_server():
     ) -> str:
         """Find and fix a bug. Runs the full Codna agent + engine + risk simulation.
 
+        Requires the one-time free `codna login` device authorization (free community
+        license) plus a provider key (BYOK — e.g. ANTHROPIC_API_KEY or `codna key set
+        anthropic`); fully offline thereafter.
+
         repo: a local path or a git URL. issue: what's broken (e.g. the failing test).
         model: optional provider-qualified model such as openai/gpt-5.
         open_pr: when false (default) this is READ-ONLY — returns the plan (root cause, confidence,
@@ -268,6 +311,9 @@ def _build_server():
         Semgrep / Snyk / Trivy), classifies each finding (exploitable / production-reachable /
         unreachable / unknown) via the engine, and reports which are autofix-eligible.
         Read-only and 0 LLM tokens. `sarif_path` is required.
+
+        Requires the one-time free `codna login` device authorization (free community
+        license); fully offline thereafter.
         """
         return secure_json(repo, sarif_path, ref)
 
@@ -290,8 +336,9 @@ def _build_server():
         rather than a whole-repo map (codna_triage) — and when you want it offline. The index
         is built on first use (an empty index auto-indexes the repo, once) and is stored
         outside the git checkout. On a fresh machine, first use requires the one-time free
-        `codna login` device authorization (it provisions the on-device memory runtime);
-        after that, recall is fully offline with no key and no network calls.
+        `codna login` device authorization (free community license); the on-device memory
+        runtime arrives via the login-gated runtime install. After that, recall is fully
+        offline with no key and no network calls.
 
         repo: a local path or git URL (default: current directory, or the server default set
           by `codna mcp start --repo`).
@@ -321,6 +368,9 @@ def _build_server():
     ) -> str:
         """File a report to thyn-ai/feedback — the public front door for algenta, codna, telys,
         and sqai. Files the same shape of issue `codna report` (the CLI) does.
+
+        Requires the one-time free `codna login` device authorization (free community
+        license); auto-filing additionally needs a GitHub token (else a pre-filled URL).
 
         title: a short summary, e.g. "codna fix hangs on a monorepo".
         body: what happened, or what you want — as much detail as you have.

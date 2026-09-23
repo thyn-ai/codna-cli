@@ -27,7 +27,7 @@
       "environmentVariables": [
         {
           "name": "ANTHROPIC_API_KEY",
-          "description": "Provider key for codna_fix's planner (or store one with `codna key set`). codna_triage and codna_secure need no key at all; codna_recall needs no key but requires the one-time free `codna login` device authorization.",
+          "description": "Provider key for codna_fix's planner (or store one with `codna key set`). Every tool also requires the one-time free `codna login` device authorization; codna_triage, codna_secure and codna_recall then need no key at all.",
           "isRequired": false,
           "isSecret": true
         },
@@ -39,7 +39,7 @@
         },
         {
           "name": "CODNA_API_KEY",
-          "description": "Codna key, needed only when Codna is pointed at a remote engine. Local runs need none.",
+          "description": "Codna key from the one-time free `codna login` (device authorization, free community license). Required to execute any of the five tools; introspection (initialize/tools/list) needs none.",
           "isRequired": false,
           "isSecret": true
         }

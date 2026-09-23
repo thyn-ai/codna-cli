@@ -62,26 +62,27 @@ codna mcp install --client cursor     # optional: write the client config for yo
 Five tools, each returning JSON; a failure comes back as `codna_<tool> error: …` text and never
 crashes the server:
 
-| Tool | What it does | Key needed |
+| Tool | What it does | Needs |
 | --- | --- | --- |
-| `codna_triage` | Understand a repo and locate the code relevant to an issue. Deterministic, 0 LLM tokens. | none |
-| `codna_secure` | Prove which SARIF scanner findings (CodeQL, Semgrep, Snyk, Trivy) are reachable. Read-only, 0 LLM tokens. | none |
-| `codna_recall` | Recall code from local on-device memory — semantic + lexical search, fully offline. | no key — one-time free `codna login` (device authorization) |
-| `codna_fix` | Root-cause and plan a fix (read-only by default); with `open_pr=true` pushes a branch and opens a real PR. | provider key (+ `GITHUB_TOKEN` for `open_pr=true`) |
-| `codna_report_bug` | File a bug, feature, or question to thyn-ai/feedback. | `GITHUB_TOKEN` (else returns a pre-filled URL) |
+| `codna_triage` | Understand a repo and locate the code relevant to an issue. Deterministic, 0 LLM tokens. | free `codna login` |
+| `codna_secure` | Prove which SARIF scanner findings (CodeQL, Semgrep, Snyk, Trivy) are reachable. Read-only, 0 LLM tokens. | free `codna login` |
+| `codna_recall` | Recall code from local on-device memory — semantic + lexical search, fully offline. | free `codna login` (+ on-device runtime from the login-gated install) |
+| `codna_fix` | Root-cause and plan a fix (read-only by default); with `open_pr=true` pushes a branch and opens a real PR. | free `codna login` + provider key (BYOK; + `GITHUB_TOKEN` for `open_pr=true`) |
+| `codna_report_bug` | File a bug, feature, or question to thyn-ai/feedback. | free `codna login` + `GITHUB_TOKEN` (else returns a pre-filled URL) |
 
-Introspection (`initialize`/`tools/list`) needs no credentials. Executing tools requires a free
-community login (`codna login` — one-time device authorization that installs the on-device
-runtime) — fully offline thereafter. Zero-credential exceptions: `codna_triage` and
-`codna_secure` run fully local with no login and no key. `codna_fix` additionally needs a
-provider key (BYOK, e.g. `ANTHROPIC_API_KEY`); `codna_report_bug` needs `GITHUB_TOKEN` or it
-returns a pre-filled issue URL. Full reference:
+Introspection (`initialize`/`tools/list`) needs no credentials. Executing any of the five tools
+requires the one-time free community login (`codna login` — device authorization, free community
+license) — fully offline thereafter. `codna_fix` additionally needs a provider key (BYOK, e.g.
+`ANTHROPIC_API_KEY`); `codna_report_bug` needs `GITHUB_TOKEN` or it returns a pre-filled issue
+URL; `codna_recall` additionally uses the on-device memory runtime from the login-gated install.
+Full reference:
 [docs.codna.ai/guides/mcp](https://docs.codna.ai/guides/mcp).
 
 ## Code memory
 
 Code memory and recall run on your machine after a one-time free `codna login` (device
-authorization — it provisions the signed on-device runtime). From then on, recall runs fully
+authorization); the signed on-device runtime arrives via the login-gated install. From then on,
+recall runs fully
 offline: no key, no network calls. The optional
 `codna[memory]` extra adds the on-device semantic reranker; without it, recall ranks lexically.
 

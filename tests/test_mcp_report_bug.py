@@ -8,6 +8,12 @@ import pytest
 from codna import mcp_server, report_cli
 
 
+@pytest.fixture(autouse=True)
+def _authorized_device(monkeypatch):
+    """The uniform execution gate requires the free `codna login`; run these tests authorized."""
+    monkeypatch.setenv("CODNA_API_KEY", "test-device-login")
+
+
 def _mcp_available() -> bool:
     try:
         import mcp.server.fastmcp  # noqa: F401

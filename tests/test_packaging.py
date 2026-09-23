@@ -83,7 +83,7 @@ def test_cli_readme_documents_base_codna_telys_install_contract():
 
     assert 'pip install "codna[memory]"' not in readme
     assert "pip install codna" in readme
-    assert "one-time free `codna login`" in readme
+    assert "requires the one-time free community login" in readme
     assert "Code memory and recall run on your machine" in readme
 
 

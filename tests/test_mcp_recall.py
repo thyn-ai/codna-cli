@@ -9,6 +9,12 @@ import pytest
 from codna.mcp_server import recall_json   # import does NOT pull in `mcp` or `telys`
 
 
+@pytest.fixture(autouse=True)
+def _authorized_device(monkeypatch):
+    """The uniform execution gate requires the free `codna login`; run these tests authorized."""
+    monkeypatch.setenv("CODNA_API_KEY", "test-device-login")
+
+
 # ── offline: the guard + friendly failure (no mcp, no telys needed) ───────────────────────────────
 def test_recall_requires_query():
     assert recall_json(query="") == "codna_recall error: query is required"

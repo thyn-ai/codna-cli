@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from codna import cli, mcp_server
+
+
+@pytest.fixture(autouse=True)
+def _authorized_device(monkeypatch):
+    """The uniform execution gate requires the free `codna login`; run these tests authorized."""
+    monkeypatch.setenv("CODNA_API_KEY", "test-device-login")
 
 
 def _write_sarif(path):

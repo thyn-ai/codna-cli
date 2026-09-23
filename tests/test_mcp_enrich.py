@@ -12,6 +12,12 @@ pytest.importorskip("mcp.server.fastmcp")
 from codna.mcp_server import _build_server  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _authorized_device(monkeypatch):
+    """The uniform execution gate requires the free `codna login`; run these tests authorized."""
+    monkeypatch.setenv("CODNA_API_KEY", "test-device-login")
+
+
 def test_readonly_annotations():
     s = _build_server()
     tools = {t.name: t for t in asyncio.run(s.list_tools())}
