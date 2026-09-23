@@ -100,5 +100,5 @@ offline: no key, no network calls. The optional
 
 - Homepage: https://codna.ai
 - Documentation: https://docs.codna.ai
-- Source: https://github.com/thyn-ai/codna
+- Source (public mirror): https://github.com/thyn-ai/codna-cli
 - Security: https://codna.ai/security
