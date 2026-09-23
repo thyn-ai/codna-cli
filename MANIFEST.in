@@ -1,0 +1,15 @@
+exclude codna/_telys_runtime/libame_kernel.*
+exclude codna/_telys_runtime/lib*.dylib
+exclude codna/_telys_runtime/lib*.so
+exclude codna/_telys_runtime/*.dll
+exclude codna/_telys_runtime/manifest.json
+exclude codna/_telys_runtime/oem-license.jwt
+recursive-exclude codna/_telys_runtime libame_kernel.* lib*.dylib lib*.so *.dll manifest.json oem-license.jwt
+exclude codna/_agent_core_runtime/codna-sidecar
+exclude codna/_agent_core_runtime/codna-sidecar.exe
+recursive-exclude codna/_agent_core_runtime codna-sidecar codna-sidecar.exe
+recursive-exclude .codna *
+recursive-exclude .codna-memory *
+recursive-exclude codna __pycache__ *.py[cod] *.pyo
+global-exclude __pycache__ *.py[cod] *.pyo
+global-exclude keys.txt .keys.txt .env .env.* *.log *.pem *.key *.jwt local-stack.json launcher.state

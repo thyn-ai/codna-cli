@@ -1,0 +1,10 @@
+{
+  "model_label": "claude-sonnet-4-6",
+  "rows": [
+    {"repo": "requests", "symbol": "HTTPAdapter, send (+6)", "blast": "low", "confidence": "55%", "regression": "95%", "context": "156,993 → 5,934 tokens (26× smaller)", "agent": "claude-sonnet-4-6", "cost": "$0.936", "time": "108s", "patch": "patch_ac8ad4e26c9b3364c99f7979", "status": "ok"},
+    {"repo": "click", "symbol": "_NamedTextIOWrapper, make_input_stream, mode", "blast": "low", "confidence": "55%", "regression": "47%", "context": "290,110 → 5,261 tokens (55× smaller)", "agent": "claude-sonnet-4-6", "cost": "$4.965", "time": "2192s", "patch": "patch_21c7aa3247a6238094cee5d0", "status": "ok"},
+    {"repo": "flask", "symbol": "get_debug_flag", "blast": "low", "confidence": "55%", "regression": "21%", "context": "288,845 → 5,769 tokens (50× smaller)", "agent": "claude-sonnet-4-6", "cost": "$0.282", "time": "40s", "patch": "patch_92af1681a7ebaf91d4ab44aa", "status": "ok"},
+    {"repo": "httpx", "symbol": "—", "blast": "—", "confidence": "—", "regression": "—", "context": "—", "agent": "—", "cost": "—", "time": "2409s", "patch": "—", "status": "exit 1"},
+    {"repo": "rich", "symbol": "get_character_cell_size", "blast": "high", "confidence": "55%", "regression": "95%", "context": "976,796 → 5,036 tokens (194× smaller)", "agent": "claude-sonnet-4-6", "cost": "$0.135", "time": "38s", "patch": "patch_5eb8383f210aad8a33b53a1d", "status": "ok"}
+  ]
+}

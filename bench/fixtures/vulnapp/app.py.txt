@@ -1,0 +1,40 @@
+"""A deliberately vulnerable Flask app — the security-benchmark fixture.
+
+Three live HTTP routes, each with a classic taint vulnerability where user input flows
+straight into a dangerous sink. Because the file is a conventional Flask entrypoint
+(``app.py``) with ``@app.route`` handlers, the engine's entrypoint-reachability proves
+all three are PRODUCTION-REACHABLE. (Contrast: legacy.py holds the same class of bug in a
+function no route calls — it must NOT be production-reachable.)
+
+NOT a real service. Do not deploy. The vulnerabilities are intentional test material.
+"""
+
+import os
+import sqlite3
+import subprocess
+
+from flask import Flask, request, send_file
+
+app = Flask(__name__)
+
+
+@app.route("/orders")
+def orders():
+    """SQL injection: user 'id' is concatenated straight into the query string."""
+    oid = request.args.get("id", "")
+    cur = sqlite3.connect("shop.db").cursor()
+    return str(cur.execute("SELECT * FROM orders WHERE id = '" + oid + "'").fetchall())
+
+
+@app.route("/ping")
+def ping():
+    """Command injection: user 'host' is passed to a shell."""
+    host = request.args.get("host", "")
+    return subprocess.check_output("ping -c1 " + host, shell=True)
+
+
+@app.route("/invoice")
+def invoice():
+    """Path traversal: user 'name' is joined into a file path and served."""
+    name = request.args.get("name", "")
+    return send_file(os.path.join("/srv/invoices", name))

@@ -1,0 +1,8 @@
+# Allowlist for the public thyn-ai/codna-cli mirror scan (blocking gate in
+# .github/workflows/sync-public-codna-cli.yml). Mirrored verbatim to the export root.
+# One entry: tests/test_workflows.py embeds a SYNTHETIC RSA key (64 bytes of made-up base64)
+# to prove codna redacts private keys from reports — it is not a real key.
+[allowlist]
+description = "codna-cli public mirror export allowlist"
+paths = ['''tests/test_workflows\.py''']
+rules = ["private-key"]

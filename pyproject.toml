@@ -1,0 +1,137 @@
+[project]
+name = "codna"
+version = "0.2.81"
+description = "Understand. Fix. Evolve. Codna maps your repository before it spends a token, reviews pull requests, fixes bugs and proves which scanner findings are reachable. Runs on your machine."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Thyn" }]
+maintainers = [{ name = "Thyn" }]
+keywords = [
+  "agent",
+  "ai",
+  "code-intelligence",
+  "codna",
+  "debugging",
+  "mcp",
+  "repository-intelligence",
+  "telys",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Bug Tracking",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Software Development :: Testing",
+  "Typing :: Typed",
+]
+# Public install dependencies only. The CLI talks to Codna's local SDK/core in
+# process by default and uses HTTP only for explicit remote overrides.
+# keyring: on-device OS keychain for local BYOK (the user's LLM provider key stays on the machine,
+# never sent to the cloud). Pure-Python + cross-platform; degrades gracefully with no backend.
+# pyyaml: parse codna.yaml (model/privacy config). Optional-with-JSON-fallback in code, but shipped so
+# the documented YAML config works out of the box.
+dependencies = [
+  "httpx>=0.28.0",
+  "keyring>=24",
+  "numpy>=1.24",
+  "pydantic>=2.6",
+  "pyarrow>=17.0.0",
+  "pyyaml>=6",
+  "telys>=0.1.0b1",
+  # defusedxml: `codna fix --tests` / `--from-junit` parse a JUnit report produced by an untrusted
+  # repo's test run; defusedxml rejects entity declarations (XXE / billion laughs) that the
+  # stdlib parser would expand.
+  "defusedxml>=0.7.1",
+  # Base `pip install codna` must not degrade local Telys recall to Python-only.
+  # These wheels power one generic structural extractor for common code languages.
+  "tree-sitter>=0.23",
+  "tree-sitter-javascript",
+  "tree-sitter-typescript",
+  "tree-sitter-go",
+  "tree-sitter-rust",
+  "tree-sitter-java",
+  "tree-sitter-c",
+  "tree-sitter-cpp",
+  "tree-sitter-c-sharp",
+  "tree-sitter-php",
+  "tree-sitter-ruby",
+]
+
+[project.optional-dependencies]
+# MCP server channel (`codna mcp`). Kept OUT of the base install because the `mcp`
+# package pulls a web stack (starlette/uvicorn/sse-starlette/anyio) that a plain
+# `pip install codna` doesn't need and that can clash with a user's existing
+# starlette/fastapi. `codna mcp` prints an install hint if this extra is missing.
+mcp = ["mcp>=1.2.0,<2"]
+# Operator-only extra for the hosted GitHub App server. Kept OUT of the base install:
+# `pip install codna` never needs it.
+webhook = ["psycopg[binary]>=3.2", "psycopg_pool>=3.2"]
+# Local, in-process code memory & recall via Telys. Base `codna` includes the
+# public SDK, Codna's vendored local runtime package, the OEM license, and the
+# multi-language tree-sitter extractors. This extra adds heavier optional
+# retrieval/rerank packages for experiments.
+memory = [
+  "faiss-cpu>=1.7",
+  "wordllama>=0.3",   # on-device semantic reranker: the DEFAULT recall blend (alpha 0.7) uses it
+]
+# OPTIONAL on-device semantic precision reranker (CODNA_MEMORY_RERANK=wordllama). 16 MB CPU model; imported
+# lazily by codna.memory — only needed when reranking is enabled. Lifts ranking precision over lexical fusion.
+memory-rerank = [
+  "wordllama>=0.3",
+]
+# Backward-compatible extra name for older docs/scripts. These dependencies are
+# now also in base `codna` so normal installs get multi-language local memory.
+memory-languages = [
+  "tree-sitter>=0.23",
+  "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-go", "tree-sitter-rust",
+  "tree-sitter-java", "tree-sitter-c", "tree-sitter-cpp", "tree-sitter-c-sharp",
+  "tree-sitter-php", "tree-sitter-ruby",
+]
+
+# Local cross-repo dev: resolve the Telys public SDK from the sibling checkout.
+# uv reads this; pip ignores it. The runtime remains an explicit release staging step.
+# cli/ is two levels under Developer/, hence ../../.
+[tool.uv.sources]
+telys = { path = "../../memory-engine/packages/telys-sdk", editable = true }
+
+[project.urls]
+Homepage = "https://codna.ai"
+Documentation = "https://docs.codna.ai"
+Source = "https://github.com/thyn-ai/codna"
+Issues = "https://github.com/thyn-ai/codna/issues"
+Security = "https://codna.ai/security"
+
+[project.scripts]
+codna = "codna.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel>=0.43"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["codna", "codna.runtime", "memengine"]
+
+[tool.setuptools.package-data]
+codna = [
+  "_telys_runtime/libame_kernel.*",
+  "_telys_runtime/lib*.dylib",
+  "_telys_runtime/lib*.so",
+  "_telys_runtime/*.dll",
+  "_telys_runtime/manifest.json",
+  # Telys license, staged at release time (never committed): code memory works with no user setup.
+  "_telys_runtime/oem-license.jwt",
+  # The bundled agent runtime, staged per platform at release time: `pip install codna` needs no
+  # Node, Bun or node_modules on the user's machine. Wheels ship for macOS (Apple silicon) and
+  # Linux (x86-64) only -- the platforms the bundled Mojo runtime supports -- so there is no
+  # Windows binary to stage.
+  "_agent_core_runtime/codna-sidecar",
+]

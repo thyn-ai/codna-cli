@@ -1,0 +1,24 @@
+# Security verification manifest for the codna secure benchmark.
+#
+# Pins the scanner + the build/test commands run inside the ephemeral worktree to verify a
+# fix, and records the autofix POLICY. The default policy auto-fixes only `exploitable`
+# findings; this manifest records the explicit operator override that also opts in
+# `production-reachable` — required because the engine's v1 reachability proof tops out at
+# production-reachable (independent taint proof, the only route to `exploitable`, is the
+# roadmap seam and off by default). image/rules_digest pinning is required only for
+# --open-pr; --engine local --fix does not need them.
+scanner:
+  id: codeql
+  command: [codeql, database, analyze, --format, sarifv2.1.0, --output, results.sarif]
+  output: results.sarif
+
+verification:
+  # Run inside an ephemeral git worktree (repo untouched). py_compile needs only stdlib —
+  # it proves the agent's remediation is syntactically valid without provisioning Flask.
+  build: []
+  tests:
+    - [python3, -m, py_compile, app.py, legacy.py]
+
+policy:
+  # Explicit override: also auto-fix production-reachable (not just exploitable).
+  autofix_classifications: [exploitable, production-reachable]

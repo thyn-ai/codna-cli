@@ -1,0 +1,17 @@
+"""Dead code — kept for the security-benchmark discrimination test.
+
+This module holds the same class of SQL-injection bug as app.py's /orders route, but
+NO route and NO entrypoint imports or calls ``legacy_lookup``. The engine's
+entrypoint-reachability must therefore NOT classify it production-reachable — proving the
+triage discriminates by reachability rather than rubber-stamping every scanner hit.
+
+NOT imported anywhere. Intentional test material.
+"""
+
+import sqlite3
+
+
+def legacy_lookup(order_id):
+    """SQL injection in an unreachable helper — no caller wires this to a request."""
+    cur = sqlite3.connect("shop.db").cursor()
+    return cur.execute("SELECT * FROM legacy WHERE id = '" + order_id + "'").fetchall()
