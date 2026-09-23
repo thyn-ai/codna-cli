@@ -5,4 +5,4 @@ This package is the `codna` CLI. Users never touch "algenta" directly — the en
 is an internal dependency reached over HTTP.
 """
 
-__version__ = "0.2.83"
+__version__ = "0.2.84"
