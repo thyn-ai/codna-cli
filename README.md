@@ -1,5 +1,7 @@
 # Codna
 
+<!-- mcp-name: io.github.thyn-ai/codna -->
+
 **Understand. Fix. Evolve.**
 
 Agents read your code. Codna understands it.
@@ -48,12 +50,29 @@ Full reference: [docs.codna.ai/reference/cli](https://docs.codna.ai/reference/cl
 
 ## MCP server
 
+Run Codna as a [Model Context Protocol](https://modelcontextprotocol.io) server over stdio —
+the same engine the CLI uses, inside Cursor, Claude Desktop, or your own agent:
+
 ```bash
-pip install "codna[mcp]"
-codna mcp install --client cursor     # or --client claude
+pipx install "codna[mcp]"       # or: pip install "codna[mcp]"
+codna mcp                       # serve over stdio
+codna mcp install --client cursor     # optional: write the client config for you (or --client claude)
 ```
 
-Tools: `codna_triage`, `codna_fix`, `codna_secure`, `codna_recall`, `codna_report_bug`.
+Five tools, each returning JSON; a failure comes back as `codna_<tool> error: …` text and never
+crashes the server:
+
+| Tool | What it does | Key needed |
+| --- | --- | --- |
+| `codna_triage` | Understand a repo and locate the code relevant to an issue. Deterministic, 0 LLM tokens. | none |
+| `codna_secure` | Prove which SARIF scanner findings (CodeQL, Semgrep, Snyk, Trivy) are reachable. Read-only, 0 LLM tokens. | none |
+| `codna_recall` | Recall code from local on-device memory — semantic + lexical search, fully offline. | none |
+| `codna_fix` | Root-cause and plan a fix (read-only by default); with `open_pr=true` pushes a branch and opens a real PR. | provider key (+ `GITHUB_TOKEN` for `open_pr=true`) |
+| `codna_report_bug` | File a bug, feature, or question to thyn-ai/feedback. | `GITHUB_TOKEN` (else returns a pre-filled URL) |
+
+**3 of 5 tools need no key at all** — `codna_triage`, `codna_secure` and `codna_recall` run with
+zero credentials and zero network calls. Full reference:
+[docs.codna.ai/guides/mcp](https://docs.codna.ai/guides/mcp).
 
 ## Code memory
 

@@ -21,6 +21,28 @@ def test_readonly_annotations():
     assert tools["codna_fix"].annotations.readOnlyHint is False  # fix is the action, not read-only
 
 
+def test_full_hint_annotations():
+    """Every tool carries accurate destructive/idempotent/open-world hints (TDQS)."""
+    s = _build_server()
+    tools = {t.name: t for t in asyncio.run(s.list_tools())}
+
+    # Read-only + deterministic + side-effect-free across repeats.
+    for name in ("codna_triage", "codna_secure", "codna_recall"):
+        assert tools[name].annotations.idempotentHint is True, name
+    # Fully local tools never touch the network (secure: SARIF-only, no sidecar; recall: on-device).
+    assert tools["codna_secure"].annotations.openWorldHint is False
+    assert tools["codna_recall"].annotations.openWorldHint is False
+
+    # fix: plan-only by default; open_pr=true pushes a branch and opens a real PR — additive.
+    assert tools["codna_fix"].annotations.destructiveHint is False
+    assert tools["codna_fix"].annotations.openWorldHint is True
+
+    # report_bug files a real GitHub issue — a create, never a destructive update.
+    assert tools["codna_report_bug"].annotations.readOnlyHint is False
+    assert tools["codna_report_bug"].annotations.destructiveHint is False
+    assert tools["codna_report_bug"].annotations.openWorldHint is True
+
+
 def test_resource_and_prompt_registered():
     s = _build_server()
     assert "codna://capabilities" in [str(r.uri) for r in asyncio.run(s.list_resources())]

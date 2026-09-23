@@ -203,7 +203,12 @@ def _build_server():
 
     server = FastMCP("codna")
 
-    @server.tool(annotations=ToolAnnotations(title="Triage a repository", readOnlyHint=True))
+    @server.tool(annotations=ToolAnnotations(
+        title="Triage a repository",
+        readOnlyHint=True,
+        # Same repo + same issue -> same suspect files; re-triage changes nothing.
+        idempotentHint=True,
+    ))
     def codna_triage(repo: str = ".", issue: str = "") -> str:
         """Understand a repository and locate the code relevant to an issue.
 
@@ -226,7 +231,15 @@ def _build_server():
         except Exception as exc:  # noqa: BLE001 — surface as tool error, never crash the server
             return f"codna_triage error: {exc}"
 
-    @server.tool(annotations=ToolAnnotations(title="Fix a bug (plan, or open a PR)", readOnlyHint=False))
+    @server.tool(annotations=ToolAnnotations(
+        title="Fix a bug (plan, or open a PR)",
+        readOnlyHint=False,
+        # Default (open_pr=false) only reads + plans; with open_pr=true it pushes a fix branch —
+        # additive, never destructive.
+        destructiveHint=False,
+        # open_pr=true writes outside this machine: it opens a real pull request on GitHub.
+        openWorldHint=True,
+    ))
     async def codna_fix(
         repo: str = ".", issue: str = "", ref: str = "", open_pr: bool = False,
         model: str = "repository.verified_agentic_v1",
@@ -242,7 +255,14 @@ def _build_server():
         """
         return await asyncio.to_thread(fix_json, repo, issue, ref, open_pr, model)
 
-    @server.tool(annotations=ToolAnnotations(title="Prove scanner-finding reachability", readOnlyHint=True))
+    @server.tool(annotations=ToolAnnotations(
+        title="Prove scanner-finding reachability",
+        readOnlyHint=True,
+        # Same SARIF in -> same classification out; purely deterministic and local.
+        idempotentHint=True,
+        # Reads one local SARIF file; never starts the sidecar or touches the network.
+        openWorldHint=False,
+    ))
     def codna_secure(repo: str = ".", sarif_path: str = "", ref: str = "") -> str:
         """Prove which scanner findings are reachable. Ingests a SARIF report (CodeQL /
         Semgrep / Snyk / Trivy), classifies each finding (exploitable / production-reachable /
@@ -251,13 +271,49 @@ def _build_server():
         """
         return secure_json(repo, sarif_path, ref)
 
-    @server.tool(annotations=ToolAnnotations(title="Recall code from local memory", readOnlyHint=True))
+    @server.tool(annotations=ToolAnnotations(
+        title="Recall code from local memory",
+        readOnlyHint=True,
+        # Same query over the same index -> same symbols; repeated calls change nothing
+        # (first use may build the local index, once).
+        idempotentHint=True,
+        # On-device Telys memory only: no network, no sidecar, 0 LLM tokens.
+        openWorldHint=False,
+    ))
     def codna_recall(repo: str = ".", query: str = "", service: str = "", language: str = "",
                      final_k: int = 8) -> str:
-        """Recall relevant code from the local Telys memory, if installed."""
+        """Recall relevant code from the local on-device Telys memory — semantic + lexical
+        search over the symbols this machine has already indexed, with zero LLM tokens and
+        zero network calls.
+
+        Use when you need the code behind a concept ("where is SARIF provenance validated?")
+        rather than a whole-repo map (codna_triage) — and when you want it offline. The index
+        is built on first use (an empty index auto-indexes the repo, once) and is stored
+        outside the git checkout.
+
+        repo: a local path or git URL (default: current directory, or the server default set
+          by `codna mcp start --repo`).
+        query: what to recall (required — an empty query returns an error string).
+        service: optional service name to scope recall to one service in a monorepo
+          (default: all services).
+        language: optional language filter such as "python" (default: all indexed languages).
+        final_k: maximum number of symbols to return (default: 8).
+        Returns matching symbols, the ranking explanation, and the candidate count as JSON.
+        Failure modes (missing query, Telys memory not installed, unreadable repo) come back
+        as "codna_recall error: ..." text — the tool never raises.
+        """
         return recall_json(repo, query, service, language, final_k)
 
-    @server.tool(annotations=ToolAnnotations(title="Report a bug, feature, or question", readOnlyHint=False))
+    @server.tool(annotations=ToolAnnotations(
+        title="Report a bug, feature, or question",
+        readOnlyHint=False,
+        # Only ever CREATES a new issue in thyn-ai/feedback; never modifies or deletes
+        # existing state.
+        destructiveHint=False,
+        # Writes outside this machine: files a real GitHub issue (or, offline, returns a
+        # pre-filled URL for a human to submit).
+        openWorldHint=True,
+    ))
     async def codna_report_bug(
         title: str, body: str = "", product: str = "codna", include_diagnostics: bool = False,
     ) -> str:
