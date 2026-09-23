@@ -1,6 +1,6 @@
 [project]
 name = "codna"
-version = "0.2.84"
+version = "0.2.85"
 description = "Understand. Fix. Evolve. Codna maps your repository before it spends a token, reviews pull requests, fixes bugs and proves which scanner findings are reachable. Runs on your machine."
 readme = "README.md"
 requires-python = ">=3.12"
