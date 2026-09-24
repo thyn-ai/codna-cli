@@ -1,0 +1,11 @@
+Codna CLI
+Copyright (c) 2026 Seville AI Technologies, Inc. d/b/a Thyn (thyn.ai)
+and the Codna contributors
+
+This product is licensed under the Apache License, Version 2.0. See LICENSE
+for the full license text.
+
+This repository contains the Codna CLI and MCP server only. The Codna
+engine, agent runtime, and on-device compute kernels are separately
+distributed (signed, device-licensed artifacts) and are not included here;
+they are subject to their own license terms, not Apache-2.0.
