@@ -1,0 +1,33 @@
+name: Bug report
+description: Something in the Codna CLI or MCP server isn't working as expected.
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      placeholder: e.g. codna 0.2.86
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead. Include the exact command you ran.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A small snippet or command sequence that reproduces the issue.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, model provider (if relevant), and anything else.
+    validations:
+      required: false

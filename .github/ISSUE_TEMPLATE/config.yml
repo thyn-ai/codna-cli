@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Enterprise / paying customer support
+    url: https://algenta.ai/support
+    about: >-
+      If you're on a paid plan, please use your existing support
+      channel instead of a public issue here — it's faster and keeps
+      account-specific details private.
+  - name: Community chat
+    url: https://algenta.ai/discord
+    about: General questions and discussion with other users.

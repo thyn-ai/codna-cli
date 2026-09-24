@@ -1,0 +1,17 @@
+name: Feature request
+description: Request a capability the Codna CLI or MCP server doesn't have today.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What capability do you want?
+      description: Describe the workflow you want to enable, not just the flag shape you'd guess at.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why isn't an existing command or tool sufficient?
+    validations:
+      required: false

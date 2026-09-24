@@ -1,0 +1,38 @@
+# Greets first-time issue authors and first-time PR contributors, pointing
+# them at the contributing guide and the good-first-issues list.
+#
+# pull_request_target is deliberate: on the plain pull_request trigger the
+# GITHUB_TOKEN is read-only for fork PRs, so the welcome comment could not be
+# posted. This is safe here because the workflow checks out nothing and
+# executes no contributor code -- the action only posts a comment.
+name: First interaction
+
+"on":
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  greet:
+    name: Welcome first-time contributors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/first-interaction@1c4688942c71f71d4f5502a26ea67c331730fa4d # v3.1.0
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          issue_message: >-
+            Thanks for opening your first issue in the Codna CLI! A maintainer
+            will take a look as soon as possible. If you would like to work on a
+            fix yourself, [CONTRIBUTING.md](https://github.com/thyn-ai/codna-cli/blob/main/CONTRIBUTING.md)
+            and the [good first issues](https://github.com/thyn-ai/codna-cli/contribute)
+            list are good places to start.
+          pr_message: >-
+            Thanks for opening your first pull request in the Codna CLI!
+            Please make sure the checks are green and that the change follows
+            [CONTRIBUTING.md](https://github.com/thyn-ai/codna-cli/blob/main/CONTRIBUTING.md).
+            A maintainer will review it shortly.

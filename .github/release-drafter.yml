@@ -1,0 +1,74 @@
+# Drafts a categorized changelog as PRs merge, and labels PRs from their
+# conventional-commit prefix (autolabeler) so the categories stay accurate.
+#
+# The draft is changelog preparation only: real releases are cut from the
+# private source repository (release-please; see GOVERNANCE.md), so the
+# draft here is never published automatically.
+name-template: v$NEXT_PATCH_VERSION
+tag-template: v$NEXT_PATCH_VERSION
+categories:
+  - title: Features
+    when:
+      labels:
+        - feat
+  - title: Bug Fixes
+    when:
+      labels:
+        - fix
+  - title: Performance
+    when:
+      labels:
+        - perf
+  - title: Documentation
+    when:
+      labels:
+        - docs
+        - documentation
+  - title: CI & Maintenance
+    when:
+      labels:
+        - ci
+        - chore
+        - build
+        - test
+        - refactor
+change-template: "- $TITLE @$AUTHOR (#$NUMBER)"
+change-title-escapes: '\<*_&'
+template: |
+  ## What's Changed
+
+  $CHANGES
+
+  ## New Contributors
+
+  $NEW_CONTRIBUTORS
+
+  **Full Changelog**: https://github.com/thyn-ai/codna-cli/compare/$PREVIOUS_TAG...v$NEXT_PATCH_VERSION
+autolabeler:
+  - label: feat
+    title:
+      - '/^feat(\(.+\))?!?:/'
+  - label: fix
+    title:
+      - '/^fix(\(.+\))?!?:/'
+  - label: perf
+    title:
+      - '/^perf(\(.+\))?!?:/'
+  - label: docs
+    title:
+      - '/^docs(\(.+\))?!?:/'
+  - label: ci
+    title:
+      - '/^ci(\(.+\))?!?:/'
+  - label: chore
+    title:
+      - '/^chore(\(.+\))?!?:/'
+  - label: build
+    title:
+      - '/^build(\(.+\))?!?:/'
+  - label: test
+    title:
+      - '/^test(\(.+\))?!?:/'
+  - label: refactor
+    title:
+      - '/^refactor(\(.+\))?!?:/'
