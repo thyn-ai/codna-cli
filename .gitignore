@@ -3,3 +3,21 @@ __pycache__/
 build/
 dist/
 *.pyc
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local Codna state — analysis caches are user data, never repository content
+.codna/
+.codna-memory/
+
+# Secrets — never commit key material of any kind
+*.pem
+*.key

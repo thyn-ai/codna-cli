@@ -1,0 +1,19 @@
+# See https://docs.github.com/articles/about-codeowners for syntax.
+# Order matters — later matches take precedence, so the most specific rules
+# are listed after the package-wide rules.
+#
+# NOTE: the thyn-ai org has exactly one member today (@0xamlab, verified
+# via `gh api orgs/thyn-ai/members`) and no teams. Every entry below is that
+# one real account, not a placeholder — replace with real teams
+# (@thyn-ai/codna-cli-maintainers) as soon as a second maintainer joins.
+# Until then, do NOT turn on branch protection's "Require review from Code
+# Owners" — GitHub blocks a PR author from approving their own PR, so a
+# solo-owner CODEOWNERS with that setting on would make every PR unmergeable
+# by the only person who can open one.
+
+/codna/ @0xamlab
+/tests/ @0xamlab
+/bench/ @0xamlab
+
+# Workflow files are as security-sensitive as the code they run.
+/.github/ @0xamlab
