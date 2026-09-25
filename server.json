@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.thyn-ai/codna",
   "title": "Codna — repository intelligence",
-  "description": "Map a repo before spending a token: triage, bug-fix PRs, SARIF reachability, on-device recall.",
+  "description": "Map a repo before spending a token: triage, bug-fix PRs, SARIF reachability, on-device recall. Execution requires the one-time free codna login (device authorization); introspection is credential-free.",
   "repository": {
     "url": "https://github.com/thyn-ai/codna-cli",
     "source": "github"
@@ -27,7 +27,7 @@
       "environmentVariables": [
         {
           "name": "ANTHROPIC_API_KEY",
-          "description": "Provider key for codna_fix's planner (or store one with `codna key set`). Every tool also requires the one-time free `codna login` device authorization; codna_triage, codna_secure and codna_recall then need no key at all.",
+          "description": "Provider key for codna_fix's planner — any one of ANTHROPIC_API_KEY (Anthropic), OPENAI_API_KEY (OpenAI/ChatGPT), or GEMINI_API_KEY (Gemini) works (or store one with `codna key set <provider>`). Every tool also requires the one-time free `codna login` device authorization before executing; introspection (initialize/tools/list) needs no credentials.",
           "isRequired": false,
           "isSecret": true
         },
