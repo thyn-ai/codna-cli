@@ -257,6 +257,10 @@ def _build_server():
     def codna_triage(repo: str = ".", issue: str = "") -> str:
         """Understand a repository and locate the code relevant to an issue.
 
+        The sibling tools act, this one maps: codna_fix plans/acts on one bug and
+        codna_recall retrieves stored code memory — triage is the zero-token map +
+        suspect-file list you run first.
+
         Requires the one-time free `codna login` device authorization (free community
         license); fully offline thereafter.
 
@@ -292,21 +296,44 @@ def _build_server():
         openWorldHint=True,
     ))
     async def codna_fix(
-        repo: str = ".", issue: str = "", ref: str = "", open_pr: bool = False,
-        model: str = "repository.verified_agentic_v1",
+        repo: Annotated[str, Field(
+            description="A local path or a git URL. open_pr=true requires a git URL (a local "
+                        "checkout has no remote to push to). Default '.': the current "
+                        "directory, or the server default set by `codna mcp start --repo` "
+                        "(env CODNA_MCP_DEFAULT_REPO).",
+        )] = ".",
+        issue: Annotated[str, Field(
+            description="What's broken — e.g. the failing test or the observed behavior. "
+                        "Required when open_pr=true; otherwise optional but strongly "
+                        "recommended (an empty issue yields a generic repo-wide plan).",
+        )] = "",
+        ref: Annotated[str, Field(
+            description="Branch, tag, or commit to analyze: the planner's repository "
+                        "snapshot is taken at this ref (registration forwards it to "
+                        "create_repository_snapshot). Default '': the repo's current state — "
+                        "the checkout as-is for a local path, the default branch for a git URL.",
+        )] = "",
+        open_pr: Annotated[bool, Field(
+            description="false (default): READ-ONLY plan — returns root cause, confidence and "
+                        "a patch reference, and changes nothing. true: pushes a fix branch "
+                        "and OPENS A PULL REQUEST — needs a git URL for repo and GITHUB_TOKEN "
+                        "(or CODNA_GITHUB_TOKEN) with write access; returns pull_request_url.",
+        )] = False,
+        model: Annotated[str, Field(
+            description="Provider-qualified planner model, e.g. openai/gpt-5. Default "
+                        "'repository.verified_agentic_v1' (codna's verified agentic runtime).",
+        )] = "repository.verified_agentic_v1",
     ) -> str:
         """Find and fix a bug. Runs the full Codna agent + engine + risk simulation.
 
         Requires the one-time free `codna login` device authorization (free community
         license) plus a provider key (BYOK — e.g. ANTHROPIC_API_KEY or `codna key set
-        anthropic`); fully offline thereafter.
+        anthropic`). Offline truth: planning calls the provider API (network), and only
+        open_pr=true writes to GitHub — codna_triage, codna_secure and codna_recall are
+        the fully-offline tools.
 
-        repo: a local path or a git URL. issue: what's broken (e.g. the failing test).
-        model: optional provider-qualified model such as openai/gpt-5.
-        open_pr: when false (default) this is READ-ONLY — returns the plan (root cause, confidence,
-          patch reference) and changes nothing. When true, codna pushes a fix branch and OPENS A
-          PULL REQUEST — this needs a git URL for `repo` and a GITHUB_TOKEN with write access.
         Returns the root cause, confidence, model, and (when open_pr) the pull_request_url.
+        Failures come back as 'codna_fix error: ...' text — the tool never raises.
         """
         return await asyncio.to_thread(fix_json, repo, issue, ref, open_pr, model)
 
@@ -405,6 +432,7 @@ def _build_server():
     ) -> str:
         """File a report to thyn-ai/feedback — the public front door for algenta, codna, telys,
         and sqai. Files the same shape of issue `codna report` (the CLI) does.
+        It only files the issue — codna_fix is the one that can open a PR with the fix.
 
         Requires the one-time free `codna login` device authorization (free community
         license); auto-filing additionally needs a GitHub token (else a pre-filled URL).
