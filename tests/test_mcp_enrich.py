@@ -49,6 +49,28 @@ def test_full_hint_annotations():
     assert tools["codna_report_bug"].annotations.openWorldHint is True
 
 
+def test_codna_secure_schema_marks_sarif_path_required_and_documents_params():
+    """TDQS: prose said sarif_path is required while the schema had it optional, and ref/repo
+    carried no semantics. The handler (secure_json) errors on omission — there is no
+    auto-discovery — so the served schema must say required and document every parameter."""
+    s = _build_server()
+    tools = {t.name: t for t in asyncio.run(s.list_tools())}
+    schema = tools["codna_secure"].inputSchema
+
+    assert schema["required"] == ["sarif_path"]
+    props = schema["properties"]
+    assert set(props) == {"sarif_path", "repo", "ref"}
+    assert "default" not in props["sarif_path"]  # required: no default to lean on
+    assert props["repo"]["default"] == "."
+    assert props["ref"]["default"] == ""
+    for name in ("sarif_path", "repo", "ref"):
+        assert props[name].get("description"), f"{name} must carry parameter semantics"
+    # The honest-truth claims behind each description (guarded against future drift):
+    assert "no auto-discovery" in props["sarif_path"]["description"]
+    assert "never scanned" in props["repo"]["description"]  # classification reads ONLY the SARIF
+    assert "does not resolve it" in props["ref"]["description"]  # `del ref` in secure_json
+
+
 def test_resource_and_prompt_registered():
     s = _build_server()
     assert "codna://capabilities" in [str(r.uri) for r in asyncio.run(s.list_resources())]
