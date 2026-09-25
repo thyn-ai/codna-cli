@@ -10,11 +10,23 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
+from typing import Annotated
 
 from .cli import _api_key, _client, _dump, _register, _runtime_keys
+
+# FastMCP builds each tool's input schema by evaluating the Annotated[str, Field(...)]
+# annotations below against THIS module's globals (inspect.signature(eval_str=True)), so
+# pydantic's Field must resolve here whenever a server can be built. But this module must also
+# import without pydantic: the offline CI lane installs neither pydantic nor the mcp extra and
+# exercises the *_json handlers directly. Keying the import to pydantic's presence satisfies
+# both — a server can only be built when the mcp extra (which hard-requires pydantic) exists,
+# so the binding is never absent when FastMCP evaluates the annotations.
+if importlib.util.find_spec("pydantic") is not None:
+    from pydantic import Field
 
 LOGIN_REQUIRED_MESSAGE = (
     "requires the one-time free `codna login` device authorization (free community license); "
@@ -306,16 +318,41 @@ def _build_server():
         # Reads one local SARIF file; never starts the sidecar or touches the network.
         openWorldHint=False,
     ))
-    def codna_secure(repo: str = ".", sarif_path: str = "", ref: str = "") -> str:
-        """Prove which scanner findings are reachable. Ingests a SARIF report (CodeQL /
+    def codna_secure(
+        sarif_path: Annotated[str, Field(
+            description="Path to the scanner's SARIF 2.1.0 report (CodeQL, Semgrep, Snyk, "
+                        "Trivy, or any other scanner). REQUIRED — there is no auto-discovery: "
+                        "omitting it fails input validation, and an empty string returns "
+                        "'codna_secure error: sarif_path is required'.",
+        )],
+        repo: Annotated[str, Field(
+            description="Repository the findings belong to (a local path or a git URL), echoed "
+                        "as 'repository' in the output for traceability. The classification "
+                        "reads ONLY the SARIF file — repo is never scanned. Default '.': the "
+                        "current directory, or the server default set by `codna mcp start "
+                        "--repo` (env CODNA_MCP_DEFAULT_REPO).",
+        )] = ".",
+        ref: Annotated[str, Field(
+            description="Branch, tag, or commit the SARIF was produced from. Accepted for "
+                        "parity with `codna secure --ref`; informational only in the MCP path — "
+                        "the local SARIF-only classifier does not resolve it. Default ''.",
+        )] = "",
+    ) -> str:
+        """Prove which scanner findings are reachable. Ingests a SARIF 2.1.0 report (CodeQL /
         Semgrep / Snyk / Trivy), classifies each finding (exploitable / production-reachable /
-        unreachable / unknown) via the engine, and reports which are autofix-eligible.
-        Read-only and 0 LLM tokens. `sarif_path` is required.
+        unreachable / unknown) via the local engine, and reports which are autofix-eligible.
+        Read-only, deterministic, 0 LLM tokens — the SARIF file is the only input read; the
+        repo is never scanned and the agent sidecar never starts.
+
+        `sarif_path` is REQUIRED (see the input schema) — there is no workspace scan or
+        default-path fallback. SARIF provenance (tool name + revision) must be complete or the
+        report is rejected. All failures come back as 'codna_secure error: ...' text — the
+        tool never raises.
 
         Requires the one-time free `codna login` device authorization (free community
         license); fully offline thereafter.
         """
-        return secure_json(repo, sarif_path, ref)
+        return secure_json(repo=repo, sarif_path=sarif_path, ref=ref)
 
     @server.tool(annotations=ToolAnnotations(
         title="Recall code from local memory",
