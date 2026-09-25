@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.thyn-ai/codna",
   "title": "Codna — repository intelligence",
-  "description": "Map a repo before spending a token: triage, bug-fix PRs, SARIF reachability, on-device recall. Execution requires the one-time free codna login (device authorization); introspection is credential-free.",
+  "description": "Repo intelligence: triage, fix PRs, SARIF reachability, recall. Free codna login to execute.",
   "repository": {
     "url": "https://github.com/thyn-ai/codna-cli",
     "source": "github"
