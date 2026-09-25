@@ -71,6 +71,53 @@ def test_codna_secure_schema_marks_sarif_path_required_and_documents_params():
     assert "does not resolve it" in props["ref"]["description"]  # `del ref` in secure_json
 
 
+def test_codna_fix_schema_documents_all_params_and_the_precise_offline_truth():
+    """TDQS: codna_fix's ref was unexplained and "fully offline thereafter" was ambiguous.
+    ref is NOT ignored here (unlike codna_secure): fix_json forwards it to _plan_once /
+    run_fix, and registration puts it into create_repository_snapshot (cli.py:372-375) —
+    the planner's snapshot is taken at that ref. The schema must say so."""
+    s = _build_server()
+    tools = {t.name: t for t in asyncio.run(s.list_tools())}
+    schema = tools["codna_fix"].inputSchema
+
+    assert "required" not in schema  # every fix parameter is optional
+    props = schema["properties"]
+    assert set(props) == {"repo", "issue", "ref", "open_pr", "model"}
+    assert props["repo"]["default"] == "."
+    assert props["issue"]["default"] == ""
+    assert props["ref"]["default"] == ""
+    assert props["open_pr"]["default"] is False
+    assert props["model"]["default"] == "repository.verified_agentic_v1"
+    for name in ("repo", "issue", "ref", "open_pr", "model"):
+        assert props[name].get("description"), f"{name} must carry parameter semantics"
+    # ref is USED, not ignored: snapshot-at-ref semantics must be the documented one.
+    assert "snapshot is taken at this ref" in props["ref"]["description"]
+    assert "create_repository_snapshot" in props["ref"]["description"]
+
+    # The precise offline sentence, not the ambiguous "fully offline thereafter":
+    desc = tools["codna_fix"].description
+    assert "codna login" in desc  # login disclosure (see test_mcp_login_gate.py)
+    assert "fully offline thereafter" not in desc
+    assert "planning calls the provider API (network)" in desc
+    assert "only" in desc and "open_pr=true writes to GitHub" in desc
+    assert "codna_triage, codna_secure and codna_recall are" in desc  # the fully-offline set
+
+
+def test_sibling_contrast_lines():
+    """TDQS: triage names what the siblings do instead; report_bug contrasts with codna_fix."""
+    s = _build_server()
+    tools = {t.name: t for t in asyncio.run(s.list_tools())}
+
+    triage = tools["codna_triage"].description
+    assert "codna_fix plans/acts on one bug" in triage
+    assert "codna_recall retrieves stored code memory" in triage
+    assert "run first" in triage
+
+    report = tools["codna_report_bug"].description
+    assert "only files the issue" in report
+    assert "codna_fix is the one that can open a PR with the fix" in report
+
+
 def test_resource_and_prompt_registered():
     s = _build_server()
     assert "codna://capabilities" in [str(r.uri) for r in asyncio.run(s.list_resources())]
