@@ -1,6 +1,6 @@
 [project]
 name = "codna"
-version = "0.2.89"
+version = "0.2.90"
 description = "Understand. Fix. Evolve. Codna maps your repository before it spends a token, reviews pull requests, fixes bugs and proves which scanner findings are reachable. Runs on your machine."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -109,6 +109,7 @@ Documentation = "https://docs.codna.ai"
 Source = "https://github.com/thyn-ai/codna"
 Issues = "https://github.com/thyn-ai/codna/issues"
 Security = "https://codna.ai/security"
+Company = "https://thyn.ai"
 
 [project.scripts]
 codna = "codna.cli:main"
