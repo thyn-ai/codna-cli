@@ -109,6 +109,7 @@ Documentation = "https://docs.codna.ai"
 Source = "https://github.com/thyn-ai/codna"
 Issues = "https://github.com/thyn-ai/codna/issues"
 Security = "https://codna.ai/security"
+Company = "https://thyn.ai"
 
 [project.scripts]
 codna = "codna.cli:main"
