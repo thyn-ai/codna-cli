@@ -32,6 +32,18 @@
           "isSecret": true
         },
         {
+          "name": "OPENAI_API_KEY",
+          "description": "Alternative provider key (OpenAI/ChatGPT) for codna_fix's planner — see ANTHROPIC_API_KEY.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "GEMINI_API_KEY",
+          "description": "Alternative provider key (Gemini) for codna_fix's planner — see ANTHROPIC_API_KEY.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
           "name": "GITHUB_TOKEN",
           "description": "Write token, only for codna_fix with open_pr=true (opens a pull request) and codna_report_bug (files an issue).",
           "isRequired": false,
