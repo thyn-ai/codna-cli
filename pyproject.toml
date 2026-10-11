@@ -1,6 +1,6 @@
 [project]
 name = "codna"
-version = "0.2.90"
+version = "0.2.91"
 description = "Understand. Fix. Evolve. Codna maps your repository before it spends a token, reviews pull requests, fixes bugs and proves which scanner findings are reachable. Runs on your machine."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -106,8 +106,8 @@ telys = { path = "../../memory-engine/packages/telys-sdk", editable = true }
 [project.urls]
 Homepage = "https://codna.ai"
 Documentation = "https://docs.codna.ai"
-Source = "https://github.com/thyn-ai/codna"
-Issues = "https://github.com/thyn-ai/codna/issues"
+Source = "https://github.com/thyn-ai/codna-cli"
+Issues = "https://github.com/thyn-ai/codna-cli/issues"
 Security = "https://codna.ai/security"
 Company = "https://thyn.ai"
 
