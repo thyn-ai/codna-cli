@@ -4,6 +4,8 @@
 
 **Understand. Fix. Evolve.**
 
+> ⭐ If Codna saved you time, a [star on GitHub](https://github.com/thyn-ai/codna-cli) helps others find it.
+
 Agents read your code. Codna understands it.
 
 Codna maps a repository before it spends a token. It then reviews pull requests, fixes bugs and
