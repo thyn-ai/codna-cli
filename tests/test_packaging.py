@@ -117,8 +117,8 @@ def test_package_declares_local_readme_metadata():
     assert "Programming Language :: Python :: 3.13" in data["classifiers"]
     assert data["urls"]["Homepage"] == "https://codna.ai"
     assert data["urls"]["Documentation"] == "https://docs.codna.ai"
-    assert data["urls"]["Source"] == "https://github.com/thyn-ai/codna"
-    assert data["urls"]["Issues"] == "https://github.com/thyn-ai/codna/issues"
+    assert data["urls"]["Source"] == "https://github.com/thyn-ai/codna-cli"
+    assert data["urls"]["Issues"] == "https://github.com/thyn-ai/codna-cli/issues"
     assert data["urls"]["Security"] == "https://codna.ai/security"
     readme = (ROOT / "cli" / "README.md").read_text(encoding="utf-8")
     assert "pip install codna" in readme
