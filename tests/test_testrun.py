@@ -55,36 +55,49 @@ def test_parse_junit_failures_rejects_entity_declarations(tmp_path):
 # ── monorepo-aware detection: pytest config one level down (codna's OWN repo shape) ───────────
 def test_detect_pytest_finds_config_in_a_depth1_subdirectory(tmp_path):
     (tmp_path / "cli" / "tests").mkdir(parents=True)
-    assert testrun._detect_pytest(str(tmp_path)) == str(tmp_path / "cli")
+    assert testrun._detect_pytest_suites(str(tmp_path)) == [str(tmp_path / "cli")]
 
 
 def test_detect_pytest_prefers_repo_root_over_a_subdirectory(tmp_path):
     (tmp_path / "tests").mkdir()
     (tmp_path / "cli" / "tests").mkdir(parents=True)
-    assert testrun._detect_pytest(str(tmp_path)) == str(tmp_path)
+    assert testrun._detect_pytest_suites(str(tmp_path)) == [str(tmp_path)]
 
 
-def test_detect_pytest_raises_when_multiple_subdirectories_are_ambiguous(tmp_path):
+def test_detect_pytest_returns_all_subdirectory_suites_sorted(tmp_path):
     """codna's OWN repo shape: bench/, cli/, and python/ are all independently valid pytest
-    roots with nothing at the repo root -- must not silently pick one (e.g. alphabetically)."""
-    (tmp_path / "bench" / "tests").mkdir(parents=True)
+    roots with nothing at the repo root. Every suite is returned (running them all can never
+    report green while a failing suite went unrun) -- never a refusal, never an arbitrary pick."""
+    (tmp_path / "python" / "tests").mkdir(parents=True)
     (tmp_path / "cli" / "tests").mkdir(parents=True)
-    with pytest.raises(RuntimeError) as exc:
-        testrun._detect_pytest(str(tmp_path))
-    assert "--test-cmd" in str(exc.value)
-    assert "bench" in str(exc.value) and "cli" in str(exc.value)
+    (tmp_path / "bench" / "tests").mkdir(parents=True)
+    assert testrun._detect_pytest_suites(str(tmp_path)) == [
+        str(tmp_path / "bench"), str(tmp_path / "cli"), str(tmp_path / "python"),
+    ]
+
+
+def test_detect_pytest_finds_suite_two_levels_down_in_packages(tmp_path):
+    """packages-monorepo shape (telys, telys-sdk): the suite lives at packages/<pkg>/ -- depth-1
+    alone misses it, but a vendored/example tree at depth 2 must still NOT count."""
+    (tmp_path / "packages" / "core" / "tests").mkdir(parents=True)
+    assert testrun._detect_pytest_suites(str(tmp_path)) == [str(tmp_path / "packages" / "core")]
+
+
+def test_detect_pytest_ignores_suites_buried_in_examples(tmp_path):
+    (tmp_path / "examples" / "demo" / "tests").mkdir(parents=True)
+    assert testrun._detect_pytest_suites(str(tmp_path)) == []
 
 
 def test_detect_pytest_none_when_neither_root_nor_any_subdirectory_has_config(tmp_path):
     (tmp_path / "docs").mkdir()
     (tmp_path / "node_modules" / "tests").mkdir(parents=True)  # skip-listed, must not count
-    assert testrun._detect_pytest(str(tmp_path)) is None
+    assert testrun._detect_pytest_suites(str(tmp_path)) == []
 
 
 def test_discover_runs_from_the_subdirectory_that_actually_has_pytest_config(tmp_path, monkeypatch):
     """Regression: codna's own repo has cli/pyproject.toml + cli/tests/, nothing at the root --
     `codna fix --tests` on codna's own repo failed outright with "could not detect a test
-    runner" until _detect_pytest looked one level down. Detecting it is not enough on its own:
+    runner" until _detect_pytest_suites looked one level down. Detecting it is not enough on its own:
     pytest must also actually RUN from that subdirectory (not the repo root) to pick up its
     pyproject.toml's own [tool.pytest.ini_options] (testpaths, markers, addopts, ...)."""
     (tmp_path / "cli" / "tests").mkdir(parents=True)
@@ -111,8 +124,90 @@ def test_discover_runs_from_the_subdirectory_that_actually_has_pytest_config(tmp
     assert captured["cwd"] == str(tmp_path / "cli")  # NOT the repo root
 
 
+def test_discover_multiple_subdir_suites_all_run_and_merge(tmp_path, monkeypatch):
+    """bench/ + cli/ + python/ all carry pytest config and the root has none (codna's own repo
+    shape): every suite runs from its own root and the failing ids merge into one report."""
+    (tmp_path / "bench" / "tests").mkdir(parents=True)
+    (tmp_path / "cli" / "tests").mkdir(parents=True)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    monkeypatch.delenv("CODNA_REQUIRE_EGRESS_DENY", raising=False)
+
+    bench_junit = _JUNIT.replace("pkg.test_mod", "bench.test_bench")
+    cli_junit = _JUNIT.replace("pkg.test_mod", "cli.test_cli")
+    runs = []
+
+    class _FakeResult:
+        timed_out = False
+        returncode = 1
+        stdout = ""
+        stderr = ""
+
+    class _FakeSandbox:
+        def __init__(self, **kw):
+            pass
+
+        def run(self, argv, *, cwd, accepted_exit_codes=(0,)):
+            runs.append(cwd)
+            junit = argv[-1].split("=", 1)[1]
+            body = bench_junit if cwd.endswith("bench") else cli_junit
+            with open(junit, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            return _FakeResult()
+
+    monkeypatch.setattr(testrun, "Sandbox", _FakeSandbox)
+    issue, failing = testrun.discover_failing_tests(str(tmp_path))
+
+    assert runs == [str(tmp_path / "bench"), str(tmp_path / "cli")]  # sorted, each from its own root
+    assert failing == [
+        "bench.test_bench::test_bad", "bench.test_bench::test_err",
+        "cli.test_cli::test_bad", "cli.test_cli::test_err",
+    ]
+    assert "bench" in issue and "cli" in issue
+
+
+def test_discover_crashed_suite_is_reported_alongside_junit_failures(tmp_path, monkeypatch):
+    """bench/ crashes with no JUnit while cli/ produces failures: the crash must appear in the
+    issue text even though `failing` is non-empty from the other suite (review: silent drop)."""
+    (tmp_path / "bench" / "tests").mkdir(parents=True)
+    (tmp_path / "cli" / "tests").mkdir(parents=True)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    monkeypatch.delenv("CODNA_REQUIRE_EGRESS_DENY", raising=False)
+
+    class _FakeSandbox:
+        def __init__(self, **kw):
+            pass
+
+        def run(self, argv, *, cwd, accepted_exit_codes=(0,)):
+            if cwd.endswith("cli"):
+                junit = argv[-1].split("=", 1)[1]
+                with open(junit, "w", encoding="utf-8") as fh:
+                    fh.write(_JUNIT)
+            return type("R", (), {"timed_out": False, "returncode": 1, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(testrun, "Sandbox", _FakeSandbox)
+    issue, failing = testrun.discover_failing_tests(str(tmp_path))
+
+    assert failing == ["pkg.test_mod::test_bad", "pkg.test_mod::test_err"]  # from cli/ only
+    assert "cli" in issue
+    assert "bench" in issue and "no JUnit" in issue  # the crashed suite is not dropped
+    assert "2 suite(s)" in issue  # failing + crashed both counted in the header
+
+
+def test_discover_too_many_suites_refuses_with_guidance(tmp_path, monkeypatch):
+    """Past _MAX_SUITES the run cannot stay inside a sane test budget — refuse with the way out."""
+    for i in range(testrun._MAX_SUITES + 1):
+        (tmp_path / f"pkg{i}" / "tests").mkdir(parents=True)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    monkeypatch.delenv("CODNA_REQUIRE_EGRESS_DENY", raising=False)
+
+    with pytest.raises(testrun.TestEnvironmentUnavailable) as exc:
+        testrun.discover_failing_tests(str(tmp_path))
+    assert "fix.test_command" in str(exc.value)
+    assert "pkg0" in str(exc.value)
+
+
 def test_discover_raises_without_runner(tmp_path, monkeypatch):
-    monkeypatch.setattr(testrun, "_detect_pytest", lambda d: False)
+    monkeypatch.setattr(testrun, "_detect_pytest_suites", lambda d: [])
     with pytest.raises(RuntimeError) as exc:
         testrun.discover_failing_tests(str(tmp_path))
     assert "--test-cmd" in str(exc.value)
