@@ -368,7 +368,7 @@ def discover_failing_tests(repo_dir: str, test_cmd: str | None = None, *, timeou
 
     failing: list[str] = []
     per_suite_failing: list[tuple[str, list[str]]] = []
-    crashed: list[str] = []
+    crashed: list[tuple[str, bool]] = []
     saw_failure_rc = False
     last_tail = ""
     for run_dir, argv, run_junit, budget in runs:
@@ -413,7 +413,7 @@ def discover_failing_tests(repo_dir: str, test_cmd: str | None = None, *, timeou
             failing.extend(suite_failing)
         elif result.returncode not in (0,):
             saw_failure_rc = True
-            crashed.append(run_dir)
+            crashed.append((run_dir, os.path.isfile(run_junit)))
             last_tail = (result.stdout or result.stderr or "")[-1500:]
 
     if failing:
@@ -425,8 +425,12 @@ def discover_failing_tests(repo_dir: str, test_cmd: str | None = None, *, timeou
         ]
         # A suite that crashed without producing JUnit ids is never dropped from the report just
         # because a sibling suite produced some — its tail is real failure evidence too.
-        for suite in crashed:
-            parts.append(f"{os.path.relpath(suite, repo_dir)}: exited non-zero with no JUnit report")
+        for suite, has_report in crashed:
+            message = (
+                "exited non-zero with JUnit report but no failing test ids"
+                if has_report else "exited non-zero with no JUnit report"
+            )
+            parts.append(f"{os.path.relpath(suite, repo_dir)}: {message}")
         involved = len(per_suite_failing) + len(crashed)
         return (
             f"{len(failing)} failing test(s) across {involved} suite(s) — "

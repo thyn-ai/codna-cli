@@ -264,6 +264,31 @@ def test_discover_crashed_suite_is_reported_alongside_junit_failures(tmp_path, m
     assert "2 suite(s)" in issue  # failing + crashed both counted in the header
 
 
+def test_discover_crashed_suite_with_empty_junit_does_not_claim_report_is_missing(tmp_path, monkeypatch):
+    (tmp_path / "bench" / "tests").mkdir(parents=True)
+    (tmp_path / "cli" / "tests").mkdir(parents=True)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    monkeypatch.delenv("CODNA_REQUIRE_EGRESS_DENY", raising=False)
+
+    class _FakeSandbox:
+        def __init__(self, **kw):
+            pass
+
+        def run(self, argv, *, cwd, accepted_exit_codes=(0,)):
+            junit = argv[-1].split("=", 1)[1]
+            report = _JUNIT if cwd.endswith("cli") else '<testsuite tests="0" failures="0" errors="0"/>'
+            with open(junit, "w", encoding="utf-8") as fh:
+                fh.write(report)
+            return type("R", (), {"timed_out": False, "returncode": 1, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(testrun, "Sandbox", _FakeSandbox)
+    issue, failing = testrun.discover_failing_tests(str(tmp_path))
+
+    assert failing == ["pkg.test_mod::test_bad", "pkg.test_mod::test_err"]
+    assert "bench: exited non-zero with JUnit report but no failing test ids" in issue
+    assert "no JUnit report" not in issue
+
+
 def test_discover_too_many_suites_refuses_with_guidance(tmp_path, monkeypatch):
     """Past _MAX_SUITES the run cannot stay inside a sane test budget — refuse with the way out."""
     for i in range(testrun._MAX_SUITES + 1):
