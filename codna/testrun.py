@@ -97,6 +97,7 @@ def parse_junit_failures(path: str) -> list[str]:
 _SKIP_SUBDIRS = frozenset({
     "node_modules", "venv", ".venv", "dist", "build", "vendor", "__pycache__", "site-packages",
 })
+_MAX_SUITES = 8  # past this, one sandboxed run cannot stay inside a sane test budget
 
 
 def _has_pytest_config(d: str) -> bool:
@@ -125,48 +126,58 @@ def _has_pytest_config(d: str) -> bool:
     return False
 
 
-def _detect_pytest(repo_dir: str) -> str | None:
-    """Return the directory pytest config lives in — ``repo_dir`` itself, or a depth-1
-    subdirectory of it — or ``None`` if neither has any.
+# Depth-1 subdirectory NAMES that act as package containers in monorepos — suites may live one
+# more level down inside these (packages/<pkg>, apps/<app>). Everything else is only searched at
+# depth 1, so an unrelated pytest config buried in examples/ or a vendored subtree never counts.
+_CONTAINER_DIRS = frozenset({"packages", "apps", "libs", "modules", "crates", "components"})
+
+
+def _detect_pytest_suites(repo_dir: str) -> list[str]:
+    """Every pytest root: ``[repo_dir]`` when the root itself has config, else every depth-1
+    subdirectory with config — plus depth-2 under package-container dirs (``packages/``,
+    ``apps/`` …) — sorted by path.
 
     Monorepo-aware: a repo's actual Python package (and its pytest.ini / tests/ / pyproject.toml
-    [tool.pytest]) commonly lives one level down, in a subdirectory like ``cli/`` or ``python/``,
-    rather than at the repo root. A root-only check would conclude "no test runner" despite a
-    real, working pytest setup one level down; only searching depth-1 (not an arbitrary recursive
-    walk) keeps this bounded and avoids false positives from an unrelated pytest config buried in
-    a vendored/example subtree.
+    [tool.pytest]) commonly lives one level down (``cli/``), and in a packages-monorepo two
+    levels down (``packages/telys-sdk/``). Bounding the walk to depth-1 plus known container
+    dirs keeps it cheap and avoids false positives from vendored/example subtrees.
 
-    Raises :class:`RuntimeError` when MULTIPLE depth-1 subdirectories each have their own pytest
-    config and the root has none — codna's OWN repo is exactly this shape (``bench/``, ``cli/``,
-    and ``python/`` are all independently valid pytest roots). Silently picking one (e.g. the
-    alphabetically-first) would run an arbitrary subset of the repo's tests and could report
-    "tests pass" while the actual failing suite never ran — a clear, actionable error is safer
-    than a guess here.
+    Multiple suites (codna's OWN repo shape: ``bench/``, ``cli/``, ``python/``) are ALL returned,
+    and :func:`discover_failing_tests` runs every one of them: running all suites can never report
+    "tests pass" while a failing suite went unrun, which is exactly the risk that made silently
+    picking one (or refusing to run at all) wrong.
     """
     if _has_pytest_config(repo_dir):
-        return repo_dir
+        return [repo_dir]
     try:
         entries = sorted(os.listdir(repo_dir))
     except OSError:
-        return None
-    candidates = [
-        os.path.join(repo_dir, name)
-        for name in entries
-        if not name.startswith(".")
-        and name not in _SKIP_SUBDIRS
-        and os.path.isdir(os.path.join(repo_dir, name))
-        and _has_pytest_config(os.path.join(repo_dir, name))
-    ]
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        names = ", ".join(os.path.basename(c) for c in candidates)
-        raise TestEnvironmentUnavailable(
-            f"pytest config lives in several subdirectories ({names}) and none at the repo root, so "
-            "it is ambiguous which suite to run (pass --test-cmd \"<your test command>\" writing "
-            "JUnit to $CODNA_JUNIT)."
-        )
-    return None
+        return []
+    suites: list[str] = []
+    for name in entries:
+        if name.startswith(".") or name in _SKIP_SUBDIRS:
+            continue
+        sub = os.path.join(repo_dir, name)
+        if not os.path.isdir(sub):
+            continue
+        if _has_pytest_config(sub):
+            suites.append(sub)
+        if name not in _CONTAINER_DIRS:
+            continue
+        try:
+            nested = sorted(os.listdir(sub))
+        except OSError:
+            continue
+        for inner in nested:
+            candidate = os.path.join(sub, inner)
+            if (
+                not inner.startswith(".")
+                and inner not in _SKIP_SUBDIRS
+                and os.path.isdir(candidate)
+                and _has_pytest_config(candidate)
+            ):
+                suites.append(candidate)
+    return sorted(suites)
 
 
 def repo_test_command(repo_dir: str) -> str | None:
@@ -298,7 +309,6 @@ def discover_failing_tests(repo_dir: str, test_cmd: str | None = None, *, timeou
     env["CODNA_JUNIT"] = junit  # custom test commands can write their report here
     env["PYTHONDONTWRITEBYTECODE"] = "1"  # prevent test runs from dirtying repos with __pycache__
 
-    run_dir = repo_dir  # overridden below only when pytest config is found in a subdirectory
     resolved = resolve_test_command(repo_dir, test_cmd)
     command, source, explicit = resolved if resolved else (None, None, False)
     if command:
@@ -310,25 +320,41 @@ def discover_failing_tests(repo_dir: str, test_cmd: str | None = None, *, timeou
                 f"`{command}` (detected from {source}) needs `{runner}`, which is not installed here.",
                 command_known=True,
             )
-        argv = ["/bin/sh", "-c", command]
         # pixi tasks, `uv run pytest`, make targets: none pass --junitxml themselves, so ask any
         # pytest the command reaches to write the report Codna parses. Additive to the repo's own
         # PYTEST_ADDOPTS, inert for a non-pytest runner.
         env["PYTEST_ADDOPTS"] = f"{env.get('PYTEST_ADDOPTS', '')} --junitxml={junit}".strip()
+        runs = [(repo_dir, ["/bin/sh", "-c", command], junit, timeout_seconds)]
     else:
-        pytest_dir = _detect_pytest(repo_dir)
-        if pytest_dir:
-            if importlib.util.find_spec("pytest") is None:
-                raise TestEnvironmentUnavailable(
-                    "pytest config was found but pytest is not installed here.", command_known=True
-                )
-            argv = [sys.executable, "-m", "pytest", "-q", f"--junitxml={junit}"]
-            run_dir = pytest_dir  # e.g. cli/ when the repo root itself has no pytest config
-        else:
+        suites = _detect_pytest_suites(repo_dir)
+        if not suites:
             raise TestEnvironmentUnavailable(
                 "no test runner was detected (no pytest.ini / tests/ / pyproject [tool.pytest] at the "
-                "repo root or one level down, no pixi `test` task, no uv.lock with pytest)."
+                "repo root, one level down, or in packages/<pkg>/, no pixi `test` task, no uv.lock "
+                "with pytest)."
             )
+        if importlib.util.find_spec("pytest") is None:
+            raise TestEnvironmentUnavailable(
+                "pytest config was found but pytest is not installed here.", command_known=True
+            )
+        if len(suites) > _MAX_SUITES:
+            found = ", ".join(os.path.relpath(s, repo_dir) for s in suites)
+            raise TestEnvironmentUnavailable(
+                f"found {len(suites)} pytest suites ({found}) — too many to run within one test "
+                "budget. Point Codna at the right one with fix.test_command in codna.yaml or "
+                "--test-cmd \"<your test command>\" (writing JUnit to $CODNA_JUNIT)."
+            )
+        # Each suite runs from its own root so its pyproject/pytest.ini applies. Distribute the
+        # caller's total integer-second budget as evenly as possible without exceeding it.
+        base_budget, extra_seconds = divmod(timeout_seconds, len(suites))
+        runs = []
+        for i, suite in enumerate(suites):
+            suite_junit = junit if len(suites) == 1 else f"{os.path.splitext(junit)[0]}-{i}.xml"
+            argv = [sys.executable, "-m", "pytest", "-q"]
+            # A container suite must not recursively collect nested roots that run independently.
+            argv.extend(f"--ignore={candidate}" for candidate in suites if os.path.dirname(candidate) == suite)
+            argv.append(f"--junitxml={suite_junit}")
+            runs.append((suite, argv, suite_junit, base_budget + (1 if i < extra_seconds else 0)))
 
     # Actually ENFORCE network denial (bwrap/unshare on Linux CI) — not just record it — so untrusted
     # test code can't exfiltrate. When fail-closed egress is required (privacy.egress) but no kernel
@@ -339,43 +365,73 @@ def discover_failing_tests(repo_dir: str, test_cmd: str | None = None, *, timeou
             "privacy.egress=fail-closed requires kernel-level egress denial (bwrap/unshare), which is "
             "unavailable here — refusing to run `--tests` with unenforced network."
         )
-    # pytest exits 1 when tests fail — that is the expected/accepted case here (not an error).
-    result = Sandbox(network="deny", timeout_seconds=timeout_seconds, env=env, network_backend=backend).run(
-        argv, cwd=run_dir, accepted_exit_codes=(0, 1)
-    )
-    if result.timed_out:
-        raise RuntimeError(f"test run timed out after {timeout_seconds}s")
 
-    tail = (result.stderr or result.stdout or "")[-1500:]
-    if command and result.returncode == 127:
-        # POSIX sh: "command not found". `pixi run test` on an image without pixi is this, and it
-        # is not a failing test whatever the command's origin.
-        raise TestEnvironmentUnavailable(
-            f"`{command}` (from {source}) exited 127 (command not found), so its runner is not "
-            "installed here.",
-            command_known=True, details={"tail": tail},
-        )
-    if os.path.isfile(junit) and junit_has_collection_errors(junit):
-        # An import error is not a failing test: "fixing" it would mean editing the repo until its
-        # tests import in THIS environment (the webhook image has pytest and nothing else).
-        raise TestEnvironmentUnavailable(
-            "pytest could not import the test modules (collection errors, usually missing "
-            "dependencies), and an import error is not a failing test.",
-            command_known=command is not None,
-        )
-    if command and not explicit and result.returncode != 0 and not os.path.isfile(junit):
-        # A detected command that died before any pytest ran (a build step, an environment that
-        # needs the network the sandbox denies): no evidence about the tests, so no "failing tests"
-        # for the agent to chase -- that is exactly how a refused test-only patch got produced.
-        raise TestEnvironmentUnavailable(
-            f"`{command}` (detected from {source}) exited {result.returncode} before pytest produced "
-            "a report, so that toolchain is not runnable here.",
-            command_known=True, details={"tail": tail},
-        )
-    failing = parse_junit_failures(junit) if os.path.isfile(junit) else []
+    failing: list[str] = []
+    per_suite_failing: list[tuple[str, list[str]]] = []
+    crashed: list[str] = []
+    saw_failure_rc = False
+    last_tail = ""
+    for run_dir, argv, run_junit, budget in runs:
+        run_env = {**env, "CODNA_JUNIT": run_junit}
+        # pytest exits 1 when tests fail — that is the expected/accepted case here (not an error).
+        result = Sandbox(
+            network="deny", timeout_seconds=budget, env=run_env, network_backend=backend
+        ).run(argv, cwd=run_dir, accepted_exit_codes=(0, 1))
+        if result.timed_out:
+            raise RuntimeError(f"test run timed out after {budget}s")
+
+        tail = (result.stderr or result.stdout or "")[-1500:]
+        if command and result.returncode == 127:
+            # POSIX sh: "command not found". `pixi run test` on an image without pixi is this, and it
+            # is not a failing test whatever the command's origin.
+            raise TestEnvironmentUnavailable(
+                f"`{command}` (from {source}) exited 127 (command not found), so its runner is not "
+                "installed here.",
+                command_known=True, details={"tail": tail},
+            )
+        if os.path.isfile(run_junit) and junit_has_collection_errors(run_junit):
+            # An import error is not a failing test: "fixing" it would mean editing the repo until its
+            # tests import in THIS environment (the webhook image has pytest and nothing else).
+            raise TestEnvironmentUnavailable(
+                "pytest could not import the test modules (collection errors, usually missing "
+                "dependencies), and an import error is not a failing test."
+                + ("" if len(runs) == 1 else f" (suite: {os.path.relpath(run_dir, repo_dir)})"),
+                command_known=command is not None,
+            )
+        if command and not explicit and result.returncode != 0 and not os.path.isfile(run_junit):
+            # A detected command that died before any pytest ran (a build step, an environment that
+            # needs the network the sandbox denies): no evidence about the tests, so no "failing tests"
+            # for the agent to chase -- that is exactly how a refused test-only patch got produced.
+            raise TestEnvironmentUnavailable(
+                f"`{command}` (detected from {source}) exited {result.returncode} before pytest produced "
+                "a report, so that toolchain is not runnable here.",
+                command_known=True, details={"tail": tail},
+            )
+        suite_failing = parse_junit_failures(run_junit) if os.path.isfile(run_junit) else []
+        if suite_failing:
+            per_suite_failing.append((run_dir, suite_failing))
+            failing.extend(suite_failing)
+        elif result.returncode not in (0,):
+            saw_failure_rc = True
+            crashed.append(run_dir)
+            last_tail = (result.stdout or result.stderr or "")[-1500:]
+
     if failing:
-        return f"{len(failing)} failing test(s): " + "; ".join(failing[:8]), failing
-    if result.returncode not in (0,):
-        tail = (result.stdout or result.stderr or "")[-1500:]
-        return ("tests are failing (no per-test JUnit ids were produced):\n" + tail), []
+        if len(runs) == 1:
+            return f"{len(failing)} failing test(s): " + "; ".join(failing[:8]), failing
+        parts = [
+            f"{os.path.relpath(suite, repo_dir)}: {len(ids)} failing ({'; '.join(ids[:4])})"
+            for suite, ids in per_suite_failing
+        ]
+        # A suite that crashed without producing JUnit ids is never dropped from the report just
+        # because a sibling suite produced some — its tail is real failure evidence too.
+        for suite in crashed:
+            parts.append(f"{os.path.relpath(suite, repo_dir)}: exited non-zero with no JUnit report")
+        involved = len(per_suite_failing) + len(crashed)
+        return (
+            f"{len(failing)} failing test(s) across {involved} suite(s) — "
+            + " | ".join(parts)
+        ), failing
+    if saw_failure_rc:
+        return ("tests are failing (no per-test JUnit ids were produced):\n" + last_tail), []
     return None, []
