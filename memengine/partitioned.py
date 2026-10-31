@@ -614,7 +614,8 @@ class PartitionedVectorIndex:
 
     def update(self, ids, vectors, keys=None, columns=None, texts=None) -> int:
         """Update vectors (and optionally the partition key + off-key columns): tombstone-old is implicit via
-        LSN supersession; the new version is appended to the (possibly new) partition's delta. Returns the LSN."""
+        LSN supersession; the new version is appended to the (possibly new) partition's delta. Returns the LSN.
+        texts=None explicitly means text is unchanged; existing raw text and lexical token hashes are retained."""
         self._require_mutable()
         if texts is not None:
             columns = self._tokens_column(texts, columns)
@@ -824,7 +825,18 @@ class PartitionedVectorIndex:
         delta merge (the wedge); no filter -> union over all partitions; Eq(off-key column) -> an ad-hoc index
         over the matching LIVE rows. MVCC-correct: base rows superseded by an update are skipped, delta rows
         carry current tokens, and every hit is re-checked through _visible_key so tombstoned/superseded/
-        moved-out rows never surface. Returns (ids, scores) (logical ids) or (ids, scores, explain)."""
+        moved-out rows never surface. Returns (ids, scores) (logical ids) or (ids, scores, explain).
+
+        Lazy build: if the collection was created with lexical=True and retained token hashes exist, but no
+        per-partition plex has been fitted yet, search_lexical builds it automatically using (k1, b). Subsequent
+        mutations are still reflected through the existing base+delta merge, so the plex is not invalidated on
+        every write."""
+        from memengine.lexical import LEX_TOKENS_COLUMN
+        # Lazy build under the write lock: a lexical-capable collection should just work without requiring an
+        # explicit build_lexical() call. The race where two readers both trigger a build is harmless because
+        # build_lexical is idempotent and protected by the same writer-preferring lock used by mutations.
+        if self.columns.get(LEX_TOKENS_COLUMN) is not None and not self.plex:
+            self.build_lexical(k1=k1, b=b)
         with self._rw.read():
             if isinstance(where, dict):
                 if len(where) != 1:
