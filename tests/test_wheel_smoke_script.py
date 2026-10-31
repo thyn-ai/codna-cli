@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ast
+import importlib.metadata
 import importlib.util
-from pathlib import Path
 import sys
 import zipfile
+from email.message import Message
+from pathlib import Path
 
 import pytest
 
@@ -348,6 +351,54 @@ def test_assert_install_probe_rejects_missing_metadata():
         tool.assert_install_probe(payload, expect_native_runtime=False)
 
     assert "package metadata" in str(excinfo.value)
+
+
+def test_readme_payload_reads_metadata_file_when_payload_empty(tmp_path: Path, monkeypatch):
+    tool = _load_script()
+    metadata_path = tmp_path / "codna-0.1.0.dist-info" / "METADATA"
+    metadata_path.parent.mkdir()
+    metadata_path.write_text(
+        "Summary: Codna package metadata\n"
+        "Version: 0.1.0\n"
+        "Description-Content-Type: text/markdown\n\n"
+        "# Codna\n\n"
+        "```bash\n"
+        "pip install codna\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    metadata = Message()
+    metadata["Summary"] = "Codna package metadata"
+    metadata["Description-Content-Type"] = "text/markdown"
+    metadata["Version"] = "0.1.0"
+
+    class FakeDistribution:
+        files = [Path("codna-0.1.0.dist-info/METADATA")]
+
+        @staticmethod
+        def locate_file(candidate):
+            return metadata_path
+
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda name: FakeDistribution())
+
+    probe = ast.parse(tool._INSTALL_PROBE_CODE)
+    helper = next(
+        (
+            node
+            for node in probe.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_readme_payload"
+        ),
+        None,
+    )
+    assert helper is not None, "_readme_payload not found as top-level def in _INSTALL_PROBE_CODE"
+    namespace = {"md": importlib.metadata, "Path": Path}
+    exec(  # noqa: S102 — execute only the embedded helper, not the full probe
+        compile(ast.Module(body=[helper], type_ignores=[]), "<readme-probe>", "exec"),
+        namespace,
+    )
+    description = namespace["_readme_payload"](metadata)
+
+    assert "pip install codna" in description
 
 
 def test_assert_install_probe_rejects_metadata_without_readme():
