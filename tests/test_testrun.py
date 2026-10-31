@@ -165,6 +165,77 @@ def test_discover_multiple_subdir_suites_all_run_and_merge(tmp_path, monkeypatch
     assert "bench" in issue and "cli" in issue
 
 
+def test_detect_pytest_includes_container_and_nested_suites(tmp_path):
+    (tmp_path / "packages" / "tests").mkdir(parents=True)
+    (tmp_path / "packages" / "core" / "tests").mkdir(parents=True)
+    (tmp_path / "packages" / "extra" / "tests").mkdir(parents=True)
+    assert testrun._detect_pytest_suites(str(tmp_path)) == [
+        str(tmp_path / "packages"),
+        str(tmp_path / "packages" / "core"),
+        str(tmp_path / "packages" / "extra"),
+    ]
+
+
+def test_discover_multiple_suites_split_budget_and_set_per_suite_junit(tmp_path, monkeypatch):
+    (tmp_path / "bench" / "tests").mkdir(parents=True)
+    (tmp_path / "cli" / "tests").mkdir(parents=True)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    monkeypatch.delenv("CODNA_REQUIRE_EGRESS_DENY", raising=False)
+    runs = []
+
+    class _FakeResult:
+        timed_out = False
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    class _FakeSandbox:
+        def __init__(self, **kw):
+            self.kw = kw
+
+        def run(self, argv, *, cwd, accepted_exit_codes=(0,)):
+            runs.append((self.kw["timeout_seconds"], self.kw["env"]["CODNA_JUNIT"], argv[-1]))
+            return _FakeResult()
+
+    monkeypatch.setattr(testrun, "Sandbox", _FakeSandbox)
+    assert testrun.discover_failing_tests(str(tmp_path), timeout_seconds=91) == (None, [])
+    assert [budget for budget, _, _ in runs] == [46, 45]
+    assert all(isinstance(budget, int) for budget, _, _ in runs)
+    assert all(env_path == junit_arg.split("=", 1)[1] for _, env_path, junit_arg in runs)
+    assert len({env_path for _, env_path, _ in runs}) == 2
+
+
+def test_discover_container_suite_excludes_independently_run_nested_roots(tmp_path, monkeypatch):
+    (tmp_path / "packages" / "tests").mkdir(parents=True)
+    (tmp_path / "packages" / "core" / "tests").mkdir(parents=True)
+    (tmp_path / "packages" / "extra" / "tests").mkdir(parents=True)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    monkeypatch.delenv("CODNA_REQUIRE_EGRESS_DENY", raising=False)
+    runs = {}
+
+    class _FakeResult:
+        timed_out = False
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    class _FakeSandbox:
+        def __init__(self, **kw):
+            pass
+
+        def run(self, argv, *, cwd, accepted_exit_codes=(0,)):
+            runs[cwd] = argv
+            return _FakeResult()
+
+    monkeypatch.setattr(testrun, "Sandbox", _FakeSandbox)
+    assert testrun.discover_failing_tests(str(tmp_path)) == (None, [])
+    container_argv = runs[str(tmp_path / "packages")]
+    assert f"--ignore={tmp_path / 'packages' / 'core'}" in container_argv
+    assert f"--ignore={tmp_path / 'packages' / 'extra'}" in container_argv
+    assert not any(arg.startswith("--ignore=") for arg in runs[str(tmp_path / "packages" / "core")])
+    assert not any(arg.startswith("--ignore=") for arg in runs[str(tmp_path / "packages" / "extra")])
+
+
 def test_discover_crashed_suite_is_reported_alongside_junit_failures(tmp_path, monkeypatch):
     """bench/ crashes with no JUnit while cli/ produces failures: the crash must appear in the
     issue text even though `failing` is non-empty from the other suite (review: silent drop)."""
@@ -191,6 +262,31 @@ def test_discover_crashed_suite_is_reported_alongside_junit_failures(tmp_path, m
     assert "cli" in issue
     assert "bench" in issue and "no JUnit" in issue  # the crashed suite is not dropped
     assert "2 suite(s)" in issue  # failing + crashed both counted in the header
+
+
+def test_discover_crashed_suite_with_empty_junit_does_not_claim_report_is_missing(tmp_path, monkeypatch):
+    (tmp_path / "bench" / "tests").mkdir(parents=True)
+    (tmp_path / "cli" / "tests").mkdir(parents=True)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    monkeypatch.delenv("CODNA_REQUIRE_EGRESS_DENY", raising=False)
+
+    class _FakeSandbox:
+        def __init__(self, **kw):
+            pass
+
+        def run(self, argv, *, cwd, accepted_exit_codes=(0,)):
+            junit = argv[-1].split("=", 1)[1]
+            report = _JUNIT if cwd.endswith("cli") else '<testsuite tests="0" failures="0" errors="0"/>'
+            with open(junit, "w", encoding="utf-8") as fh:
+                fh.write(report)
+            return type("R", (), {"timed_out": False, "returncode": 1, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(testrun, "Sandbox", _FakeSandbox)
+    issue, failing = testrun.discover_failing_tests(str(tmp_path))
+
+    assert failing == ["pkg.test_mod::test_bad", "pkg.test_mod::test_err"]
+    assert "bench: exited non-zero with JUnit report but no failing test ids" in issue
+    assert "no JUnit report" not in issue
 
 
 def test_discover_too_many_suites_refuses_with_guidance(tmp_path, monkeypatch):
