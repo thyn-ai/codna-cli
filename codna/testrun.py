@@ -162,7 +162,6 @@ def _detect_pytest_suites(repo_dir: str) -> list[str]:
             continue
         if _has_pytest_config(sub):
             suites.append(sub)
-            continue
         if name not in _CONTAINER_DIRS:
             continue
         try:
@@ -345,19 +344,17 @@ def discover_failing_tests(repo_dir: str, test_cmd: str | None = None, *, timeou
                 "budget. Point Codna at the right one with fix.test_command in codna.yaml or "
                 "--test-cmd \"<your test command>\" (writing JUnit to $CODNA_JUNIT)."
             )
-        # Each suite runs from its own root so its pyproject/pytest.ini applies; the overall budget
-        # is split evenly (deterministic). The 60s floor is safe: _MAX_SUITES caps the count, so
-        # floor * suites can never exceed 8*60s = 480s even when timeout_seconds is small.
-        per_suite = max(60, timeout_seconds // len(suites))
+        # Each suite runs from its own root so its pyproject/pytest.ini applies. Distribute the
+        # caller's total integer-second budget as evenly as possible without exceeding it.
+        base_budget, extra_seconds = divmod(timeout_seconds, len(suites))
         runs = []
         for i, suite in enumerate(suites):
             suite_junit = junit if len(suites) == 1 else f"{os.path.splitext(junit)[0]}-{i}.xml"
-            runs.append((
-                suite,
-                [sys.executable, "-m", "pytest", "-q", f"--junitxml={suite_junit}"],
-                suite_junit,
-                per_suite,
-            ))
+            argv = [sys.executable, "-m", "pytest", "-q"]
+            # A container suite must not recursively collect nested roots that run independently.
+            argv.extend(f"--ignore={candidate}" for candidate in suites if os.path.dirname(candidate) == suite)
+            argv.append(f"--junitxml={suite_junit}")
+            runs.append((suite, argv, suite_junit, base_budget + (1 if i < extra_seconds else 0)))
 
     # Actually ENFORCE network denial (bwrap/unshare on Linux CI) — not just record it — so untrusted
     # test code can't exfiltrate. When fail-closed egress is required (privacy.egress) but no kernel
@@ -375,10 +372,11 @@ def discover_failing_tests(repo_dir: str, test_cmd: str | None = None, *, timeou
     saw_failure_rc = False
     last_tail = ""
     for run_dir, argv, run_junit, budget in runs:
+        run_env = {**env, "CODNA_JUNIT": run_junit}
         # pytest exits 1 when tests fail — that is the expected/accepted case here (not an error).
-        result = Sandbox(network="deny", timeout_seconds=budget, env=env, network_backend=backend).run(
-            argv, cwd=run_dir, accepted_exit_codes=(0, 1)
-        )
+        result = Sandbox(
+            network="deny", timeout_seconds=budget, env=run_env, network_backend=backend
+        ).run(argv, cwd=run_dir, accepted_exit_codes=(0, 1))
         if result.timed_out:
             raise RuntimeError(f"test run timed out after {budget}s")
 
