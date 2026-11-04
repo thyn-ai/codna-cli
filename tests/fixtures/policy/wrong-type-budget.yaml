@@ -1,0 +1,8 @@
+# Wrong TYPE inside the budget: YAML parses `max_cost_usd: "5.0"` as the STRING "5.0".
+# Coercing it would silently invent a cap; a bool would coerce to 1.0. Must DENY
+# (`policy_invalid_type`), because a cap that was not a number is not a cap.
+version: 1
+tools:
+  allow: [read_files]
+budget:
+  max_cost_usd: "5.0"

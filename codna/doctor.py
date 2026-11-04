@@ -19,7 +19,7 @@ API_KEY_KEYS = ("CODNA_API_KEY", "ALGENTA_API_KEY", "DE_API_KEY")
 PUBLIC_CONFIGURED_VALUE = "<configured>"
 PUBLIC_STATE_PATH = Path.home() / ".codna" / "runtime" / "local-stack.json"
 _URL_CREDENTIAL_RE = re.compile(r"(https?://)([^/@\s\"']+@)")
-_SECRET_FIELD_RE = re.compile(r"(?i)\b(password|token|secret|api[_-]?key)(\s*[:=]\s*)[^\s,}\]]+")
+_SECRET_FIELD_RE = re.compile(r"(?i)\b(password|token|secret|api[_-]?key)([\"']?\s*[:=]\s*)[^\s,}\]]+")
 
 
 def _first_config_source(env: Mapping[str, str], keys: tuple[str, ...]) -> str | None:

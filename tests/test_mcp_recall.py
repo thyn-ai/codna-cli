@@ -89,19 +89,10 @@ def test_recall_uses_external_mcp_memory_root(monkeypatch, tmp_path):
 
 
 # ── kernel-gated: the happy path returns real symbols + a plan ────────────────────────────────────
-def _telys_ready():
-    try:
-        from codna.memory import _configure_telys_kernel_env
-
-        _configure_telys_kernel_env()
-        from telys.embedding import AlgentaBigramEmbedder
-        AlgentaBigramEmbedder()
-        return True
-    except Exception:
-        return False
+from telys_gate import telys_kernel_ready  # noqa: E402 — must follow the sys.path setup above
 
 
-@pytest.mark.skipif(not _telys_ready(), reason="Telys not installed or Codna could not resolve a local kernel")
+@pytest.mark.skipif(not telys_kernel_ready(), reason="Telys not installed or Codna could not resolve a local kernel")
 def test_recall_happy_path(monkeypatch, tmp_path):
     monkeypatch.setenv("CODNA_TELYS_MEMORY_ROOT", str(tmp_path / "memory-root"))
     (tmp_path / "ci.py").write_text(

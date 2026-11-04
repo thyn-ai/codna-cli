@@ -1,0 +1,10 @@
+# Sections present but PERMITTING NOTHING: empty tool list, empty write scope, no commands.
+# This is the fixture that separates "denies everything" from "malformed" — the document is valid
+# and must be reported as `policy_denies_all`, not as an unknown-key or type error.
+version: 1
+tools:
+  allow: []
+write_scope:
+  paths: []
+command_allow_list:
+  commands: []
