@@ -25,6 +25,30 @@ def _git(repo_dir: str, *args: str, stdin: str | None = None) -> str:
     return proc.stdout
 
 
+def push_branch(
+    repo_dir: str,
+    *,
+    branch: str,
+    sha: str,
+    push_url: str | None = None,
+    remote: str = "origin",
+) -> str:
+    """Push an EXISTING commit as ``branch``. Returns the branch name.
+
+    The sibling of `GitBranchBuilder.build_and_push` for a caller whose branch is already built —
+    a durable run commits each turn itself (`durable.activities.checkpoint_turn`), so there is no
+    patch to apply here and re-applying one would rewrite the history that was just audited. It
+    verifies ``sha`` exists first: pushing a ref that is not in this repository would otherwise
+    fail deep inside git with a message about the remote, not about the mistake.
+
+    Idempotent in the sense that matters: pushing the same sha again is a no-op on the remote
+    (git reports "Everything up-to-date"), so a retried activity does not error.
+    """
+    rev = _git(repo_dir, "rev-parse", "--verify", f"{sha}^{{commit}}").strip()
+    _git(repo_dir, "push", push_url or remote, f"{rev}:refs/heads/{branch}")
+    return branch
+
+
 class GitBranchBuilder:
     def __init__(self, repo_dir: str, remote: str = "origin"):
         self.repo_dir = repo_dir
