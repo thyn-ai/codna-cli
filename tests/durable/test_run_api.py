@@ -72,7 +72,7 @@ from codna.durable.identity import AUTH_MODE_TOKEN, IdentityConfig, IdentityReso
 from codna.durable.ledger import RunLedger
 from codna.durable.siem import NullSiemSink
 from codna.durable.run_api import RunApiServer
-from codna.durable.run_api_backend import RunBackend, translate
+from codna.durable.run_api_backend import RunBackend, durable_capabilities, translate
 from codna.durable.run_api_support import (
     SSE_EVENT_TEMPLATE,
     SSE_HEADERS,
@@ -166,6 +166,11 @@ class ScriptedBackend(RunBackend):
         self.signals: list[tuple[str, str]] = []
         self.closed = False
         self.start_error: BaseException | None = None
+
+    def capabilities(self) -> Any:
+        # A Temporal-shaped answer: this backend stands in for a CONNECTED server, so every route is
+        # servable. The `--no-temporal` mode has its own tests, which assert the other answer.
+        return durable_capabilities("127.0.0.1:7233")
 
     def start_run(self, *, payload: Mapping[str, Any], run_id: str, run_timeout_s: int) -> dict[str, Any]:
         if self.start_error is not None:
@@ -1962,6 +1967,257 @@ def test_outcome_of_reports_nothing_for_an_open_run(config: Any) -> None:
     assert outcome_of(config.ledger_path("run-open")) is None
 
 
+# -- the terminal a run ACTUALLY writes ---------------------------------------------------------
+#
+# `run.finished` is written only on the two `completed` exits of `RunWorkflow`. A run whose task never
+# got that far ends at a TURN terminal and writes nothing above it, and reading only the run terminal
+# meant such a run was reported as open — and animated as Working — forever. These tests use the real
+# shape: the event is a `turn.event` whose `event_type` names the turn's ending.
+
+# The THREE REAL LEDGERS from the report, copied verbatim (byte-identical by sha256) and checked in.
+# They lived only in the reporter's `~/.codna/runs/`, so a path into `$HOME` would have made this
+# proof pass on one machine and skip everywhere else — including CI, whose "no unexpected skips" gate
+# correctly refuses a skip that hides a missing fixture. A committed copy is what makes the assertion
+# portable; the user's own files stay untouched and are still the thing that was measured.
+STUCK_RUN_IDS = (
+    "run-20261030T185610Z",
+    "run-20261030T184245Z",
+    "run-20261030T184525Z",
+)
+STUCK_RUNS_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "stuck_runs"
+
+# sha256 of each file EXACTLY as the reporter's `~/.codna/runs/<id>/ledger.ndjson` had it. Pinned so a
+# fixture cannot be edited into a shape that passes: being real is the entire evidentiary value.
+STUCK_RUN_SHA256 = {
+    "run-20261030T185610Z": "c6b6c676e443e2a0bbec1eda1e938c5d83c35f9f49fb03501d6a3c4b3ca32ae4",
+    "run-20261030T184245Z": "15c04b4a9f2332e778576c57ee813a9aea5fb406c8c7f4855e0c57e4d93fd058",
+    "run-20261030T184525Z": "cbbfad02121af73cab420437867d996f2865c3bc9975e3c8624f682e5d1743e3",
+}
+
+
+
+def _turn_terminal(config: Any, run_id: str, event_type: str) -> Path:
+    """A ledger whose last meaningful record is a turn terminal, as the engine writes it."""
+    ledger = RunLedger.for_run(config.paths, run_id)
+    ledger.append("note", payload={"event": "notification", "kind": "run.started", "message": "go"})
+    ledger.append("turn.started", payload={"turn_id": "t1", "phase": "plan"})
+    ledger.append(
+        "turn.event", session_id="s1", event_index=1, payload={"event_type": event_type, "payload": {}}
+    )
+    return config.ledger_path(run_id)
+
+
+def test_a_failed_turn_ends_the_run_as_failed(config: Any) -> None:
+    """A turn the engine failed is a run that ended badly, not a run that is still going."""
+    path = _turn_terminal(config, "run-turn-failed", "session.turn_failed")
+    assert support.terminal_verdict(path)[0] is True
+    assert outcome_of(path) == "failed"
+
+
+def test_an_aborted_turn_ends_the_run_as_stopped_not_failed(config: Any) -> None:
+    """An INTERRUPTED turn is not a failure. `turn_unpaired` is a warning in the soak harness for
+    exactly this reason, so an abort resolves to `stopped` — ended, not blamed."""
+    for index, event_type in enumerate(("session.aborted", "session.turn_aborted", "session.stopped")):
+        path = _turn_terminal(config, f"run-turn-aborted-{index}", event_type)
+        assert support.terminal_verdict(path)[0] is True
+        assert outcome_of(path) == "stopped", event_type
+
+
+def test_a_resume_after_an_abort_supersedes_it(config: Any) -> None:
+    """The engine restarts a turn under the same key: the abort is history, not a verdict.
+
+    Measured on a real 24h soak: 23 of 97 ledgers end at `session.aborted` and many of those have a
+    `session.resumed` right after. Reading "any terminal anywhere" would call a resumed run finished.
+    """
+    ledger = RunLedger.for_run(config.paths, "run-resumed")
+    ledger.append("turn.event", session_id="s1", event_index=1, payload={"event_type": "session.aborted"})
+    ledger.append("note", payload={"event": "turn.resumed_from_ledger", "turn_key": "k"})
+    ledger.append("turn.event", session_id="s1", event_index=2, payload={"event_type": "session.resumed"})
+    ledger.append("turn.event", session_id="s1", event_index=3, payload={"event_type": "agent.content_start"})
+    path = config.ledger_path("run-resumed")
+    assert support.terminal_verdict(path)[0] is False
+    assert outcome_of(path) is None
+
+
+def test_work_after_a_run_terminal_cannot_unfinish_it(config: Any) -> None:
+    """`run.finished` is final: nothing is scheduled after it, so nothing may revoke it."""
+    ledger = RunLedger.for_run(config.paths, "run-final")
+    ledger.append("note", payload={"event": "notification", "kind": "run.finished", "outcome": "completed"})
+    ledger.append("turn.event", session_id="s1", event_index=1, payload={"event_type": "agent.content_start"})
+    assert outcome_of(config.ledger_path("run-final")) == "completed"
+
+
+def test_a_terminal_without_an_outcome_is_still_ended(config: Any) -> None:
+    """The ending is a fact even when the cause was never written down.
+
+    Production `_notify` carries no `outcome` — measured on a real 24h soak, all 9 `run.finished`
+    notes had keys `event/evidence/kind/message` and 0 had an outcome. So `ended` must not depend on
+    it, or every completed production run would still read as in progress.
+    """
+    ledger = RunLedger.for_run(config.paths, "run-no-outcome")
+    ledger.append("note", payload={"event": "notification", "kind": "run.finished", "message": "done"})
+    path = config.ledger_path("run-no-outcome")
+    assert support.terminal_verdict(path)[0] is True
+    assert outcome_of(path) is None
+
+
+def test_stalled_threshold_is_twice_the_longest_activity() -> None:
+    """The threshold mirrors Temporal's own ceiling for one activity, so it cannot silently drift."""
+    from codna.durable.contracts import ACTIVITY_TURN_TIMEOUT_S
+
+    assert support.STALLED_AFTER_S == 2 * ACTIVITY_TURN_TIMEOUT_S
+
+
+def test_a_quiet_ledger_with_no_terminal_is_stalled_not_working(config: Any) -> None:
+    """The third state. A run nobody is producing must not animate forever."""
+    ledger = RunLedger.for_run(config.paths, "run-quiet")
+    ledger.append("run.started")
+    path = config.ledger_path("run-quiet")
+    fresh = support.ledger_verdict(path, updated_ts=path.stat().st_mtime)
+    assert fresh["ended"] is False
+    assert fresh["stalled"] is False, "a ledger written a moment ago is simply live"
+    old = support.ledger_verdict(
+        path, updated_ts=path.stat().st_mtime - (support.STALLED_AFTER_S + 1)
+    )
+    assert old["ended"] is False
+    assert old["stalled"] is True
+
+
+def test_a_terminal_bearing_ledger_is_never_stalled(config: Any) -> None:
+    """`stalled` is "we do not know"; a terminal is "we do know". They cannot both hold."""
+    path = _turn_terminal(config, "run-ended-old", "session.turn_failed")
+    verdict = support.ledger_verdict(path, updated_ts=path.stat().st_mtime - 30 * 24 * 60 * 60)
+    assert verdict["ended"] is True
+    assert verdict["stalled"] is False
+    assert verdict["outcome"] == "failed"
+
+
+@pytest.mark.parametrize("run_id", STUCK_RUN_IDS)
+def test_the_users_own_stuck_runs_resolve_to_an_outcome(run_id: str) -> None:
+    """The reported defect, on the real ledgers: these three animated as Working for 4-6 days.
+
+    ``stopped`` rather than ``failed`` is the measured answer, not a softened one: each of these
+    ledgers records a ``session.turn_failed``, then retries (``session.resumed``), and the LAST
+    substantive record is a ``session.aborted`` — the run was aborted, so the abort is the verdict.
+    Both outcomes are non-``completed``, so the sidebar shows a run needing attention either way;
+    the distinction that matters is ended-versus-working.
+    """
+    path = STUCK_RUNS_DIR / run_id / "ledger.ndjson"
+    assert path.is_file(), f"the fixture for {run_id} is missing from {STUCK_RUNS_DIR}"
+    assert support.terminal_verdict(path)[0] is True, f"{run_id} contains a turn terminal and must read as ended"
+    assert outcome_of(path) == "stopped", run_id
+
+
+def test_the_turn_terminal_set_matches_the_sidecars() -> None:
+    """The vocabulary is the SIDECAR's, transcribed. A drifting copy is a silent misclassification."""
+    from codna.durable.sidecar_client import SSE_TERMINAL_TURN_EVENTS
+
+    assert support.TURN_TERMINAL_EVENT_TYPES == SSE_TERMINAL_TURN_EVENTS
+
+
+def test_a_completed_turn_is_not_a_run_verdict(config: Any) -> None:
+    """A turn that COMPLETED is progress, not an ending — folding it into "stopped" would be a lie.
+
+    This is the distinction `codna review` was right to probe. A successful turn is a task doing its
+    job; a run whose next task is still coming must not read as over because the last turn ended
+    cleanly. So `session.turn_completed` is deliberately absent from the verdict set, and the mapping
+    function refuses it rather than having a fallthrough that quietly calls success "stopped".
+    """
+    assert support.TURN_COMPLETED_EVENT in support.TURN_TERMINAL_EVENT_TYPES
+    assert support.TURN_COMPLETED_EVENT not in support.TURN_VERDICT_EVENT_TYPES
+    with pytest.raises(ValueError):
+        support.outcome_of_turn_terminal(support.TURN_COMPLETED_EVENT)
+    # And a ledger ending on a completed turn is NOT reported as finished...
+    ledger = RunLedger.for_run(config.paths, "run-turn-ok")
+    ledger.append("turn.event", session_id="s1", event_index=1,
+                  payload={"event_type": support.TURN_COMPLETED_EVENT, "payload": {}})
+    path = config.ledger_path("run-turn-ok")
+    assert support.terminal_verdict(path)[0] is False
+    assert outcome_of(path) is None
+
+
+def test_the_detail_summary_reads_terminal_and_outcome_from_one_pass(config: Any) -> None:
+    """`ledger_summary` must not report `terminal: false` beside `outcome: "completed"`.
+
+    Two independent tail reads can observe two file states, and a response that contradicts itself is
+    worse than either answer. The route now takes both facts from ONE `terminal_verdict` call.
+    """
+    ledger = RunLedger.for_run(config.paths, "run-atomic")
+    ledger.append("note", payload={"event": "notification", "kind": "run.finished", "outcome": "completed"})
+    ended, outcome = support.terminal_verdict(config.ledger_path("run-atomic"))
+    assert ended is True
+    assert outcome == "completed"
+    # The invariant the route relies on: it is impossible for the pair to disagree.
+    assert (ended, outcome) == (
+        support.terminal_verdict(config.ledger_path("run-atomic"))[0],
+        outcome_of(config.ledger_path("run-atomic")),
+    )
+
+
+def test_the_route_reports_a_terminal_bearing_run_as_ended(server: Any) -> None:
+    """End-to-end: a turn terminal (no `run.finished`) reaches `/runs` as ended, with an outcome.
+
+    A FRESH run id, not `seed_mutable_run`: that fixture's ledger already ends at a `run.finished`,
+    which is deliberately final, so appending a turn terminal after it would (correctly) still report
+    `completed`. The case under test is a run that never got a `run.finished` at all.
+    """
+    run_id = "run-turn-only"
+    ledger = RunLedger.for_run(server.config.paths, run_id)
+    ledger.append("note", payload={"event": "notification", "kind": "run.started", "message": "go"})
+    ledger.append(
+        "turn.event",
+        session_id="s1",
+        event_index=1,
+        payload={"event_type": "session.turn_failed", "payload": {"error": "no API key"}},
+    )
+    _, body = server.json("GET", "/runs")
+    entry = next(item for item in body["runs"] if item["run_id"] == run_id)
+    assert entry["ended"] is True
+    assert entry["outcome"] == "failed"
+    assert entry["stalled"] is False
+    _, one = server.json("GET", f"/runs/{run_id}")
+    assert one["ledger"]["terminal"] is True
+    assert one["outcome"] == "failed"
+
+
+@pytest.mark.parametrize("run_id", STUCK_RUN_IDS)
+def test_the_committed_fixtures_are_the_real_ledgers(run_id: str) -> None:
+    """The fixtures are the reporter's files copied verbatim — proven by sha256, not by chain.
+
+    Pinned by sha256 so a fixture cannot be quietly edited into something that passes: the point of
+    these files is that they are what a real run wrote, and a "fixed" copy would prove nothing.
+
+    The hash chain is deliberately NOT asserted: one of the three real ledgers has a broken chain
+    (``run-20261030T184525Z``, 7 problems starting at seq 10), and that damage is part of the
+    evidence. Repairing it in a fixture would erase the condition that produced the defect.
+    """
+    import hashlib
+
+    path = STUCK_RUNS_DIR / run_id / "ledger.ndjson"
+    raw = path.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == STUCK_RUN_SHA256[run_id]
+
+
+def _records(path: Path) -> list[Any]:
+    """Every complete record in a ledger file, in order. The whole file, for chain checks only."""
+    from codna.durable.ledger import LedgerRecord
+
+    raw = path.read_bytes().decode("utf-8")
+    return [LedgerRecord.from_payload(json.loads(line)) for line in raw.splitlines() if line.strip()]
+
+
+def test_a_broken_chain_does_not_hide_the_terminal_verdict() -> None:
+    """The one damaged fixture still resolves, because the verdict is read from the tail, not the chain.
+
+    A run whose ledger chain is broken is exactly the run most likely to be stuck: reporting it as
+    ``working`` would be the worst possible answer. The tail scan is chain-independent by design.
+    """
+    path = STUCK_RUNS_DIR / "run-20261030T184525Z" / "ledger.ndjson"
+    assert len(support.ledger_problems(_records(path))) > 0, "this fixture is expected to be damaged"
+    assert support.terminal_verdict(path)[0] is True
+    assert outcome_of(path) == "stopped"
+
+
 def test_translate_maps_a_missing_workflow_to_404() -> None:
     error = translate(cli_error("could not query workflow run:x: not found", code="durable_query_failed"),
                       run_id="x")
@@ -2061,6 +2317,24 @@ def test_serve_prints_a_readable_banner_through_a_pipe(tmp_path: Path) -> None:
         assert banner.lstrip().startswith("{"), f"the banner never arrived through the pipe: {banner!r}"
         document = json.loads(banner)
         assert document["run_api"]["url"].startswith("http://127.0.0.1:")
+        # THE BANNER STATES THE MODE. A `--no-temporal` server used to report only `"temporal": null`,
+        # which is a fact about a CONNECTION — an operator who had been told to run `codna serve` read
+        # the absence as a broken install. `capabilities` says what works and what does not.
+        capabilities = document["run_api"]["capabilities"]
+        assert capabilities["mode"] == "ledger-only"
+        assert capabilities["durable_execution"] is False
+        assert capabilities["temporal_address"] is None
+        assert capabilities["reason_code"] == "run_api_temporal_disabled"
+        assert capabilities["available_routes"] == [
+            "runs.capabilities",
+            "runs.events",
+            "runs.get",
+            "runs.list",
+        ]
+        assert "runs.start" in capabilities["unavailable_routes"]
+        assert capabilities["summary"].startswith("Ledger-only mode:")
+        # `temporal` is kept for callers already keying on it, and it must AGREE with `capabilities`.
+        assert document["run_api"]["temporal"] is None
         # The token's PATH is printed; the token itself must not be. A server that logs its own
         # credential has published it to every process that can read the log.
         token_path = Path(document["run_api"]["token_path"])
@@ -2077,7 +2351,14 @@ def test_serve_prints_a_readable_banner_through_a_pipe(tmp_path: Path) -> None:
 
 
 def test_the_ledger_only_backend_answers_503_for_everything_that_needs_temporal(config: Any) -> None:
-    """`--no-temporal` is explicit: a caller that steers through it is told it did not happen."""
+    """`--no-temporal` is explicit: a caller that steers through it is told it did not happen.
+
+    THE REFUSAL IS NOW ACTIONABLE, and that is what this pins. It used to read "this run API cannot
+    reach Temporal: it was started with --no-temporal" — a sentence that named the flag the operator
+    deliberately chose and nothing they could DO. The message now describes the mode (ledger-only),
+    names what still works, and names the fix; `details.available_routes` is the machine-readable half
+    so a client can render its own affordances instead of parsing prose.
+    """
     from codna.durable.run_cli import _LedgerOnlyBackend
 
     backend = _LedgerOnlyBackend()
@@ -2090,9 +2371,76 @@ def test_the_ledger_only_backend_answers_503_for_everything_that_needs_temporal(
             call()
         assert caught.value.code == "run_api_temporal_disabled"
         assert caught.value.status == 503
+        # NOT an error about a flag: a statement of the mode and of what still works.
+        assert "ledger-only" in str(caught.value)
+        assert "can list runs and read their history" in str(caught.value)
+        # AND the route that does work is named in the structured half.
+        assert caught.value.details["available_routes"] == [
+            "runs.capabilities",
+            "runs.events",
+            "runs.get",
+            "runs.list",
+        ]
+        assert caught.value.details["no_temporal"] is True
+        # The hint names a command a person can run, not the flag they already passed.
+        assert "codna durable dev-server start" in caught.value.hint
     # ...but a ledger read still works, which is the point of the mode.
     assert backend.status("r") is None
     backend.close()
+
+
+def test_the_ledger_only_backend_states_its_capabilities_before_being_asked_to_act(config: Any) -> None:
+    """The mode is DATA, available without provoking a 503.
+
+    This is the other half of the fix: the banner and `GET /capabilities` answer "what can you do"
+    up front, so a client does not have to attempt a mutation to learn the mode.
+    """
+    from codna.durable.run_cli import _LedgerOnlyBackend
+
+    capabilities = _LedgerOnlyBackend().capabilities()
+    assert capabilities.durable_execution is False
+    assert capabilities.temporal_address is None
+    assert capabilities.mode == "ledger-only"
+    assert capabilities.reason_code == "run_api_temporal_disabled"
+    # Exactly the reads work, and exactly the mutations do not — no third state to interpret.
+    assert capabilities.available_routes == frozenset(
+        {"runs.capabilities", "runs.list", "runs.get", "runs.events"}
+    )
+    assert capabilities.unavailable_routes == frozenset(
+        {"runs.start", "runs.steer", "runs.approve", "runs.budget", "runs.pause", "runs.resume", "runs.cancel"}
+    )
+    assert not (capabilities.available_routes & capabilities.unavailable_routes)
+    payload = capabilities.as_payload()
+    assert payload["mode"] == "ledger-only"
+    assert payload["summary"].startswith("Ledger-only mode: listing runs and reading run history work")
+    assert "codna durable dev-server start" in payload["summary"]
+
+
+def test_a_temporal_backend_reports_every_route_and_its_address() -> None:
+    """The healthy half of the same document. No socket: the answer is a pure function of the config."""
+    from codna.durable.run_api_backend import durable_capabilities
+
+    capabilities = durable_capabilities("127.0.0.1:7233")
+    assert capabilities.durable_execution is True
+    assert capabilities.mode == "durable"
+    assert capabilities.reason_code is None
+    assert capabilities.unavailable_routes == frozenset()
+    assert capabilities.available_routes == frozenset(
+        {
+            "runs.capabilities",
+            "runs.list",
+            "runs.get",
+            "runs.events",
+            "runs.start",
+            "runs.steer",
+            "runs.approve",
+            "runs.budget",
+            "runs.pause",
+            "runs.resume",
+            "runs.cancel",
+        }
+    )
+    assert "127.0.0.1:7233" in capabilities.as_payload()["summary"]
 
 
 def test_a_ledger_only_server_serves_reads_and_refuses_writes(config: Any) -> None:
@@ -2121,17 +2469,102 @@ def test_a_ledger_only_server_serves_reads_and_refuses_writes(config: Any) -> No
         status, body = live.json("GET", "/runs")
         assert status == 200
         assert [entry["run_id"] for entry in body["runs"]] == ["run-io"]
+        # THE MODE RIDES ON THE LIST the IDE already polls, so a window that can list runs can say
+        # what else it can do. Without this, the only way to learn the mode was to fail a start.
+        assert body["capabilities"]["mode"] == "ledger-only"
+        assert body["capabilities"]["durable_execution"] is False
+        assert body["capabilities"]["unavailable_routes"] == sorted(
+            {"runs.start", "runs.steer", "runs.approve", "runs.budget", "runs.pause", "runs.resume", "runs.cancel"}
+        )
+
+        status, body = live.json("GET", "/capabilities")
+        assert status == 200
+        assert body["capabilities"]["mode"] == "ledger-only"
 
         status, body = live.json(
             "POST", "/runs/run-io/pause", body={"identity": TEST_IDENTITY}
         )
         assert status == 503
         assert body["error"]["code"] == "run_api_temporal_disabled"
+        # The refusal itself names what still works, so a client that only ever sees the 503 is not
+        # left with "a flag was passed".
+        assert "ledger-only" in body["error"]["message"]
+        assert body["error"]["details"]["available_routes"] == [
+                "runs.capabilities",
+                "runs.events",
+                "runs.get",
+                "runs.list",
+            ]
 
         status, body = live.json("POST", "/runs", body={"briefs": ["b"]})
         assert status == 503
     finally:
         running.stop()
+
+
+def test_a_durable_server_reports_full_capabilities_over_http(config: Any) -> None:
+    """The healthy path over the wire: the mode says every route is servable.
+
+    `ScriptedBackend` stands in for a CONNECTED Temporal server, so this pins the transport's half of
+    the contract without needing a real cluster. The real-cluster path is covered by
+    `test_run_api_real.py` where one is available.
+    """
+    RunLedger.for_run(config.paths, "run-ok").append(        "run.started", payload={"event": "notification", "kind": "run.started"}
+    )
+    settings = RunApiSettings(port=0, token_path=config.paths.root / "ok.token")
+    running = RunApiServer(
+        config=config,
+        backend=ScriptedBackend(),
+        settings=settings,
+        identity=IdentityResolver(
+            IdentityConfig(
+                mode=AUTH_MODE_TOKEN,
+                local_token=load_or_create_token(settings.token_path),
+                local_identity=TEST_IDENTITY,
+            )
+        ),
+        siem=NullSiemSink(),
+    ).start()
+    live = Running(running, ScriptedBackend(), config)
+    try:
+        status, body = live.json("GET", "/capabilities")
+        assert status == 200
+        assert body["capabilities"]["mode"] == "durable"
+        assert body["capabilities"]["durable_execution"] is True
+        assert body["capabilities"]["unavailable_routes"] == []
+        assert body["capabilities"]["reason_code"] is None
+
+        status, body = live.json("GET", "/runs")
+        assert status == 200
+        assert body["capabilities"]["mode"] == "durable"
+    finally:
+        running.stop()
+
+
+def test_the_capability_sets_partition_the_route_table() -> None:
+    """Every declared route is in exactly one set, so a new route cannot be silently undescribed.
+
+    Written against `roles.ROUTE_ROLES` rather than the router because the role table is the closed
+    declaration of "which routes exist"; a route added there without a decision in `READ_ROUTE_KEYS`
+    or `TEMPORAL_ROUTE_KEYS` would otherwise be an endpoint a capability document omitted.
+
+    THE UNION IS ASSERTED EQUAL, NOT MERELY A SUPERSET. An earlier version wrote
+    ``described | {"runs.capabilities"} == set(ROUTE_ROLES)``, which passes even if
+    ``runs.capabilities`` were removed from BOTH sets — the union would add it back, so the guard was
+    weaker than its own comment claimed. Equality is what makes "a declared route has a home" true,
+    and the explicit membership check below keeps the capability route in the READ set specifically
+    (it needs no Temporal, which is why a ledger-only server can answer it).
+    """
+    from codna.durable.roles import ROUTE_ROLES
+    from codna.durable.run_api_backend import READ_ROUTE_KEYS, TEMPORAL_ROUTE_KEYS
+
+    assert not (READ_ROUTE_KEYS & TEMPORAL_ROUTE_KEYS), "a route cannot both need and not need Temporal"
+    described = READ_ROUTE_KEYS | TEMPORAL_ROUTE_KEYS
+    # Equality, with no set added back in: a route missing from both buckets fails HERE.
+    assert described == set(ROUTE_ROLES)
+    # And `runs.capabilities` is a READ, so a ledger-only server can describe itself.
+    assert "runs.capabilities" in READ_ROUTE_KEYS
+    assert "runs.capabilities" not in TEMPORAL_ROUTE_KEYS
 
 
 def test_the_outcome_survives_a_control_note_written_after_the_terminal(config: Any) -> None:
@@ -2158,9 +2591,13 @@ def test_the_run_list_reports_a_finished_run_after_a_control_note(server: Runnin
     assert status == 200
     _, body = server.json("GET", "/runs")
     assert [entry["outcome"] for entry in body["runs"]] == ["completed"]
+    assert [entry["ended"] for entry in body["runs"]] == [True]
     _, one = server.json("GET", f"/runs/{run_id}")
     assert one["outcome"] == "completed"
-    assert one["ledger"]["terminal"] is False  # the LAST record is the control note, honestly reported
+    # `terminal` is "the run ended", not "the last record is a terminal". The control note is the
+    # last record and the run still ended — reading the flag as "last record" is what reported a
+    # finished run as open forever.
+    assert one["ledger"]["terminal"] is True
 
 
 # -- delegation and parallelism (D7) ---------------------------------------------------------

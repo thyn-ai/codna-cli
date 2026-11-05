@@ -72,15 +72,13 @@ from .roles import AuthorizationError, Principal
 from .run_api_backend import RunBackend, TemporalRunBackend, translate
 from .run_api_http import RunApiHandler, ThreadingRunApiServer
 from .run_api_support import (
-    TERMINAL_EVENT_TYPES,
     LedgerTail,
     RunApiError,
     RunApiSettings,
     constant_time_token_equals,
-    event_type_of,
     load_or_create_token,
-    outcome_of,
     parse_bearer,
+    terminal_verdict,
 )
 from .siem import SiemEvent, SiemSink, SiemDeliveryError, build_siem_sink
 
@@ -274,6 +272,7 @@ class RunApi:
         except LedgerError as exc:
             records = []
             problems = [f"{exc.code}: {exc}"]
+        ended, outcome = terminal_verdict(path)
         return {
             "path": str(path),
             "exists": True,
@@ -281,11 +280,13 @@ class RunApi:
             "last_seq": records[-1].seq if records else 0,
             "valid": not problems,
             "problems": problems[:10],
-            # `terminal` is a fact about the ledger (a `run.finished` was recorded); `outcome` is
-            # only reported when the ledger actually carries one. Inventing an outcome from "the
-            # last record was a terminal" would be a guess, and a wrong one for a stopped run.
-            "terminal": bool(records) and event_type_of(records[-1]) in TERMINAL_EVENT_TYPES,
-            "outcome": outcome_of(path),
+            # `terminal` is the fact that stops a spinner: a run-level `run.finished`, OR a turn
+            # terminal the run never wrote past. `outcome` is only reported when the ledger carries
+            # (or implies) one. `terminal_verdict` reads BOTH from ONE tail pass: two separate reads
+            # could observe two file states if a record landed between them, and a response that says
+            # `terminal: false` beside `outcome: "completed"` contradicts itself.
+            "terminal": ended,
+            "outcome": outcome,
         }
 
     def audit_control(self, run_id: str, *, action: str, identity: str, principal: Principal | None = None) -> int:

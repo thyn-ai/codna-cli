@@ -59,16 +59,25 @@ __all__ = [
     "TERMINAL_EVENT",
     "TERMINAL_EVENT_TYPES",
     "TOKEN_FILENAME",
+    "TURN_ABORTED_EVENT_TYPES",
+    "TURN_COMPLETED_EVENT",
+    "TURN_FAILED_EVENT_TYPES",
+    "TURN_TERMINAL_EVENT_TYPES",
+    "TURN_VERDICT_EVENT_TYPES",
+    "INERT_EVENT_TYPES",
+    "STALLED_AFTER_S",
     "LedgerTail",
     "constant_time_token_equals",
     "event_frame_payload",
     "event_type_of",
     "last_seq_of",
+    "ledger_verdict",
     "load_or_create_token",
     "optional_positive_int",
     "optional_positive_number",
     "optional_string_list",
     "outcome_of",
+    "outcome_of_turn_terminal",
     "parse_bearer",
     "reject_unknown_fields",
     "require_identity",
@@ -131,6 +140,70 @@ SSE_HEARTBEAT_TEMPLATE: Final = ": heartbeat {now_ms}\n\n"
 # `run.finished` is the run's own final notification (`RunWorkflow.run` emits it before returning).
 TERMINAL_EVENT: Final = "run.finished"
 TERMINAL_EVENT_TYPES: Final[frozenset[str]] = frozenset({TERMINAL_EVENT})
+
+# -- turn terminals: not RUN terminals, but evidence that the run ended -------------------------
+#
+# The distinction the run list used to miss. `run.finished` is written only on the two `completed`
+# exits of `RunWorkflow` (all tasks done, and goal met). Every other way a run stops — a task whose
+# turn failed, a cancellation, a dead worker — leaves the ledger ending at a TURN terminal and
+# nothing above it. Reading only `run.finished` therefore reported such a run as "not finished", and
+# the sidebar animated it as Working indefinitely.
+#
+# The names and the membership are `sidecar_client.SSE_TERMINAL_TURN_EVENTS`, transcribed here (the
+# same way the SSE constants above are) because a turn terminal is the SIDECAR's vocabulary, and
+# `tests/durable/test_run_api.py` asserts the two sets are equal so they cannot drift.
+TURN_COMPLETED_EVENT: Final = "session.turn_completed"
+# The engine reported the turn as failed: a failure of the work, not of the harness.
+TURN_FAILED_EVENT_TYPES: Final[frozenset[str]] = frozenset({"session.turn_failed"})
+# The turn was stopped rather than lost. An INTERRUPTED turn is not a failure — the soak harness
+# reports `turn_unpaired` as a warning for exactly this reason — so these resolve to `stopped`.
+TURN_ABORTED_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+    {"session.turn_aborted", "session.aborted", "session.stopped"}
+)
+# The turn terminals that are EVIDENCE about how the RUN ended.
+#
+# `session.turn_completed` is deliberately NOT here, and the omission is the point. A turn that
+# completed is a task that did its job: it is work, not a verdict, and a run whose next task is still
+# coming must not read as over because the previous turn ended cleanly. That is exactly why it is also
+# absent from `INERT_EVENT_TYPES` — it is neither a verdict nor noise, it is progress.
+#
+# Listed in `TURN_TERMINAL_EVENT_TYPES` below only so `event_type_of`'s vocabulary is complete; nothing
+# in the verdict path may treat it as an ending.
+TURN_TERMINAL_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+    {TURN_COMPLETED_EVENT} | TURN_FAILED_EVENT_TYPES | TURN_ABORTED_EVENT_TYPES
+)
+# The subset a verdict may be DERIVED from: everything that says the turn did not finish its work.
+TURN_VERDICT_EVENT_TYPES: Final[frozenset[str]] = TURN_FAILED_EVENT_TYPES | TURN_ABORTED_EVENT_TYPES
+
+# Records that are INERT when looking for a verdict: they neither record work nor give one.
+#
+#   * `turn.resumed_from_ledger` / `session.resumed` narrate a RETRY. An aborted turn is followed by
+#     a resume, and the resume is not evidence the run is alive again — the work after it is.
+#   * `control.requested` is the audit record of a human's signal. A pause on a finished run is
+#     allowed and harmless and appends a note PAST the terminal; "the last record is a control note"
+#     must not be read as "this run never finished".
+#
+# Anything NOT in this set is work, and work after a turn terminal means it was superseded.
+INERT_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+    {"turn.resumed_from_ledger", "session.resumed", "control.requested"}
+)
+
+# -- how long a quiet ledger is read as "stalled" rather than "working" -------------------------
+#
+# Twice `contracts.ACTIVITY_TURN_TIMEOUT_S` (60 min), kept as a literal here because this module is
+# a LEAF that `run_api_http` imports at load time: importing `contracts` would pull the provider,
+# state and prompt layers into the HTTP surface for one integer. The value is pinned by
+# `test_stalled_threshold_is_twice_the_longest_activity`, so it cannot drift from what it mirrors.
+#
+# WHY TWICE THE LONGEST ACTIVITY. `ACTIVITY_TURN_TIMEOUT_S` is Temporal's own outer ceiling for one
+# activity — the longest a paid turn may run before it is abandoned. A live run that has written
+# NOTHING for longer than two such ceilings has outlived the whole timeout-and-retry machinery: its
+# activity was abandoned, its retries ran and ended, and no worker is producing this ledger. Waiting
+# longer only keeps the lie up for longer. Nothing is lost by being this generous, because the
+# verdict is re-derived on every read: a run that starts writing again leaves `stalled` on its own,
+# with no state to clear.
+ACTIVITY_TURN_TIMEOUT_S: Final = 60 * 60
+STALLED_AFTER_S: Final = 2 * ACTIVITY_TURN_TIMEOUT_S
 
 
 class RunApiError(RuntimeError):
@@ -723,21 +796,123 @@ def event_frame_payload(record: LedgerRecord) -> dict[str, Any]:
 
 
 def outcome_of(path: Path) -> str | None:
-    """The run's outcome from the LAST ledger record, read from the tail of the file.
+    """The run's outcome, read from the tail of the ledger. ``None`` when the run has not ended.
 
-    A bounded read: the answer is in the final record, so scanning a year of ledger to find it would
-    be work with no answer at the end of it. ``None`` means "not finished", which is the honest
-    answer for a truncated tail as well: a record that did not commit is not an outcome.
+    A bounded read: the answer is in the final records, so scanning a year of ledger to find it
+    would be work with no answer at the end of it. ``None`` is the honest answer for a truncated
+    tail as well — a record that did not commit is not an outcome.
+
+    TWO SHAPES OF "FINISHED", because the workflow writes two. ``run.finished`` is the run's own
+    terminal and carries the outcome the workflow decided. A run whose task never got that far ends
+    on a TURN terminal and writes nothing above it (see ``TURN_TERMINAL_EVENT_TYPES``). Both are
+    read here, so a run that plainly ended stops being reported as open.
+
+    A turn terminal has no ``outcome`` field, so one is DERIVED from WHICH terminal it was, in the
+    vocabulary run-level outcomes already use (``RunOutcome`` in ``run_contracts``, plus the
+    ``failed`` the workflow already finalises with). The distinction that matters is kept: a turn
+    the engine FAILED is ``failed``; a turn that was stopped or interrupted is ``stopped``. An
+    interrupted turn is not a failure — the same rule the soak harness applies by reporting
+    ``turn_unpaired`` as a warning rather than a violation.
     """
-    # A bounded look-back, not "the last record": a control request recorded AFTER the run finished
-    # (a pause on a finished run is allowed and harmless) appends a note past the terminal, and
-    # "the last record is not a terminal" must not be read as "this run never finished".
-    for record in _tail_records(path, limit=_OUTCOME_SCAN_RECORDS):
+    ended, outcome = terminal_verdict(path)
+    return outcome if ended else None
+
+
+def outcome_of_turn_terminal(event_type: str) -> str:
+    """The run outcome implied by a turn terminal. Total over ``TURN_VERDICT_EVENT_TYPES``.
+
+    ``failed`` for a turn the engine reported as failed; ``stopped`` for one that was aborted or
+    interrupted. Both are non-``completed``, so both reach the sidebar as a run the user has to look
+    at rather than as one still in progress.
+
+    ``session.turn_completed`` is REFUSED rather than mapped: a completed turn is success, and folding
+    it into "stopped" would make a turn that finished its job indistinguishable from one that was
+    killed. A caller holding a completed turn has no verdict to derive, and this raises instead of
+    inventing one.
+    """
+    if event_type in TURN_FAILED_EVENT_TYPES:
+        return "failed"
+    if event_type in TURN_ABORTED_EVENT_TYPES:
+        return "stopped"
+    raise ValueError(
+        f"{event_type!r} is not a turn verdict: a turn that completed is progress, not an ending"
+    )
+
+
+def _terminal_verdict(records: list[LedgerRecord]) -> tuple[bool, str | None]:
+    """``(ended, outcome)`` from a tail, newest first. The ONE place the terminal rules are applied.
+
+    **A ``run.finished`` is final.** It is the run's own completion and nothing is scheduled after
+    it, so the whole window is searched for one FIRST. That is what keeps the property the
+    control-note case depends on: a pause recorded AFTER the run finished (allowed and harmless)
+    cannot un-finish it, and neither can a stray record.
+
+    **A turn terminal is superseded by work that followed it.** An aborted turn is not always an
+    ending: a worker restarts the turn under the same ``turn_key``, and the ledger then reads
+    ``session.aborted``, ``turn.resumed_from_ledger``, ``session.resumed``, ... The abort records
+    what happened; it is not a verdict that outlives the resume. So when the run wrote no terminal
+    of its own, this returns the NEWEST turn verdict, looking past the INERT records above: they
+    neither confirm nor revive one. Any other record is work, and work supersedes a turn terminal.
+
+    Measured against the 97 ledgers of a 24h soak: 52 end at a ``review`` record and 23 at
+    ``session.aborted``. Reading "the newest terminal anywhere" would call 75 of them finished;
+    reading "the newest verdict, superseded by work" calls finished exactly the ones that stopped.
+    """
+    for record in records:
         if event_type_of(record) != TERMINAL_EVENT:
             continue
-        outcome = record.payload.get("outcome")
-        return outcome if isinstance(outcome, str) and outcome else None
-    return None
+        raw = record.payload.get("outcome")
+        return True, raw if isinstance(raw, str) and raw else None
+    for record in records:
+        event_type = event_type_of(record)
+        if event_type in INERT_EVENT_TYPES:
+            continue
+        if event_type in TURN_VERDICT_EVENT_TYPES:
+            return True, outcome_of_turn_terminal(event_type)
+        # Any other record is work — a completed turn, a task starting, a tool call — that happened
+        # AFTER an older turn verdict, so it supersedes it.
+        return False, None
+    return False, None
+
+
+def terminal_verdict(path: Path) -> tuple[bool, str | None]:
+    """``(ended, outcome)`` for one ledger, from a SINGLE bounded tail read.
+
+    The one entry point a route should use when it reports both facts, because two separate reads can
+    observe two different file states: a record appended between them makes ``terminal: False`` sit
+    beside ``outcome: "completed"``, and a response that contradicts itself is worse than either
+    answer alone. ``outcome_of`` remains for a caller that wants only the cause.
+    """
+    return _terminal_verdict(_tail_records(path, limit=_OUTCOME_SCAN_RECORDS))
+
+
+def ledger_verdict(
+    path: Path, *, updated_ts: float, now: float | None = None
+) -> dict[str, object]:
+    """Everything a LIST read needs about one ledger, from a single bounded tail pass.
+
+    One pass rather than one per question: the answers would otherwise be able to disagree if a
+    record were appended between them, and a row that said "stalled" while carrying an outcome would
+    be worse than either answer alone.
+
+    * ``ended`` — a terminal is present, so the run is over. This is what stops a spinner.
+    * ``outcome`` — what the ledger recorded, or what its turn terminal implies. ``None`` when it
+      ended without saying why, which is a fact rather than a gap to fill.
+    * ``stalled`` — no terminal AND nothing appended for ``STALLED_AFTER_S``. The honest third
+      state: not finished, and not being worked on either.
+
+    ``updated_ts`` is the ledger's mtime — the same value the list reports as the row's age, so the
+    row's "3d" and this verdict cannot disagree about how long it has been quiet.
+    """
+    ended, outcome = _terminal_verdict(_tail_records(path, limit=_OUTCOME_SCAN_RECORDS))
+    current = time.time() if now is None else now
+    quiet_for_s = max(0.0, current - updated_ts)
+    return {
+        "ended": ended,
+        "outcome": outcome,
+        "stalled": (not ended) and quiet_for_s >= STALLED_AFTER_S,
+        "quiet_for_s": round(quiet_for_s, 3),
+    }
 
 
 def last_seq_of(path: Path) -> int:
