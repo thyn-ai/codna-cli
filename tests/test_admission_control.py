@@ -106,19 +106,58 @@ def test_contention_grows_with_concurrency():
 
 
 # ── never stall ────────────────────────────────────────────────────────────────────────────────
-def test_a_raising_predictor_degrades_instead_of_blocking_admission():
-    """A predictor/engine outage must never wedge the gate. make_mojo_breach_fn wraps the kernel with
-    exactly this fallback, so verify the wrapper, not just the docstring."""
+def test_a_raising_predictor_degrades_instead_of_blocking_admission(capsys):
+    """A predictor/engine outage must never wedge the gate.
+
+    THE CONTRACT, stated twice in production code: the module docstring — "the gate can NEVER stall: a
+    kernel hiccup degrades to in-process math, it does not block admission" — and `make_mojo_breach_fn`
+    — "falling back to ``fallback`` (numpy by default) on any error so a predictor/engine outage never
+    stalls admission". So a raising kernel must DEGRADE to the fallback predictor and keep deciding; it
+    must not refuse admission and it must not raise out of the gate. The one error that does surface is
+    a fallback that ALSO raises: no predictor at all is the one case where "degrade" has no value to
+    degrade to, and swallowing it would turn a caller bug into an invisible admission.
+
+    The kernel is made to fail through an INJECTED client, which is the seam this file already uses for
+    the same purpose (`test_fallback_is_announced_not_silent`,
+    `test_the_kernel_predictor_reports_which_branch_answered`). Leaving it to the environment was the
+    defect this test carried: with a working in-process kernel `mojo_breach_probability` answers, the
+    fallback is never consulted — so the second half below was unreachable and the test pinned whether
+    the CI box happened to have a usable kernel, not the behaviour (it failed on this machine, where the
+    `build/local-telys` kernel answers). Both halves are now deterministic on any machine.
+    """
+    class _EngineDown:
+        def _request(self, *_a, **_k):
+            raise RuntimeError("engine down")
+
+    degraded_value = 0.25
+
+    def fallback(*_a):
+        return degraded_value
+
+    fn = ac.make_mojo_breach_fn(client=_EngineDown(), fallback=fallback)
+
+    # The fallback answered — asserted by BRANCH and by a value only the fallback can produce, because
+    # a breach probability alone cannot show which predictor computed it.
+    assert fn.probe([10.0, 11.0], 1.5, 900.0, 128) == (0.25, "numpy")
+    assert fn([10.0, 11.0], 1.5, 900.0, 128) == 0.25
+    assert fn.last_predictor == "numpy"
+    assert "fell back to in-process numpy" in capsys.readouterr().err
+
+    # ...and the gate still DECIDES with it, in the MC zone, instead of raising out of try_admit.
+    d = ac.MCAdmissionDecider(_cfg(model_rate_budget=1, ceiling=4), mc_fn=fn)
+    d.finish(10.0)
+    assert d.try_admit().admit is True       # deterministic floor: no prediction needed
+    verdict = d.try_admit()                  # MC zone, decided by the DEGRADED predictor
+    assert verdict.p_breach == 0.25
+    assert verdict.admit is False            # 0.25 >= breach_threshold: throttled, never raised
+
+    # An explicitly exploding fallback has nothing left to degrade to, so it surfaces rather than
+    # letting the gate continue on an invented number.
     def _boom(*_a, **_k):
         raise RuntimeError("engine down")
 
-    fn = ac.make_mojo_breach_fn(fallback=lambda *a: 0.0)
-    # mojo_breach_probability will fail (no client/daemon here) -> falls back to the given predictor.
-    assert fn([10.0, 11.0], 1.5, 900.0, 128) == 0.0
-
-    # And an explicitly exploding fallback surfaces rather than hanging.
-    fn_bad = ac.make_mojo_breach_fn(fallback=_boom)
-    with pytest.raises(RuntimeError):
+    fn_bad = ac.make_mojo_breach_fn(client=_EngineDown(), fallback=_boom)
+    with pytest.raises(RuntimeError, match="engine down"):
         fn_bad([10.0], 1.5, 900.0, 8)
 
 
