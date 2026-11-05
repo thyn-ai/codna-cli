@@ -1,0 +1,68 @@
+# The fixture matrix: ONE list of expectations that BOTH consumers are tested against.
+#
+# The Python suite (`tests/test_policy_document.py`) and the engine suite
+# (`agent-core/vendor/cline/algenta/server/policy-document.test.ts`) each read this file and assert
+# their own reader reaches exactly this verdict. A change to what a fixture means is therefore one
+# edit here, reviewed once, and both sides fail together if they disagree — which is the whole point
+# of the shared directory.
+#
+# `expect.code` is the stable machine code, not prose. `expect.allowed` must be false for every
+# fixture in this file: nothing here is a permissive document. `expect.mode` is `policy` for all of
+# them (the `absent` mode is exercised by the missing-file case, which has no file to name).
+#
+# `require` selects how the document is loaded:
+#   required: true  — the durable/worker path, and the sidecar's default. A missing file DENIES.
+#   required: false — "policy if present". A missing file reports mode=absent, allowed=false.
+fixtures:
+  - name: valid
+    required: true
+    expect: { mode: policy, allowed: true, code: policy_ok }
+
+  - name: permissive-looking-invalid
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_unknown_key }
+
+  - name: unknown-key-nested
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_unknown_key }
+
+  - name: wrong-type
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_invalid_type }
+
+  - name: wrong-type-budget
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_invalid_type }
+
+  - name: empty
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_denies_all }
+
+  - name: sections-absent
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_denies_all }
+
+  - name: denies-all
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_denies_all }
+
+  - name: unparseable
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_unparseable }
+
+  - name: duplicate-key
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_duplicate_key }
+
+  - name: not-a-mapping
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_invalid_type }
+
+  # No such file on disk. The only case whose expectation depends on `required`.
+  - name: missing
+    required: true
+    expect: { mode: policy, allowed: false, code: policy_missing }
+
+  - name: missing
+    required: false
+    expect: { mode: absent, allowed: false, code: policy_absent_not_required }
