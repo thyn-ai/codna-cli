@@ -1,0 +1,5 @@
+# The document is a LIST, not a mapping. Must DENY (`policy_invalid_type`) — a reader that took
+# the first element would read an arbitrary object as a policy.
+- version: 1
+- tools:
+    allow: [read_files]
