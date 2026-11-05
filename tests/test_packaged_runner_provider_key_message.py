@@ -57,3 +57,38 @@ def test_the_message_names_the_task_kind():
     with pytest.raises(PackagedRepositoryAdvancedError) as excinfo:
         _parse_final_frame(_MISSING_KEY_FRAME, sidecar_url="http://127.0.0.1:1", task_kind="review")
     assert str(excinfo.value).startswith("codna review needs a provider key")
+
+
+def test_the_engine_error_TYPE_prefix_still_names_the_fix():
+    """The engine raises a typed error (`ProviderCredentialError extends Error`), so the final frame's
+    `String(error)` now starts with the CLASS NAME instead of `Error:`. The actionable message must survive
+    that: a caller reading `codna fix error: ...` should still be told which variable to set."""
+    frame = json.dumps(
+        {
+            "type": "final",
+            "status": "failed",
+            "terminal_state": "runtime_invalid",
+            "error": "ProviderCredentialError: no API key in env for 'anthropic' (tried: ANTHROPIC_API_KEY)",
+        }
+    )
+    with pytest.raises(PackagedRepositoryAdvancedError) as excinfo:
+        _parse_final_frame(frame, sidecar_url="http://127.0.0.1:1", task_kind="fix")
+    assert excinfo.value.code == "agent_core_run_failed"
+    assert "set ANTHROPIC_API_KEY" in str(excinfo.value)
+    assert "`codna key set anthropic`" in str(excinfo.value)
+
+
+def test_a_keyless_provider_failure_is_not_mistaken_for_a_missing_key():
+    """A keyless provider (ollama) has no key to set, so it must never be routed into the "set <ENV>" advice.
+    Whatever its real failure is, the generic message is the honest one."""
+    frame = json.dumps(
+        {
+            "type": "final",
+            "status": "failed",
+            "terminal_state": "runtime_invalid",
+            "error": "Error: connect ECONNREFUSED 127.0.0.1:11434",
+        }
+    )
+    with pytest.raises(PackagedRepositoryAdvancedError) as excinfo:
+        _parse_final_frame(frame, sidecar_url="http://127.0.0.1:1", task_kind="fix")
+    assert str(excinfo.value) == "Local agent-core did not complete the packaged fix run successfully."
