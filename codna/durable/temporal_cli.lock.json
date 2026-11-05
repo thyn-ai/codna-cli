@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "cli_version": "1.9.1",
+  "server_version": "1.32.0",
+  "archive_url": "https://temporal.download/cli/archive/v1.9.1",
+  "comment": "Pinned by version AND sha256 of the extracted binary. A download whose digest does not match is refused, never used: the dev server is a binary executed with the user's privileges. Regenerate this file only together with a deliberate version bump, and re-run the dev-server tests.",
+  "platforms": {
+    "darwin-arm64": {
+      "platform": "darwin",
+      "arch": "arm64",
+      "binary_sha256": "33c298d41f6eefebf01a28a3511f444480e939e21d3518cb0c12a4abad467c4b",
+      "archive_sha256": "41e0425378fcb4fb5766340b97435e20fe47bbff2d7bf644ec2d51f7662b7c56"
+    },
+    "linux-amd64": {
+      "platform": "linux",
+      "arch": "amd64",
+      "binary_sha256": "712217694cac9f786a72d4b6c876cd15f3dcf1bf31434d9fed6af25242a327a0",
+      "archive_sha256": "09a0326a51db84d02735e53542b9ebd8c4758daf47482a9ab0abce15844e60d5"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+# Exact pins for `pip install -e 'cli[durable]'` — D2's durable stack.
+#
+# The `durable` extra declares ranges (`temporalio[langgraph]>=1.34,<2`, `langgraph>=1,<2`,
+# `langgraph-checkpoint>=4,<5`, `langchain-core>=1,<2`) because a range is what a library consumer
+# may install. This file is what *we* test and ship: an exact, known-good set. Install with
+#
+#     pip install -e 'cli[durable]' -c cli/constraints-durable.txt
+#
+# Why exact pins for a Public-Preview surface: `temporalio.contrib.langgraph` is experimental, and
+# its behaviour IS the workflow's history semantics. A minor bump can change how a node is mapped to
+# an activity, which turns an in-flight run into a replay failure that only appears on a worker
+# restart — the exact class of bug a durable system must never have. `codna.durable.require_durable`
+# refuses a version outside the extra's window; `tests/durable/test_durable_extra.py` asserts these
+# pins are the ones the module expects, so a bump here without a code change fails the suite.
+#
+# LangGraph's checkpoint package is pinned and explicitly ranged too:
+# `interrupt()`/`Command(resume=...)` semantics live there, and `InMemorySaver` is mandatory inside
+# a workflow (D2.0 spike finding 3).
+temporalio==1.34.0
+langgraph==1.2.17
+langgraph-checkpoint==4.3.0
+langgraph-sdk==0.4.9
+langgraph-prebuilt==1.1.1
+langchain-core==1.7.0
+
+# OIDC verification is part of the durable Run API, so PyJWT is a direct runtime dependency rather
+# than a test-only install. Keep the implementation we exercise pinned with the rest of the stack.
+pyjwt==2.10.1
+
+# Not part of the plugin, but the pinned set must also agree on the HTTP client and the Parquet
+# writer the ledger rollup uses, or a fresh install of the extra can resolve a combination we never
+# tested. `httpx` is a base dependency for the same client the sidecar surface uses.
+httpx==0.28.1
+pyarrow==26.0.0
