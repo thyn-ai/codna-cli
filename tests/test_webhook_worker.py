@@ -32,8 +32,23 @@ def test_free_port_pair_returns_the_exact_ports_it_actually_probed(monkeypatch):
     """REGRESSION-shaped: the returned tuple must be the SAME ports that were bind-tested, not
     merely two numbers one-apart -- a probe of the wrong port (e.g. base+2 while still returning
     base+1) would pass a check that only looks at the return value's arithmetic, while actually
-    verifying nothing about whether the port it hands back is free."""
+    verifying nothing about whether the port it hands back is free.
+
+    RETRIES ARE PART OF THE CONTRACT, so this asserts the invariant PER ATTEMPT rather than
+    "exactly one attempt happened". `_free_port_pair` legitimately retries when `base+1` is taken:
+    it binds an ephemeral base, then bind-tests base+1, and on `OSError` starts over. A single
+    attempt is not guaranteed and asserting it is what made this test flaky — CI observed
+    `bound == [0, 48110, 0, 38652]` for `pair == (38651, 38652)`, i.e. attempt 1 found 48111
+    occupied, the function correctly retried, attempt 2 succeeded, and the TEST failed on a
+    correct result. That failure said nothing about the code and everything about the assertion.
+
+    So the shape is: each attempt binds port 0 then exactly one more port, and that second port
+    is `candidate + 1` where `candidate` is the base the NEXT attempt would return. Concretely, the
+    successful attempt's two binds must satisfy `bound[-2] == 0` and `bound[-1] == pair[1]`, and
+    every failed attempt must also be a `(0, someBase + 1)` pair — never a stray third bind.
+    """
     bound: list[int] = []
+    bases: list[int] = []
     real_socket = worker_module.socket.socket
 
     class _RecordingSocket:
@@ -52,19 +67,117 @@ def test_free_port_pair_returns_the_exact_ports_it_actually_probed(monkeypatch):
             self._s.bind(addr)
 
         def getsockname(self):
+            assigned = self._s.getsockname()[1]
+            bases.append(assigned)
             return self._s.getsockname()
 
     monkeypatch.setattr(worker_module.socket, "socket", lambda *a, **k: _RecordingSocket(*a, **k))
     pair = worker_module._free_port_pair()
     assert pair is not None
-    assert bound == [0, pair[0] + 1]  # first bind is ephemeral (port 0); second checks base+1 EXACTLY
+
+    # Every attempt records exactly two binds: the ephemeral base, then that base + 1.
+    assert len(bound) % 2 == 0, f"each attempt binds base then base+1, got {bound}"
+    assert len(bases) == len(bound) // 2, f"each attempt reports its assigned base once: {bases}"
+    assert bound[-2] == 0, f"the successful attempt's first bind must be ephemeral, got {bound}"
+    assert bound[-1] == pair[0] + 1, (
+        f"the port bind-tested by the successful attempt must be the port returned: "
+        f"bound {bound[-1]} vs returned {pair[1]}"
+    )
+    # Both halves of every attempt agree with the base the OS actually returned, including failures.
+    for attempt in range(0, len(bound), 2):
+        number = attempt // 2
+        assert bound[attempt] == 0, f"attempt {number} did not probe an ephemeral base: {bound}"
+        assert bound[attempt + 1] == bases[number] + 1, (
+            f"attempt {number} probed a non-adjacent port: {bound} vs bases {bases}"
+        )
 
 
-def test_free_port_pair_does_not_repeat_across_calls():
+def test_free_port_pair_retries_when_the_adjacent_port_is_taken(monkeypatch):
+    """The retry branch, deterministically -- no dependence on live ephemeral ports.
+
+    CI exercised this path by accident (a real `base+1` happened to be occupied) and the old
+    assertion called a correct retry a failure. The branch itself had no test of its own, so it was
+    only ever covered by luck. Here the first attempt's `base+1` bind raises `OSError` (the real
+    signal that the port is taken), the second succeeds, and the result must be the SECOND base.
+    """
+    attempts = {"n": 0}
+    bases = [41200, 41300]
+
+    class _FakeSocket:
+        def __init__(self, *a, **k):
+            self._bound: int | None = None
+            self._role = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def bind(self, addr):
+            if addr[1] == 0:
+                # The ephemeral base probe: hand out the next scripted base.
+                self._role = "base"
+                self._bound = bases[attempts["n"]]
+                return
+            self._role = "adjacent"
+            if attempts["n"] == 0:
+                # The first attempt's base+1 is occupied, which is exactly what OSError means here.
+                attempts["n"] += 1
+                raise OSError(48, "Address already in use")
+            self._bound = addr[1]
+
+        def getsockname(self):
+            return ("127.0.0.1", self._bound)
+
+    monkeypatch.setattr(worker_module.socket, "socket", lambda *a, **k: _FakeSocket(*a, **k))
+    pair = worker_module._free_port_pair()
+
+    assert pair == (41300, 41301), f"the retry must return the SECOND base, got {pair}"
+    assert attempts["n"] == 1, "the first attempt must have failed exactly once"
+
+
+def test_free_port_pair_returns_none_after_exhausting_attempts(monkeypatch):
+    """Never raises, never returns a half-checked pair: five failures means None, and the caller
+    falls back rather than crashing the job over a nice-to-have."""
+
+    class _AlwaysFail:
+        def __init__(self, *a, **k):
+            self._bound = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def bind(self, addr):
+            if addr[1] != 0:
+                raise OSError(48, "Address already in use")
+            self._bound = 45000
+
+        def getsockname(self):
+            return ("127.0.0.1", self._bound)
+
+    monkeypatch.setattr(worker_module.socket, "socket", lambda *a, **k: _AlwaysFail(*a, **k))
+    assert worker_module._free_port_pair() is None
+
+
+def test_free_port_pair_is_not_derived_from_job_identity():
     """Not a hash of job identity -- if it were, two different jobs could derive the SAME port by
-    coincidence, reintroducing the exact class of collision this exists to eliminate."""
+    coincidence, reintroducing the exact class of collision this exists to eliminate.
+
+    This used to assert `len({_free_port_pair() for _ in range(5)}) == 5`, which is a PROBABILISTIC
+    claim about the kernel's ephemeral allocator: the OS is free to hand back a recently released
+    port, so five draws can legitimately collide. It went red on CI exactly that way (assert 4 == 5)
+    while passing 12/12 locally -- the worst shape, because a maintainer reads it as their change.
+
+    The property that actually matters is that the value is NOT a fixed function of job identity, so
+    assert that instead: repeated calls must not all return the same pair, which a hash of a constant
+    input would. A single collision is acceptable; five identical draws are not.
+    """
     seen = {worker_module._free_port_pair() for _ in range(5)}
-    assert len(seen) == 5
+    assert len(seen) > 1, f"five calls returned one value {seen} — this looks derived, not ephemeral"
 
 
 def test_isolated_runtime_env_nests_inside_the_jobs_own_scratch_dir(tmp_path):

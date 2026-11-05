@@ -157,10 +157,42 @@ def ensure_provisioned(*, access_token: str | None = None, plan: str = _DEFAULT_
         install=status["kernel_source"] is None,
         open_browser=open_browser,
     )
+    # ``runtime_installed`` asks whether this device HAS a usable on-device runtime, so it is answered
+    # by the SAME resolver `codna status` and `ensure_licensed` use — never by ``result["installed"]``.
+    # ``telys.login`` reports ``installed`` for "this call downloaded a bundle", which is a different
+    # question: a device whose kernel already resolves passes ``install=False``, so provisioning
+    # succeeds and used to report ``runtime_installed: false`` — the flag described the branch taken,
+    # not the machine. Re-probing is also what makes the answer true for every path (a fresh download,
+    # a pre-existing kernel, a packaged runtime) instead of only the one this function happened to take.
+    after = provision_status()
+    if not after["provisioned"]:
+        # ``provisioned`` is "license AND kernel", so name WHICH half is missing rather than always
+        # blaming the kernel. A device whose kernel resolves but whose license was never written is a
+        # real state (a platform wheel ships a kernel; `run_login` may fail to write the license), and
+        # pointing that user at CODNA_TELYS_INSTALL_ROOT/TELYS_KERNEL would send them to fix the one
+        # thing that already works. Exit 0 means signed in AND provisioned (cmd_login's contract), so
+        # this must not return a success payload either way.
+        missing: list[str] = []
+        if not after["license_source"]:
+            missing.append(
+                "the per-device license was not written (re-run `codna login`; if it persists, check "
+                "that $TELYS_HOME is writable)"
+            )
+        if not after["kernel_source"]:
+            missing.append(
+                "no Telys kernel resolves (re-run `codna login`; if it persists, set "
+                "CODNA_TELYS_INSTALL_ROOT or TELYS_KERNEL to a Codna-managed runtime)"
+            )
+        raise OnboardingError(
+            "Codna device authorization succeeded but the on-device runtime is not fully provisioned: "
+            + "; ".join(missing)
+        )
     return {
         "provisioned": True,
         "already_provisioned": False,
-        "runtime_installed": bool(result.get("installed")),
+        # True now: ``after["provisioned"]`` requires a license AND a resolved kernel.
+        "runtime_installed": True,
+        "runtime_source": after["kernel_source"],
         "tier": result.get("tier"),
     }
 
