@@ -19,7 +19,14 @@ API_KEY_KEYS = ("CODNA_API_KEY", "ALGENTA_API_KEY", "DE_API_KEY")
 PUBLIC_CONFIGURED_VALUE = "<configured>"
 PUBLIC_STATE_PATH = Path.home() / ".codna" / "runtime" / "local-stack.json"
 _URL_CREDENTIAL_RE = re.compile(r"(https?://)([^/@\s\"']+@)")
-_SECRET_FIELD_RE = re.compile(r"(?i)\b(password|token|secret|api[_-]?key)(\s*[:=]\s*)[^\s,}\]]+")
+_SECRET_FIELD_RE = re.compile(
+    r"""
+    \b(?P<field>password|token|secret|api[_-]?key)
+    (?P<separator>[\"']?\s*[:=]\s*)
+    (?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,}\]]+)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 def _first_config_source(env: Mapping[str, str], keys: tuple[str, ...]) -> str | None:
@@ -201,9 +208,18 @@ def render_report(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _redact_secret_field(match: re.Match[str]) -> str:
+    value = match.group("value")
+    quote = value[0] if value.startswith(("\"", "'")) else ""
+    if not quote:
+        separator = match.group("separator").lstrip()
+        quote = separator[0] if separator.startswith(("\"", "'")) else ""
+    return f"{match.group('field')}{match.group('separator')}{quote}<redacted>{quote}"
+
+
 def redact_display_text(text: str) -> str:
     without_url_credentials = _URL_CREDENTIAL_RE.sub(r"\1<redacted>@", text)
-    return _SECRET_FIELD_RE.sub(r"\1\2<redacted>", without_url_credentials)
+    return _SECRET_FIELD_RE.sub(_redact_secret_field, without_url_credentials)
 
 
 def format_public_output(report: Mapping[str, Any], *, json_output: bool) -> str:

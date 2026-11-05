@@ -12,6 +12,7 @@ import pytest
 np = pytest.importorskip("numpy")   # the reranker path uses numpy; skip cleanly in the minimal offline suite
 
 import codna.memory as M  # noqa: E402
+import codna.memory_rerank as rerank_module  # noqa: E402
 
 
 class _FakeWL:
@@ -37,7 +38,7 @@ _MEM = _Mem({"a": "def parse(): pass", "b": "def cookie_jar(): pass"})
 
 def test_blend_is_default(monkeypatch):
     monkeypatch.delenv("CODNA_MEMORY_RERANK", raising=False)
-    monkeypatch.setattr(M, "_wordllama", lambda: _FakeWL())
+    monkeypatch.setattr(rerank_module, "_wordllama", lambda: _FakeWL())
     out = M._semantic_rerank("lost cookies after redirect", _CANDS, _MEM)
     assert {i for i, _ in out} == {"a", "b"}                  # lossless: nothing dropped
     # default alpha=0.7 (lexical-heavy): lexical ('a') still wins, but WordLlama is mixed in (order may shift)
@@ -45,7 +46,7 @@ def test_blend_is_default(monkeypatch):
 
 
 def test_alpha_extremes_select_each_signal(monkeypatch):
-    monkeypatch.setattr(M, "_wordllama", lambda: _FakeWL())
+    monkeypatch.setattr(rerank_module, "_wordllama", lambda: _FakeWL())
     monkeypatch.setenv("CODNA_MEMORY_RERANK", "blend")
     monkeypatch.setenv("CODNA_MEMORY_RERANK_ALPHA", "1.0")    # pure lexical
     assert [i for i, _ in M._semantic_rerank("cookies", _CANDS, _MEM)] == ["a", "b"]
@@ -54,7 +55,7 @@ def test_alpha_extremes_select_each_signal(monkeypatch):
 
 
 def test_lexical_off_disables(monkeypatch):
-    monkeypatch.setattr(M, "_wordllama", lambda: (_ for _ in ()).throw(AssertionError("WL loaded while off")))
+    monkeypatch.setattr(rerank_module, "_wordllama", lambda: (_ for _ in ()).throw(AssertionError("WL loaded while off")))
     for mode in ("off", "lexical", "none"):
         monkeypatch.setenv("CODNA_MEMORY_RERANK", mode)
         assert M._semantic_rerank("q", _CANDS, _MEM) == _CANDS    # no-op, WL never consulted
@@ -62,25 +63,25 @@ def test_lexical_off_disables(monkeypatch):
 
 def test_pure_wordllama_mode(monkeypatch):
     monkeypatch.setenv("CODNA_MEMORY_RERANK", "wordllama")
-    monkeypatch.setattr(M, "_wordllama", lambda: _FakeWL())
+    monkeypatch.setattr(rerank_module, "_wordllama", lambda: _FakeWL())
     out = M._semantic_rerank("lost cookies", _CANDS, _MEM)
     assert out[0][0] == "b"                                   # pure semantic promotes the cookie symbol
 
 
 def test_default_blend_falls_back_to_lexical_when_wl_absent(monkeypatch):
     monkeypatch.delenv("CODNA_MEMORY_RERANK", raising=False)   # default blend
-    monkeypatch.setattr(M, "_wordllama", lambda: (_ for _ in ()).throw(M.CodeMemoryError("no wordllama")))
+    monkeypatch.setattr(rerank_module, "_wordllama", lambda: (_ for _ in ()).throw(M.CodeMemoryError("no wordllama")))
     assert M._semantic_rerank("q", _CANDS, _MEM) == _CANDS     # graceful: returns lexical order, no raise
 
 
 def test_explicit_wordllama_missing_raises(monkeypatch):
     monkeypatch.setenv("CODNA_MEMORY_RERANK", "wordllama")
-    monkeypatch.setattr(M, "_wordllama", lambda: (_ for _ in ()).throw(M.CodeMemoryError("no wordllama")))
+    monkeypatch.setattr(rerank_module, "_wordllama", lambda: (_ for _ in ()).throw(M.CodeMemoryError("no wordllama")))
     with pytest.raises(M.CodeMemoryError):
         M._semantic_rerank("q", _CANDS, _MEM)
 
 
 def test_passthrough_when_no_text(monkeypatch):
     monkeypatch.delenv("CODNA_MEMORY_RERANK", raising=False)
-    monkeypatch.setattr(M, "_wordllama", lambda: (_ for _ in ()).throw(AssertionError("WL loaded with no text")))
+    monkeypatch.setattr(rerank_module, "_wordllama", lambda: (_ for _ in ()).throw(AssertionError("WL loaded with no text")))
     assert M._semantic_rerank("q", _CANDS, _Mem({})) == _CANDS   # no candidate text -> untouched

@@ -16,6 +16,8 @@ import sys
 
 import numpy as np
 
+from memengine import _pykernel
+
 # Kernel resolution order: (1) TELYS_KERNEL / (2) AME_KERNEL env override; (3) a verified `telys runtime
 # install` location ($TELYS_HOME/runtime/<platform>/, via telys.paths) — zero-config after an offline install;
 # (4) a kernel bundled INSIDE the package at memengine/_runtime/ — present only in the INTERNAL full-engine
@@ -56,18 +58,39 @@ def _resolve_lib_path() -> str:
 _LIB_PATH = _resolve_lib_path()
 _LIB = None
 
+# Set to True when the pure-NumPy reference is standing in for the native kernel. Read by `kernel_info()` (via
+# telys.runtime.LocalRuntime) and by `memengine.mojo_backend.backend_kind()`, so "is the native kernel driving
+# this engine?" is a QUESTION A PROGRAM CAN ASK rather than something an operator infers from a log line.
+_PYNATIVE_ACTIVE = False
+
+
+def backend_kind() -> str:
+    """``"native"`` when the loaded backend is the Mojo shared library, ``"pynative"`` when it is the reference.
+
+    Forces the same lazy resolution the engine uses, so the answer is about the backend that will actually run
+    rather than about whether a file happens to exist on disk.
+    """
+    _lib()
+    return "pynative" if _PYNATIVE_ACTIVE else "native"
+
 
 def _lib():
-    global _LIB
+    """The Mojo kernel's C ABI, or the pure-NumPy reference when no native library can be loaded.
+
+    Three outcomes, and the difference between the last two is the whole point of this module:
+
+    * the library exists and loads -> the real Mojo kernel (unchanged behaviour, kernel-first);
+    * the library does not exist -> the pure-NumPy reference, announced once on stderr. A platform with no
+      Mojo wheel (Windows today) still gets a working engine, degraded in SPEED only;
+    * the library exists but fails to load -> RAISES. That is a broken install, not an unsupported platform, and
+      quietly substituting the reference would hide a real defect behind a working-looking engine.
+    """
+    global _LIB, _PYNATIVE_ACTIVE
     if _LIB is None:
         if not os.path.exists(_LIB_PATH):
-            ext = _lib_ext()
-            raise FileNotFoundError(
-                f"Telys Mojo kernel not found at {_LIB_PATH}.\n"
-                f"  • In a consumer repo: set TELYS_KERNEL=/abs/path/to/libame_kernel.{ext}\n"
-                "  • To build it: cd mojo_env && pixi run mojo build --emit shared-lib "
-                f"../mojo/engine/ame_kernel.mojo -o ../mojo_build/libame_kernel.{ext}"
-            )
+            _LIB = _pykernel.PyKernel()
+            _PYNATIVE_ACTIVE = True
+            return _LIB
         lib = ctypes.CDLL(_LIB_PATH)
         lib.ame_flat_top1.restype = ctypes.c_int32
         lib.ame_flat_top1.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p]
