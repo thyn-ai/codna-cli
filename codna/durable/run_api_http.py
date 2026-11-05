@@ -49,13 +49,13 @@ from .run_api_support import (
     event_frame_payload,
     follow_param,
     last_seq_of,
+    ledger_verdict,
     limit_param,
     optional_bool,
     optional_positive_int,
     optional_positive_int_or_none,
     optional_positive_number,
     optional_string_list,
-    outcome_of,
     reject_unknown_fields,
     require_identity,
     require_positive_number,
@@ -626,13 +626,26 @@ class RunApiHandler(BaseHTTPRequestHandler):
                     stat = ledger_path.stat()
                 except Exception:  # noqa: BLE001 - a stray or vanished entry is not a run
                     continue
+                # ONE bounded tail pass for ended/outcome/stalled (`ledger_verdict`). The three
+                # travel together because a row that said "stalled" while carrying an outcome, or
+                # "ended" while its ledger was still being written, would be a contradiction the
+                # sidebar could not render honestly.
+                verdict = ledger_verdict(ledger_path, updated_ts=stat.st_mtime)
                 entries.append(
                     {
                         "run_id": run_id,
                         "updated_ts": round(stat.st_mtime, 6),
                         "ledger_bytes": stat.st_size,
                         "last_seq": last_seq_of(ledger_path),
-                        "outcome": outcome_of(ledger_path),
+                        "outcome": verdict["outcome"],
+                        # `ended` is the fact that stops a spinner, reported apart from `outcome`
+                        # because a ledger can prove its run is over while saying nothing about why.
+                        "ended": verdict["ended"],
+                        # No terminal AND quiet for longer than any activity may run: not finished,
+                        # and not being worked on. The third state, so a caller need not claim
+                        # "working" for a run nobody is producing.
+                        "stalled": verdict["stalled"],
+                        "quiet_for_s": verdict["quiet_for_s"],
                     }
                 )
         entries.sort(key=lambda item: (-float(item["updated_ts"]), str(item["run_id"])))
