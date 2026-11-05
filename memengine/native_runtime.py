@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import hashlib
 import os
 import sys
 import threading
@@ -140,6 +141,48 @@ def _partition_sort_key(key):
     if isinstance(key, (str, int, float, bytes)):
         return 1, type(key).__name__, key
     return 1, type(key).__name__, repr(key)
+
+
+def _py_key(value):
+    """De-numpy a partition key so it round-trips through JSON unchanged."""
+    return value.item() if hasattr(value, "item") else value
+
+
+def _sha256_file(path, chunk: int = 1 << 20) -> str:
+    """Per-file sha256 for the manifest's integrity table (mirrors the local sealer's)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _quantize_i8(vecs, dim: int):
+    """f32 -> int8 unit-vector slab, byte-identical to the local sealer's shadow (``ame_quantize_i8``).
+
+    Mirrors ``memengine._pynative.quantize_i8``: scale by 127, round HALF-AWAY-FROM-ZERO (the kernel's
+    ``Int(Float)`` truncation after a +/-0.5 nudge), then clamp to [-127, 127]. Verified byte-identical to
+    the kernel in ``cli/tests/test_native_compact_export.py``; kept in NumPy here so the export path has no
+    extra native ABI dependency.
+    """
+    import numpy as np
+
+    src = np.ascontiguousarray(vecs, np.float32).reshape(-1)
+    scaled = src * np.float32(127.0)
+    nudged = np.where(scaled >= 0.0, scaled + np.float32(0.5), scaled - np.float32(0.5))
+    return np.clip(np.trunc(nudged), -127, 127).astype(np.int8)
+
+
+def _pq_choose_m(dim: int) -> int:
+    """PQ subquantizer count ~= dim/8 (1 byte each -> ~32x vs f32), constrained to divide dim.
+
+    Same rule as the local sealer's ``PartitionedVectorIndex._pq_choose_m`` — the two runtimes must train
+    the same codebook shape for their artifacts to be comparable.
+    """
+    m = max(1, dim // 8)
+    while dim % m:
+        m -= 1
+    return m
 
 
 _LIB = None
@@ -541,6 +584,12 @@ class NativeRuntime(RuntimeHandle):
     internal/PHASE-1B-NATIVE-RUNTIME.md)."""
 
     FORMAT_VERSION = _SDK_FORMAT_VERSION
+
+    # The sealed on-disk collection layout is shared with the local runtime (the SDK asserts
+    # `PartitionedVectorIndex.VERSION == telys.runtime.FORMAT_VERSION`); a compact artifact is a view of
+    # that same layout, so both runtimes must stamp the same format/version into its manifest.
+    _FORMAT = "ame.partitioned"
+    _VERSION = _SDK_FORMAT_VERSION
 
     # ── lifecycle (native, implemented) ───────────────────────────────────────────────────────────
     def new_index(self, dim, dtype):
@@ -1248,18 +1297,174 @@ class NativeRuntime(RuntimeHandle):
         )
         return [int(x) for x in out[:cnt].tolist()]
 
-    # compact serve artifacts — the native index handle has no quantized-export path yet; the engine-side
-    # sealer (PartitionedVectorIndex.save(compact=...)) lives in the local runtime. Fail closed (D-19 style).
+    # ── compact serve artifacts (the "ship the index" tier) ─────────────────────────────────────
+    # Writes the SAME on-disk layout as the local sealer (PartitionedVectorIndex.save(compact=...)):
+    # rowids.i64 + vectors.i8 [+ vectors.pq / pq_codebook.f32 for "pq"] + one col_<name>.npy per
+    # provenance column + a manifest.json commit point. The native handle supplies the visible f32 base,
+    # the logical row ids and the interned row metadata (ty_index_export_base / _export_rowmeta); the 4x
+    # int8 slab is produced by the SAME kernel quantizer the local sealer uses (ame_quantize_i8), so both
+    # runtimes emit a byte-identical slab for the same corpus. "pq" trains faiss' ProductQuantizer here as
+    # the local sealer does (offline, per-seal; the query-time ADC scan stays in the kernel).
+    #
+    # Preconditions mirror the local sealer — a partial artifact would be worse than none, so each is a
+    # hard error rather than a silent downgrade:
+    #   * dtype == "int8"   (the compact tiers keep an int8 slab; an f32/fp16 index has none)
+    #   * no pending delta  (fold with compact() first — the visible export is the sealed base)
+    supports_compact_export = True
+    # Read-back of a compact artifact is NOT implemented natively yet: the native handle has no mmap'd
+    # i8-only open path (only `open_index`, which rebuilds from a full-precision `ty_base.npy`). The
+    # artifact this method writes is readable by the local runtime, so the gap is declared, not hidden.
+    supports_compact_open = False
+
+    @_write
     def export_compact(self, index, path, mode):
-        raise NotImplementedError(
-            "compact serve artifacts are not yet supported on the native runtime; "
-            "export from the local runtime (TELYS_RUNTIME=local)"
-        )
+        import json
+
+        import numpy as np
+
+        if mode not in ("int8", "pq"):
+            raise ValueError(f"unknown compact mode {mode!r} (use True/'int8' or 'pq')")
+        if index.dtype != "int8":
+            raise ValueError("compact save requires dtype='int8' (an int8 base slab to keep)")
+        if int(_lib().ty_index_mutated(index._h)) or int(_lib().ty_index_delta_count(index._h)):
+            raise ValueError(
+                "compact save requires a folded index — call compact() first (no pending delta)"
+            )
+        n = int(_lib().ty_index_visible_count(index._h))
+        if mode == "pq" and n < 256:
+            raise ValueError(
+                "compact='pq' needs >=256 rows to train the PQ codebook; use 'int8' for tiny indexes"
+            )
+
+        # Visible set in native physical order: f32 vectors, logical ids, partition keys, provenance columns.
+        base, ids, keys, cols = self._materialize_visible(index)
+        base = np.ascontiguousarray(base, np.float32)
+        rowids = np.ascontiguousarray(ids, np.int64)
+
+        os.makedirs(path, exist_ok=True)
+        files: dict = {}
+
+        def record(name):
+            p = os.path.join(path, name)
+            files[name] = {"sha256": _sha256_file(p), "bytes": os.path.getsize(p)}
+
+        # Raw slabs: contiguous, atomic rename, no .npy header (the local sealer's exact byte layout).
+        def w(name, arr):
+            p = os.path.join(path, name)
+            tmp = p + ".tmp"
+            np.ascontiguousarray(arr).tofile(tmp)
+            os.replace(tmp, p)
+            record(name)
+
+        w("rowids.i64", rowids)
+        w("vectors.i8", _quantize_i8(base, index.dim))
+
+        pq_meta = None
+        if mode == "pq":
+            import faiss as _f
+
+            dim = index.dim
+            m_sub = _pq_choose_m(dim)
+            pq = _f.ProductQuantizer(dim, m_sub, 8)
+            pq.train(base)
+            w("vectors.pq", pq.compute_codes(base))  # (n, m) uint8
+            w("pq_codebook.f32", _f.vector_to_array(pq.centroids).astype(np.float32))
+            pq_meta = {"m": int(m_sub), "ksub": 256, "dsub": int(dim // m_sub)}
+
+        # Provenance columns are LOGICAL-ID indexed on disk (the artifact drops the external id map, so an
+        # internal id addresses its provenance directly). Each column becomes an object array whose length
+        # covers the largest visible id, matching the local sealer's column arrays byte for byte.
+        col_names = _native_col_names(index)
+        width = int(ids.max()) + 1 if len(ids) else 0
+
+        def save_col(name, arr):
+            p = os.path.join(path, name)
+            tmp = p + ".tmp"
+            with open(tmp, "wb") as _fh:  # np.save(handle) keeps the exact name (no .npy re-append)
+                np.save(_fh, arr)
+            os.replace(tmp, p)
+            record(name)
+
+        if width:
+            for c in col_names:
+                arr = np.full(width, None, dtype=object)
+                arr[ids] = np.asarray(cols.get(c, [None] * len(ids)), dtype=object)
+                save_col(f"col_{c}.npy", arr)
+            # Retained token hashes ride the same reserved column the local sealer writes, so an artifact
+            # is self-describing across runtimes. Off-key filtering ignores it in both engines.
+            # NOTE: the native handle keeps tokens HOST-side (`index.lexical_tokens`) rather than as a
+            # native rowmeta column, so `index.col_names` never lists the reserved name here — presence of
+            # retained tokens is the correct predicate, and it matches the local sealer's `texts` gate.
+            if index.lexical_tokens:
+                toks = np.full(width, None, dtype=object)
+                for lid in ids.tolist():
+                    hashes = index.lexical_tokens.get(int(lid))
+                    toks[int(lid)] = np.asarray(hashes, np.int64) if hashes else None
+                save_col(f"col_{_LEX_TOKENS_COLUMN}.npy", toks)
+
+        # Partition directory in the local sealer's shape: [key, start, len] over the physical row order.
+        # The native base is contiguous by partition key, which is what makes each entry a single slice —
+        # so ENFORCE that instead of trusting it. If a key ever reappeared after its slice closed, the
+        # [start, len] pair would describe the wrong rows and a reader would scan the wrong slice
+        # (silently corrupt). Fail closed rather than write a directory that lies.
+        directory: list = []
+        previous_key = object()  # sentinel: no run open yet
+        for pos, raw_key in enumerate(keys):
+            key = _py_key(raw_key)
+            if key == previous_key:
+                directory[-1][2] += 1  # same run: extend its length
+            else:
+                if any(entry[0] == key for entry in directory):
+                    raise RuntimeError(
+                        f"native export is not partition-contiguous: key {key!r} reappears at row {pos} "
+                        "after its slice closed; refusing to write a wrong partition directory"
+                    )
+                directory.append([key, int(pos), 1])
+                previous_key = key
+        directory.sort(key=lambda e: _partition_sort_key(e[0]))
+
+        profile = None
+        embedder = getattr(index, "embedder", None)
+        if embedder is not None and getattr(embedder, "profile", None) is not None:
+            profile = embedder.profile.as_dict()
+
+        manifest = {
+            "format": self._FORMAT,
+            "version": self._VERSION,
+            "dim": int(index.dim),
+            "dtype": index.dtype,
+            "n": int(n),
+            "key_name": index.key_name,
+            "metric": "ip",
+            "cand_cap": None,
+            "partitions": len(directory),
+            "exact_crossover": int(getattr(index, "exact_crossover", 1 << 62)),
+            "directory": directory,
+            "columns": list(col_names)
+            + ([_LEX_TOKENS_COLUMN] if index.lexical_tokens else []),
+            "profile": profile,
+            "has_delta": False,  # a compact export is folded by construction (guarded above)
+            "delta_keys": [],
+            "lsn": int(_lib().ty_index_snapshot(index._h)),
+            "tomb": [],
+            "dirty": [],
+            "compact_primary": mode,
+            "pq": pq_meta,
+            "pivf": [],
+            "files": files,
+        }
+        # Manifest is the commit point — written last, atomically, so a reader never sees a manifest that
+        # references files not yet fully written.
+        mtmp = os.path.join(path, "manifest.json.tmp")
+        with open(mtmp, "w") as f:
+            json.dump(manifest, f)
+        os.replace(mtmp, os.path.join(path, "manifest.json"))
+        return path
 
     def open_compact(self, path):
         raise NotImplementedError(
-            "compact serve artifacts are not yet supported on the native runtime; "
-            "open with the local runtime (TELYS_RUNTIME=local)"
+            "reading compact serve artifacts is not supported on the native runtime; "
+            "open it with the local runtime (TELYS_RUNTIME=local)"
         )
 
     # ── IVF-within-partition (PR-5; faiss clustering host-side, native exact rerank) ───────────────
