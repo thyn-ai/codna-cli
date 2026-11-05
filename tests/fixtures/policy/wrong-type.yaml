@@ -1,0 +1,9 @@
+# Wrong TYPE: `tools.allow` must be a list of strings, not a single string.
+# A lenient reader would coerce `read_files` into `[read_files]` — same permissions here, but the
+# same coercion applied to a mapping or a number is how a policy becomes something nobody reviewed.
+# Must DENY (`policy_invalid_type`).
+version: 1
+tools:
+  allow: read_files
+write_scope:
+  paths: ["src/**"]

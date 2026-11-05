@@ -916,6 +916,10 @@ def build_parser() -> argparse.ArgumentParser:
     _register_key(sub)
     from .impact_cli import register_cli as _register_impact_cli  # impact + memory commands
     _register_impact_cli(sub)
+    from .durable.cli import register as _register_durable  # durable runs (optional extra)
+    _register_durable(sub)
+    from .durable.cli import register_top_level as _register_durable_top  # `codna run` / `codna worker`
+    _register_durable_top(sub)
     return p
 
 
