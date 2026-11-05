@@ -6,6 +6,24 @@ from types import SimpleNamespace
 import pytest
 
 import codna.cli as cli_module
+from codna.doctor import redact_display_text
+
+
+@pytest.mark.parametrize("value", ["secretvalue", "secret,value with spaces", "", 123])
+def test_redact_display_text_preserves_json_output(value) -> None:
+    raw = json.dumps({"api_key": value})
+
+    redacted = redact_display_text(raw)
+
+    assert json.loads(redacted) == {"api_key": "<redacted>"}
+    if value:
+        assert str(value) not in redacted
+
+
+def test_redact_display_text_preserves_plain_assignments() -> None:
+    assert redact_display_text("api_key=secret token:another") == (
+        "api_key=<redacted> token:<redacted>"
+    )
 
 
 def _clean_mojo_workers() -> dict[str, object]:

@@ -1,4 +1,4 @@
-"""Make the `codna` package importable when running pytest from anywhere.
+"""Make the `codna` package and shared test helpers importable from any pytest invocation.
 
 `codna.sarif` / `codna.findings` are pure-stdlib, so importing the package does not pull
 in the engine client — the offline SARIF suite runs without installing the full CLI.
@@ -9,9 +9,11 @@ import sys
 import pytest
 
 CLI_DIR = pathlib.Path(__file__).resolve().parents[1]  # .../cli
-FIXTURES_DIR = pathlib.Path(__file__).resolve().parent / "fixtures"
-if str(CLI_DIR) not in sys.path:
-    sys.path.insert(0, str(CLI_DIR))
+TESTS_DIR = pathlib.Path(__file__).resolve().parent
+FIXTURES_DIR = TESTS_DIR / "fixtures"
+for import_dir in (CLI_DIR, TESTS_DIR):
+    if str(import_dir) not in sys.path:
+        sys.path.insert(0, str(import_dir))
 
 
 def pytest_ignore_collect(collection_path, config):  # noqa: ARG001 - pytest hook signature
