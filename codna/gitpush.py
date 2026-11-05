@@ -8,7 +8,15 @@ build/test/scanner code), and is exercised offline against a local bare remote i
 """
 from __future__ import annotations
 
+import re
 import subprocess
+
+
+_URL_CREDENTIAL_RE = re.compile(r"(https?://)([^/@\s\"']+@)")
+
+
+def _redact_url_credentials(text: str) -> str:
+    return _URL_CREDENTIAL_RE.sub(r"\1<redacted>@", text)
 
 
 class GitPushError(Exception):
@@ -21,8 +29,34 @@ def _git(repo_dir: str, *args: str, stdin: str | None = None) -> str:
         input=stdin, capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        raise GitPushError(f"git {' '.join(args)} -> {proc.returncode}: {proc.stderr.strip()}")
+        command = _redact_url_credentials(" ".join(args))
+        stderr = _redact_url_credentials(proc.stderr.strip())
+        raise GitPushError(f"git {command} -> {proc.returncode}: {stderr}")
     return proc.stdout
+
+
+def push_branch(
+    repo_dir: str,
+    *,
+    branch: str,
+    sha: str,
+    push_url: str | None = None,
+    remote: str = "origin",
+) -> str:
+    """Push an EXISTING commit as ``branch``. Returns the branch name.
+
+    The sibling of `GitBranchBuilder.build_and_push` for a caller whose branch is already built —
+    a durable run commits each turn itself (`durable.activities.checkpoint_turn`), so there is no
+    patch to apply here and re-applying one would rewrite the history that was just audited. It
+    verifies ``sha`` exists first: pushing a ref that is not in this repository would otherwise
+    fail deep inside git with a message about the remote, not about the mistake.
+
+    Idempotent in the sense that matters: pushing the same sha again is a no-op on the remote
+    (git reports "Everything up-to-date"), so a retried activity does not error.
+    """
+    rev = _git(repo_dir, "rev-parse", "--verify", f"{sha}^{{commit}}").strip()
+    _git(repo_dir, "push", push_url or remote, f"{rev}:refs/heads/{branch}")
+    return branch
 
 
 class GitBranchBuilder:

@@ -12,6 +12,7 @@ from typing import Any, Mapping
 import httpx
 
 from .agent_core_runtime import ensure_agent_core_running
+from .config_file import BASE_URL_ENV
 from .packaged_repository_advanced import (
     PackagedAgentRunRequest,
     PackagedAgentRunResult,
@@ -175,6 +176,12 @@ def _sidecar_payload(request: PackagedAgentRunRequest, workspace: Path) -> dict[
         payload["provider"] = provider
     if model:
         payload["model"] = model
+    # The provider ENDPOINT override. It may only come from the user's own config (`~/.codna/config.yaml`,
+    # applied to CODNA_AGENT_BASE_URL by config_file) or the environment — never from a repository file, and
+    # never from the run request. The engine validates and normalizes it again on arrival.
+    base_url = (os.environ.get(BASE_URL_ENV) or "").strip()
+    if base_url:
+        payload["base_url"] = base_url
     return payload
 
 
