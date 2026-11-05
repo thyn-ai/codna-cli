@@ -247,6 +247,11 @@ def _server(tmp_path: Path) -> Iterator[Any]:
         def __init__(self) -> None:
             self.started: list[dict[str, Any]] = []
 
+        def capabilities(self) -> Any:
+            from codna.durable.run_api_backend import durable_capabilities
+
+            return durable_capabilities("127.0.0.1:7233")
+
         def start_run(self, *, payload: Any, run_id: str, run_timeout_s: int) -> dict[str, Any]:
             self.started.append({"payload": dict(payload), "run_id": run_id})
             return {"run_id": run_id, "workflow_id": f"run:{run_id}", "tasks": 1}

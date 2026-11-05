@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Final, Mapping
 
@@ -29,10 +30,16 @@ from .config import DurableConfig
 from .run_api_support import RunApiError
 
 __all__ = [
+    "ALL_ROUTE_KEYS",
+    "READ_ROUTE_KEYS",
     "RPC_TIMEOUT_S",
+    "TEMPORAL_ROUTE_KEYS",
     "RunBackend",
+    "RunCapabilities",
     "TemporalRunBackend",
+    "durable_capabilities",
     "is_not_found",
+    "ledger_only_capabilities",
     "translate",
 ]
 
@@ -41,6 +48,132 @@ __all__ = [
 RPC_TIMEOUT_S: Final = 30.0
 # How long the loop thread may take to establish the client before the server refuses to start.
 CONNECT_TIMEOUT_S: Final = 30.0
+
+
+# Which routes this surface can serve WITHOUT a durable executor. Deliberately a declaration beside
+# the backend seam rather than something derived from the role table: "a viewer may read" and "a read
+# needs no Temporal" are two different facts that happen to agree today, and a role added later must
+# not silently move a route between the two sets.
+#
+# `runs.capabilities` belongs here rather than in its own third bucket: it describes the server itself,
+# needs no workflow, and is the route a ledger-only server must ANSWER to describe being ledger-only.
+READ_ROUTE_KEYS: Final[frozenset[str]] = frozenset(
+    {"runs.capabilities", "runs.list", "runs.get", "runs.events"}
+)
+# Every route that needs a workflow to act on. `tests/durable/test_run_api_capabilities.py` asserts the
+# two sets PARTITION `roles.ROUTE_ROLES`, so a route added without a decision here is a red test and
+# never a capability document that quietly omits it.
+TEMPORAL_ROUTE_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "runs.start",
+        "runs.steer",
+        "runs.approve",
+        "runs.budget",
+        "runs.pause",
+        "runs.resume",
+        "runs.cancel",
+    }
+)
+
+
+# The union, computed ONCE. `durable_capabilities` is called on every `GET /runs` (the IDE's poll), and a
+# per-request set union is an allocation with no purpose: the set of routes this build can serve is a property of
+# the BUILD, not of the request. Declared beside the two halves so a route added to either is in it automatically.
+ALL_ROUTE_KEYS: Final[frozenset[str]] = READ_ROUTE_KEYS | TEMPORAL_ROUTE_KEYS
+
+
+@dataclass(frozen=True)
+class RunCapabilities:
+    """What this server can ACTUALLY do, as data — not as prose a client has to interpret.
+
+    The problem this type exists for: a Run API started with ``--no-temporal`` is a legitimate mode
+    (it serves the run list, the ledger and the event history), but the only way a caller learned that
+    was by attempting a mutation and reading a 503 whose message said a flag had been passed. An
+    operator who had just been told to "run `codna serve`" read that as a broken install.
+
+    So the server states its capabilities UP FRONT, in the banner it prints and on the list route the
+    IDE already calls. ``available_routes`` / ``unavailable_routes`` name route keys rather than
+    sentences, because the client must branch on them; ``execution`` is the one-word summary of the
+    same fact for a human, and ``reason`` is the coded refusal a mutation would produce.
+
+    ``summary`` is what the MODE means, in the words a person needs: a degraded server is described
+    by what still works first, and by the one requirement it is missing second.
+    """
+
+    #: True only when this server can start, steer and control runs (i.e. it owns a Temporal client).
+    durable_execution: bool
+    #: The Temporal address this server is connected to; ``None`` in a ledger-only deployment.
+    temporal_address: str | None
+    #: Route keys this server serves. A client may call all of them.
+    available_routes: frozenset[str]
+    #: Route keys this server refuses. Calling one is a 503 with ``reason_code``.
+    unavailable_routes: frozenset[str]
+
+    @property
+    def mode(self) -> str:
+        """``durable`` or ``ledger-only``. One word, so a client does not have to infer a mode."""
+        return "durable" if self.durable_execution else "ledger-only"
+
+    @property
+    def reason_code(self) -> str | None:
+        """The code an unavailable route answers with, or ``None`` when everything is available."""
+        return None if self.durable_execution else "run_api_temporal_disabled"
+
+    @property
+    def summary(self) -> str:
+        """One sentence a human can read: what works first, then what is missing and why."""
+        if self.durable_execution:
+            return (
+                f"Durable execution is available via Temporal at {self.temporal_address}: "
+                "runs can be started, steered and controlled."
+            )
+        return (
+            "Ledger-only mode: listing runs and reading run history work; starting and controlling "
+            "runs needs Temporal. Start one with `codna durable dev-server start`, then restart "
+            "`codna serve` without --no-temporal."
+        )
+
+    def as_payload(self) -> dict[str, Any]:
+        """The JSON shape. Sorted lists, because a client diffing two banners must get a stable answer."""
+        return {
+            "mode": self.mode,
+            "durable_execution": self.durable_execution,
+            "temporal_address": self.temporal_address,
+            "available_routes": sorted(self.available_routes),
+            "unavailable_routes": sorted(self.unavailable_routes),
+            "reason_code": self.reason_code,
+            "summary": self.summary,
+        }
+
+
+def durable_capabilities(temporal_address: str) -> RunCapabilities:
+    """The capabilities of a server that owns a Temporal client. Every route is servable.
+
+    A function rather than a class constant because the address is part of the answer: a banner that
+    said "durable execution is available" without naming WHICH server would leave an operator unable
+    to tell a local dev server from a Cloud namespace.
+    """
+    return RunCapabilities(
+        durable_execution=True,
+        temporal_address=temporal_address,
+        available_routes=ALL_ROUTE_KEYS,
+        unavailable_routes=frozenset(),
+    )
+
+
+def ledger_only_capabilities() -> RunCapabilities:
+    """The capabilities of a `--no-temporal` server: the ledger routes, and nothing that starts work.
+
+    THE ONE DEFINITION of this mode. The banner, `GET /capabilities`, the copy on `GET /runs` and the
+    503 a mutation raises all read it, so an operator and a client cannot be told two different things
+    about the same process.
+    """
+    return RunCapabilities(
+        durable_execution=False,
+        temporal_address=None,
+        available_routes=READ_ROUTE_KEYS,
+        unavailable_routes=TEMPORAL_ROUTE_KEYS,
+    )
 
 
 class RunBackend:
@@ -52,6 +185,15 @@ class RunBackend:
     An implementation raises `RunApiError` for a condition the surface reports (unknown run) and may
     raise the CLI's own coded error, which `translate` maps onto a status.
     """
+
+    def capabilities(self) -> RunCapabilities:
+        """What this backend can do. NO DEFAULT: an implementation has to state it.
+
+        A permissive default here would be the same defect this seam's guard rails exist to prevent
+        — a backend that forgot to answer would be described as fully capable, and the client would
+        only learn otherwise by failing a mutation.
+        """
+        raise NotImplementedError
 
     def start_run(self, *, payload: Mapping[str, Any], run_id: str, run_timeout_s: int) -> dict[str, Any]:
         raise NotImplementedError
@@ -186,6 +328,15 @@ def translate(exc: BaseException, *, run_id: str) -> RunApiError:
 
 class TemporalRunBackend(RunBackend):
     """The real backend, over the CLI's own Temporal calls."""
+
+    def capabilities(self) -> RunCapabilities:
+        """Connected to Temporal: every route is servable.
+
+        This is a statement about the CONNECTION, which is why it is a method and not a class constant:
+        the backend cannot be constructed without a client, so "connected" is true by construction here
+        and the answer is derived from the address it is actually connected to.
+        """
+        return durable_capabilities(self._config.address)
 
     def __init__(self, config: DurableConfig, *, connect_timeout_s: float = CONNECT_TIMEOUT_S) -> None:
         self._config = config

@@ -105,6 +105,7 @@ class AuthorizationError(RuntimeError):
 # what lets the router and the role table agree without one implying the other.
 ROUTE_ROLES: Final[Mapping[str, Role]] = {
     # reads
+    "runs.capabilities": VIEWER,
     "runs.list": VIEWER,
     "runs.get": VIEWER,
     "runs.events": VIEWER,
