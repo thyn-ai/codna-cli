@@ -6,8 +6,8 @@ that already exists. A reviewer asking "what does the IDE talk to" reads this fi
 
 Everything the surface enforces (loopback only, the 0600 bearer token, an identity on every mutation)
 lives in `run_api`; this is the translator that turns flags into `RunApiSettings` and a listen socket,
-plus the `--no-temporal` backend that answers "this server cannot reach Temporal" explicitly rather
-than pretending.
+plus the `--no-temporal` backend that answers "this server cannot start runs" explicitly rather than
+pretending, and states what it CAN do before a caller has to find out by failing.
 
 Not imported at module scope by anything that must work without the durable extra: `run_api` is
 imported inside `cmd_serve`.
@@ -17,7 +17,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from .run_api_backend import RunBackend
+from .run_api_backend import RunBackend, RunCapabilities, ledger_only_capabilities
 
 __all__ = ["add_serve_flags", "cmd_serve"]
 
@@ -62,6 +62,11 @@ def cmd_serve(args: Any) -> int:
     ``/runs/:id/events``): it starts the server with no Temporal client, so a read-only viewer does
     not require the durable extra or a running server. The routes that need Temporal answer 503 with
     a stable code rather than pretending.
+
+    THE BANNER STATES THE MODE, not only the address. `capabilities` names which route keys this
+    server serves and which it refuses, plus one sentence saying what still works; `temporal` stays
+    because a caller keying on its absence should keep working. A mode an operator chose is described
+    as a mode — never as a failure to reach something.
     """
     from . import require_durable
     from .identity import IdentityError, IdentityResolver
@@ -112,6 +117,7 @@ def cmd_serve(args: Any) -> int:
     except RunApiError as exc:
         backend.close()
         raise _error(str(exc), code=exc.code, details=dict(exc.details), hint=exc.hint) from exc
+    capabilities = backend.capabilities()
     _cli_module()._print(
         {
             "run_api": {
@@ -120,7 +126,10 @@ def cmd_serve(args: Any) -> int:
                 "port": server.port,
                 "token_path": str(settings.token_path),
                 "auth_mode": identity.mode,
-                "temporal": None if getattr(args, "no_temporal", False) else config.address,
+                # Kept as the ADDRESS-OR-NULL field existing callers already read. `capabilities`
+                # carries the rest; the two are derived from the same object, so they cannot disagree.
+                "temporal": capabilities.temporal_address,
+                "capabilities": capabilities.as_payload(),
                 "task_queue": config.task_queue,
             }
         }
@@ -208,20 +217,38 @@ class _LedgerOnlyBackend(RunBackend):
     be told the steering did not happen. ``run_api_temporal_disabled`` is that answer, and
     `require_run` still succeeds for a run whose ledger exists — which is exactly the read-only
     viewer's case.
+
+    `capabilities` is the SAME fact stated before the fact, so a caller does not have to provoke a 503
+    to discover the mode. Both come from `ledger_only_capabilities`, so the banner and the refusal
+    cannot describe two different servers.
     """
 
     def __init__(self) -> None:
-        self._reason = "this server was started with --no-temporal"
+        self._capabilities = ledger_only_capabilities()
+
+    def capabilities(self) -> RunCapabilities:
+        return self._capabilities
 
     def _unavailable(self) -> Any:
         from .run_api_support import RunApiError as _Error
 
         return _Error(
-            "this run API cannot reach Temporal: it was started with --no-temporal.",
+            "this run API is in ledger-only mode (it was started with --no-temporal): it can list "
+            "runs and read their history, but it cannot start or control a run.",
             code="run_api_temporal_disabled",
             status=503,
-            details={"no_temporal": True},
-            hint="restart without --no-temporal to start, steer or control a run",
+            details={
+                "no_temporal": True,
+                "mode": self._capabilities.mode,
+                # The routes that DO work, named in the refusal itself: an operator reading a 503 is
+                # owed the same statement the banner gives, not a hint to try something else.
+                "available_routes": sorted(self._capabilities.available_routes),
+            },
+            hint=(
+                "listing runs and reading their history work here; to start, steer or control a run, "
+                "start Temporal (`codna durable dev-server start`) and restart `codna serve` without "
+                "--no-temporal"
+            ),
         )
 
     def start_run(self, *, payload: Any, run_id: str, run_timeout_s: int) -> dict[str, Any]:
@@ -266,7 +293,9 @@ def add_serve_flags(serve: Any) -> None:
                        help="concurrent SSE streams to serve before answering 503 "
                             f"(default: {DEFAULT_MAX_STREAMS})")
     serve.add_argument("--no-temporal", action="store_true",
-                       help="serve the ledger routes only (no Temporal client, no durable extra)")
+                       help="LEDGER-ONLY mode: serve GET /runs and /runs/:id/events (the run list and "
+                            "its history); starting or controlling a run is refused with "
+                            "run_api_temporal_disabled. Needs no Temporal server and no durable extra.")
     # -- the identity layer ------------------------------------------------------------------
     #
     # `token` is the default because it is what every existing caller already has. `oidc` is the
