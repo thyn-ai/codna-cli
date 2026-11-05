@@ -40,6 +40,10 @@ class LocalRuntime(RuntimeHandle):
 
     FORMAT_VERSION = FORMAT_VERSION
 
+    # The local sealer implements compact serve artifacts in full (export AND read-back).
+    supports_compact_export = True
+    supports_compact_open = True
+
     # lifecycle
     def new_index(self, dim, dtype):
         return PartitionedVectorIndex(dim, dtype)
