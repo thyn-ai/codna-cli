@@ -1,0 +1,9 @@
+# Unknown key nested INSIDE a known section. `tool:` (singular) is a typo for `tools:`;
+# the section it sits in still parses, so only a per-section unknown-key check catches it.
+# Must DENY (`policy_unknown_key` at `tools`), not "grant everything the profile allows".
+version: 1
+tools:
+  allow: [read_files]
+  tool: [editor]
+write_scope:
+  paths: ["src/**"]
