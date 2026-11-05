@@ -41,6 +41,16 @@ def fresh_machine(monkeypatch, tmp_path):
         "CODNA_TELYS_ACCOUNTS_URL", "CODNA_TELYS_API_URL", "CODNA_TELYS_PACKAGES_URL",
     ):
         monkeypatch.delenv(name, raising=False)
+    # "Fresh" must include the kernel, not just the env. The resolver also consults this SOURCE
+    # CHECKOUT's `build/local-telys` (`memory_install.candidate_install_roots` -> the checkout root
+    # derived from codna/memory.py), which `TELYS_HOME` does not redirect. Without this, a machine with
+    # a built runtime reports a kernel BEFORE any provisioning and a runner with none reports none —
+    # so `ensure_provisioned` takes a different branch per machine and the tests below would pin the
+    # developer's disk. Only the checkout fallback is neutralised: the `$CODNA_TELYS_INSTALL_ROOT`
+    # override the fake provisioning sets is still honoured, which is the path under test. The full
+    # resolution order is covered by `test_memory_errors.py` / `test_mcp_recall.py`.
+    monkeypatch.setattr("codna.memory_install.source_checkout_root",
+                        lambda package_file: tmp_path / "no-source-checkout")
     # The gate must see only what the test provisions — never the developer's real OS keychain.
     monkeypatch.setattr("codna.keystore.config_values", lambda: {})
     monkeypatch.setattr("codna.byok_cli.ensure_local_provider_key", lambda **kwargs: "present")
@@ -252,18 +262,73 @@ def test_ensure_provisioned_fast_path_never_calls_run_login(monkeypatch):
 def test_ensure_provisioned_skips_download_when_a_kernel_already_resolves(monkeypatch):
     # License missing but a kernel is already resolvable (e.g. a platform wheel): authorize the
     # device without re-downloading the runtime.
-    monkeypatch.setattr(memory_module, "_configured_license_token", lambda: (None, None))
+    #
+    # THE FLAG, which is why this test also matters for `runtime_installed`: this is the branch that
+    # passes `install=False`, and it used to report `runtime_installed: false` even though the device
+    # HAS a usable runtime — the flag echoed "nothing was downloaded" instead of "a kernel resolves".
+    # `telys.login` with install=False reports `installed: false` by construction, so the two can never
+    # agree; the status now comes from the resolver (see `ensure_provisioned`).
+    licenses = [("no license yet", None)]
+    monkeypatch.setattr(
+        memory_module, "_configured_license_token",
+        lambda: (None, None) if licenses[0][1] is None else ("device.jwt", "codna:onboarding-license"),
+    )
     monkeypatch.setattr(memory_module, "_resolve_telys_kernel",
                         lambda *, configure_env: {"found": True, "source": "codna:package-runtime"})
+
+    def fake_run_login(**kwargs):
+        licenses[0] = ("device authorized", "device.jwt")
+        return {"installed": False, "tier": "telys_developer"}
+
     captured: dict = {}
     monkeypatch.setattr(onb, "run_login",
-                        lambda **kwargs: captured.update(kwargs) or {"installed": False,
-                                                                     "tier": "telys_developer"})
+                        lambda **kwargs: captured.update(kwargs) or fake_run_login(**kwargs))
     status = onb.ensure_provisioned(access_token="tok")
     assert captured == {"token": "tok", "plan": "telys_developer", "install": False,
                         "open_browser": None}
     assert status["provisioned"] is True
     assert status["already_provisioned"] is False
+    # Downloaded nothing (install=False) yet the runtime IS installed — the regression this pins.
+    assert status["runtime_installed"] is True
+    assert status["runtime_source"] == "codna:package-runtime"
+
+
+def test_ensure_provisioned_refuses_to_report_success_without_a_runtime(monkeypatch):
+    """Provisioning that authorized the device but left NO resolvable kernel is a failure, not a
+    0-exit `codna login`: the documented contract is "0 = signed in AND provisioned", and a success
+    payload here would defer the failure to the first `codna_recall`."""
+    monkeypatch.setattr(memory_module, "_configured_license_token",
+                        lambda: ("device.jwt", "codna:onboarding-license"))
+    monkeypatch.setattr(memory_module, "_resolve_telys_kernel",
+                        lambda *, configure_env: {"found": False, "source": "missing"})
+    monkeypatch.setattr(onb, "run_login",
+                        lambda **kwargs: {"installed": False, "tier": "telys_developer"})
+
+    with pytest.raises(onb.OnboardingError, match="no Telys kernel resolves"):
+        onb.ensure_provisioned(access_token="tok")
+
+
+def test_ensure_provisioned_names_the_license_when_the_kernel_already_resolves(monkeypatch):
+    """`provisioned` is "license AND kernel", so the error must name which half is missing.
+
+    The kernel half can already be satisfied when the license is not — a platform wheel ships a
+    kernel, and `run_login` writing the license is a separate step. Blaming the kernel there sends
+    the user to `CODNA_TELYS_INSTALL_ROOT`/`TELYS_KERNEL`, i.e. to reconfigure the one thing that
+    works. Regression: the first version of this guard did exactly that.
+    """
+    monkeypatch.setattr(memory_module, "_configured_license_token", lambda: (None, None))
+    monkeypatch.setattr(memory_module, "_resolve_telys_kernel",
+                        lambda *, configure_env: {"found": True, "source": "codna:package-runtime"})
+    monkeypatch.setattr(onb, "run_login",
+                        lambda **kwargs: {"installed": False, "tier": "telys_developer"})
+
+    with pytest.raises(onb.OnboardingError) as excinfo:
+        onb.ensure_provisioned(access_token="tok")
+
+    message = str(excinfo.value)
+    assert "license was not written" in message
+    assert "TELYS_HOME" in message
+    assert "TELYS_KERNEL" not in message, "the kernel already resolves; do not send the user to it"
 
 
 # ---- login(): the access token is returned for the provisioning step --------------------------------

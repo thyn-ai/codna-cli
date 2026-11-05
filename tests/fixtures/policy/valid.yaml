@@ -1,0 +1,12 @@
+# Valid: the baseline policy every fixture is compared against.
+# Grants a narrow write scope, two tools, one command, and a budget.
+version: 1
+tools:
+  allow: [read_files, editor]
+  deny: [run_commands]
+write_scope:
+  paths: ["src/**"]
+command_allow_list:
+  commands: [pytest]
+budget:
+  max_cost_usd: 5.0
