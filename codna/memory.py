@@ -43,6 +43,10 @@ import sys
 import time
 
 from .codeunits import FILTER_COLUMNS, UnsupportedLanguageError, extract_repo, resolve_languages
+# Import wiring for a resolved Codna-managed Telys install lives in memory_install.py (1000-line ceiling);
+# re-exported here because `codna.memory` is the public import surface every caller and test uses.
+from .memory_install import activate_install_site_packages as _activate_install_site_packages
+from .memory_install import candidate_install_roots as _candidate_codna_install_roots
 from .memory_manifest import legacy_manifest_id_belongs_to_repo, manifest_entry, manifest_hash, manifest_scope
 
 COLLECTION = "repo_symbols"
@@ -54,7 +58,6 @@ _LICENSE_PATH_ENV_NAMES = ("CODNA_TELYS_LICENSE_PATH", "TELYS_LICENSE_PATH")
 _LICENSE_REQUIRED_ENV = "CODNA_TELYS_LICENSE_REQUIRED"
 _KERNEL_ENV_NAMES = ("TELYS_KERNEL", "AME_KERNEL")
 _CODNA_KERNEL_ENV_NAME = "CODNA_TELYS_KERNEL"
-_CODNA_INSTALL_ROOT_ENV_NAME = "CODNA_TELYS_INSTALL_ROOT"
 _PACKAGE_RUNTIME_DIRNAME = "_telys_runtime"
 _PACKAGE_RUNTIME_MANIFEST = "manifest.json"
 _PACKAGE_RUNTIME_SCHEMA_VERSION = 1
@@ -79,10 +82,6 @@ def _kernel_filename() -> str:
     if sys.platform.startswith("win"):
         return "libame_kernel.dll"
     return "libame_kernel.so"
-
-
-def _source_checkout_root() -> Path:
-    return Path(__file__).resolve().parents[2]
 
 
 def _runtime_platform_tag() -> str:
@@ -171,15 +170,6 @@ def _package_runtime_candidate() -> tuple[Path, dict] | None:
     return runtime_dir / expected, metadata
 
 
-def _candidate_codna_install_roots() -> list[tuple[str, Path]]:
-    roots: list[tuple[str, Path]] = []
-    raw = os.environ.get(_CODNA_INSTALL_ROOT_ENV_NAME)
-    if raw and raw.strip():
-        roots.append((f"env:{_CODNA_INSTALL_ROOT_ENV_NAME}", Path(raw).expanduser()))
-    roots.append(("codna:source-build", _source_checkout_root() / "build" / "local-telys"))
-    return roots
-
-
 def _candidate_kernel_paths() -> list[tuple[str, Path]]:
     filename = _kernel_filename()
     candidates: list[tuple[str, Path]] = []
@@ -189,7 +179,7 @@ def _candidate_kernel_paths() -> list[tuple[str, Path]]:
     packaged = _package_runtime_candidate()
     if packaged is not None:
         candidates.append(("codna:package-runtime", packaged[0]))
-    for source, root in _candidate_codna_install_roots():
+    for source, root in _candidate_codna_install_roots(__file__):
         candidates.append((source, root / "kernel" / filename))
     try:
         from telys.paths import AME_KERNEL_STEM, installed_lib_path
@@ -272,6 +262,10 @@ def _runtime_install_hint() -> str:
 
 def _require_telys():
     """Lazily import the Telys surface. Raises CodeMemoryError with an install hint if absent."""
+    # Make the RESOLVED install's site-packages importable BEFORE the first telys import: without this the
+    # process imported whatever telys was installed system-wide (or nothing) and failed with an install hint
+    # even though a complete Codna-managed install was present. See _activate_install_site_packages.
+    _activate_install_site_packages(__file__)
     try:
         from telys import Telys, scope_key
     except ImportError as exc:

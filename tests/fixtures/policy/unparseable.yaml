@@ -1,0 +1,5 @@
+# Unparseable YAML: a tab used for indentation (illegal in YAML) plus an unterminated flow list.
+# Must DENY (`policy_unparseable`) — the reader must not "recover" a prefix.
+version: 1
+tools:
+	allow: [read_files
