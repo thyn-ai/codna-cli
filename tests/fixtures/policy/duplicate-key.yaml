@@ -1,0 +1,10 @@
+# DUPLICATE KEY: two `tools:` blocks. PyYAML's default loader resolves this last-wins, so a second
+# block appended below a reviewed one silently replaces it — a fail-open that no type check catches.
+# Must DENY (`policy_duplicate_key`).
+version: 1
+tools:
+  allow: [read_files]
+write_scope:
+  paths: ["src/**"]
+tools:
+  allow: [read_files, search_codebase, editor, apply_patch, run_commands]
