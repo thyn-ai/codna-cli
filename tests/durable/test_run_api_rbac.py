@@ -59,7 +59,11 @@ from codna.durable.roles import (  # noqa: E402
     role_from_claim,
 )
 from codna.durable.run_api import RunApiServer  # noqa: E402
-from codna.durable.run_api_backend import RunBackend  # noqa: E402
+from codna.durable.run_api_backend import (  # noqa: E402
+    RunBackend,
+    RunCapabilities,
+    durable_capabilities,
+)
 from codna.durable.run_api_http import ALL_ROUTES, Route  # noqa: E402
 from codna.durable.run_api_support import RunApiSettings  # noqa: E402
 from codna.durable.siem import (  # noqa: E402
@@ -89,6 +93,11 @@ class ScriptedBackend(RunBackend):
         self.signals: list[tuple[str, str]] = []
         self.started: list[dict[str, Any]] = []
         self.closed = False
+
+    def capabilities(self) -> RunCapabilities:
+        # A scripted backend with a Temporal-shaped answer: these tests exercise AUTH, and a
+        # ledger-only answer would make every mutation a 503 before the role check under test.
+        return durable_capabilities("127.0.0.1:7233")
 
     def start_run(self, *, payload: Mapping[str, Any], run_id: str, run_timeout_s: int) -> dict[str, Any]:
         self.started.append({"run_id": run_id, "payload": dict(payload)})
@@ -228,6 +237,7 @@ def _resolver_for(config: Any, roles: frozenset[str]) -> IdentityResolver:
 # would leave it untested; the "every route is covered" test below is what makes this exhaustive.
 
 ROUTE_MATRIX: tuple[tuple[str, str, dict[str, Any] | None, str], ...] = (
+    ("GET", "/capabilities", None, VIEWER),
     ("GET", "/runs", None, VIEWER),
     ("GET", "/runs/run-1", None, VIEWER),
     ("GET", "/runs/run-1/events?follow=0", None, VIEWER),
@@ -253,6 +263,7 @@ def test_the_matrix_covers_every_declared_route() -> None:
     to make "a route exists with no role matrix row" a red test.
     """
     covered = {
+        "GET /capabilities": "runs.capabilities",
         "GET /runs": "runs.list",
         "GET /runs/run-1": "runs.get",
         "GET /runs/run-1/events": "runs.events",
