@@ -1,0 +1,2 @@
+# Present but declares nothing: a mapping with no sections. Same verdict as `empty.yaml` —
+# `policy_denies_all`. Included separately because "the file parsed" is not "the file permits".

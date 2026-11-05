@@ -168,8 +168,23 @@ def test_export_without_compact_seam_raises(monkeypatch):
     assert not os.path.exists("/tmp/never-written")
 
 
+def _compact_export_capability(mem):
+    """(supported, detail) for the memory's resolved runtime, from a REAL capability signal.
+
+    ``hasattr(collection, "export_compact")`` is the wrong probe: the method exists on every runtime
+    (it is part of the SDK's ``RuntimeHandle`` contract), so the attribute is always present even when
+    calling it raises ``NotImplementedError``. That is exactly how this test rotted into an error in its
+    own body instead of a clean skip. The decision lives in ``memengine.capabilities`` so the product and
+    this test cannot disagree.
+    """
+    from codna.runtime_capabilities import supports_compact_export
+
+    runtime = getattr(getattr(mem, "_eng", None), "_runtime", None)
+    return supports_compact_export(runtime)
+
+
 def test_export_end_to_end(tmp_path, monkeypatch):
-    """Needs the Telys kernel + the compact seam; skips on older stacks (offline CI lane)."""
+    """Needs the Telys kernel + a runtime that IMPLEMENTS the compact seam (offline CI lane skips)."""
     monkeypatch.setenv("CODNA_MEMORY_EMBED", "local")
     repo = str(tmp_path / "repo")
     os.makedirs(repo, exist_ok=True)
@@ -182,8 +197,9 @@ def test_export_end_to_end(tmp_path, monkeypatch):
         mem = CodeMemory(repo, db_path=str(tmp_path / "db"))
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"telys/kernel unavailable: {type(exc).__name__}: {exc}")
-    if not hasattr(mem._collection(), "export_compact"):
-        pytest.skip("resolved telys predates the compact seam (telys#99)")
+    supported, detail = _compact_export_capability(mem)
+    if not supported:
+        pytest.skip(f"resolved runtime cannot export compact serve artifacts: {detail}")
 
     info = CodeMemory(repo, db_path=str(tmp_path / "db")).export_serve_artifact(
         str(tmp_path / "artifact"))
@@ -192,3 +208,48 @@ def test_export_end_to_end(tmp_path, monkeypatch):
     assert info["mode"] == "int8" and info["size_bytes"] > 0
     assert os.path.isfile(os.path.join(info["artifact"], "manifest.json"))
     assert not os.path.exists(os.path.join(info["artifact"], "ty_base.npy"))  # no f32 slab
+    assert not os.path.exists(os.path.join(info["artifact"], "vectors.f32"))  # no f32 slab
+
+
+def test_compact_capability_probe_rejects_unimplemented_runtime(monkeypatch):
+    """The capability probe must read the runtime flag, not merely the method's presence.
+
+    Regression guard for the exact defect that made ``test_export_end_to_end`` an ERROR in its own body:
+    a runtime that declares the method but raises ``NotImplementedError`` satisfies ``hasattr`` while
+    supporting nothing. The probe must call it unsupported.
+    """
+    from types import SimpleNamespace
+
+    from codna.memory import CodeMemory, CodeMemoryError
+
+    # A runtime that inherits the SDK's base-class stub: the method EXISTS (so `hasattr` says yes) and
+    # calling it raises NotImplementedError. This is the exact shape that made the export test error
+    # inside its own body instead of skipping. No SDK here -> genuine skip (the offline CI lane).
+    try:
+        from telys.runtime import RuntimeHandle
+    except ImportError as exc:
+        pytest.skip(f"telys SDK unavailable: {exc}")
+
+    class _UnimplementedRuntime(RuntimeHandle):
+        pass
+
+    mem = CodeMemory.__new__(CodeMemory)
+    mem._eng = SimpleNamespace(_runtime=_UnimplementedRuntime())
+
+    supported, detail = _compact_export_capability(mem)
+    assert supported is False, detail
+    assert "unimplemented export_compact" in detail
+
+    # The product surface refuses for the SAME reason, before doing any rebuild work. Reachable with no
+    # flag at all — the legacy case the review flagged: `not getattr(...)` and the base-stub check must
+    # both treat an absent attribute as unsupported, not silently pass it.
+    mem._col = SimpleNamespace(export_compact=lambda *a: None, dtype="int8")
+    with pytest.raises(CodeMemoryError, match="cannot export compact serve artifacts"):
+        mem.export_serve_artifact("/tmp/never-written")
+    assert not os.path.exists("/tmp/never-written")
+
+    # A pre-flag runtime that DOES implement the method is still assumed capable (no regression for the
+    # runtimes the flag exists for). `SimpleNamespace` has no `export_compact`, so give it one.
+    mem._eng = SimpleNamespace(_runtime=SimpleNamespace(export_compact=lambda *a, **k: "/tmp"))
+    supported, detail = _compact_export_capability(mem)
+    assert supported is True and "no supports_compact_export flag" in detail

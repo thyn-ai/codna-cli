@@ -262,6 +262,26 @@ def test_sidecar_spawn_does_not_inherit_local_database_urls(tmp_path, monkeypatc
     assert "ASYNC_DATABASE_URL" not in env
 
 
+def _force_dev_sidecar_path(monkeypatch) -> None:
+    """Exercise the DEV/source-checkout spawn branch, which is the one that needs a JS runtime.
+
+    `_sidecar_spawn` prefers a self-contained compiled sidecar when `config.sidecar_binary` exists, and returns
+    before ever looking at node/bun. On a machine where a Codna wheel (or a packaged build) has staged that binary,
+    these two tests would therefore never reach the branch they are about: they asserted a refusal that the
+    short-circuit had already made unreachable, so they failed on an environment difference rather than on a defect.
+
+    Neutralising the binary is the honest way to test the fallback, because that is exactly the condition under
+    which the fallback runs: a source checkout with no compiled sidecar.
+    """
+    real = resolve_runtime_config()
+
+    def _dev_config():
+        config = real
+        return type(config)(**{**config.__dict__, "sidecar_binary": None})
+
+    monkeypatch.setattr(local_stack_module, "resolve_runtime_config", _dev_config)
+
+
 def test_sidecar_spawn_requires_bun_for_real_runtime(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
     monkeypatch.setattr(
@@ -269,7 +289,8 @@ def test_sidecar_spawn_requires_bun_for_real_runtime(tmp_path, monkeypatch) -> N
         "which",
         lambda name: "/usr/bin/node" if name == "node" else None,
     )
-    config = resolve_runtime_config()
+    _force_dev_sidecar_path(monkeypatch)
+    config = local_stack_module.resolve_runtime_config()
 
     with pytest.raises(LocalRuntimeError) as excinfo:
         local_stack_module._sidecar_spawn(config, "runtime-1")
@@ -288,7 +309,8 @@ def test_sidecar_spawn_allows_node_only_for_contract_stub_runtime(tmp_path, monk
         "which",
         lambda name: "/usr/bin/node" if name == "node" else None,
     )
-    config = resolve_runtime_config()
+    _force_dev_sidecar_path(monkeypatch)
+    config = local_stack_module.resolve_runtime_config()
 
     command, _cwd, env = local_stack_module._sidecar_spawn(config, "runtime-1")
 
