@@ -8,21 +8,13 @@ import os
 
 import pytest
 
-
-def _telys_ready():
-    try:
-        from codna.memory import _configure_telys_kernel_env
-
-        _configure_telys_kernel_env()
-        from telys import scope_key  # noqa: F401
-        from telys.embedding import AlgentaBigramEmbedder
-        AlgentaBigramEmbedder()       # loads the kernel dylib; raises if absent
-        return True
-    except Exception:
-        return False
+from telys_gate import telys_kernel_ready
 
 
-if not _telys_ready():
+# The probe RESOLVES the kernel to decide whether to skip, and resolving writes `TELYS_KERNEL`. At module scope
+# that would outlive this file: pytest imports every test module during collection, so the override would apply to
+# the whole session (and `memengine.mojo_backend` reads it once, at import). `telys_kernel_ready` restores it.
+if not telys_kernel_ready():
     pytest.skip("Telys not installed or Codna could not resolve a local kernel", allow_module_level=True)
 
 from telys import scope_key  # noqa: E402

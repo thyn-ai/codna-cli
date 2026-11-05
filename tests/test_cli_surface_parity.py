@@ -245,3 +245,108 @@ def test_resolve_issue_tests_lets_an_environment_gap_keep_its_code(monkeypatch):
     monkeypatch.setattr("codna.testrun.discover_failing_tests", _boom)
     with pytest.raises(TestEnvironmentUnavailable):
         resolve_issue(_Args(tests=True))
+
+
+# ---- the durable surface's two entrances ------------------------------------------------------
+
+def test_the_top_level_parser_exposes_run_and_worker():
+    """The plan names `codna run` / `codna worker` as first-class commands, not only `durable` verbs.
+
+    Asserted on the parser rather than on prose: a command that exists in the docs and not in
+    `build_parser` is a command a user cannot type.
+    """
+    parser = cli.build_parser()
+    subcommands = next(a for a in parser._actions if getattr(a, "choices", None))
+    assert {"run", "worker", "durable"} <= set(subcommands.choices)
+
+
+def test_both_run_spellings_accept_the_same_flags():
+    """One flag definition, two entrances: a flag on one and not the other is a documented lie."""
+    top = _parse(["run", "--brief", "b", "--pin", "--no-worker"])
+    grouped = _parse(["durable", "run", "--brief", "b", "--pin", "--no-worker"])
+    for attribute in ("brief", "pin", "no_worker", "engine", "run_id", "max_cost", "poll_interval"):
+        assert getattr(top, attribute) == getattr(grouped, attribute), attribute
+
+
+def test_the_two_run_spellings_differ_only_in_whether_they_run_a_worker():
+    """`codna run` executes what it starts; `durable run` is the lower-level start-only surface."""
+    assert _parse(["run", "--brief", "b"]).run_worker_by_default is True
+    assert _parse(["durable", "run", "--brief", "b"]).run_worker_by_default is False
+    # ...and --worker/--no-worker override it on either surface.
+    assert _parse(["run", "--brief", "b", "--no-worker"]).no_worker is True
+    assert _parse(["durable", "run", "--brief", "b", "--worker"]).worker is True
+
+
+def test_worker_flags_exist_on_both_spellings():
+    top = _parse(["worker"])
+    grouped = _parse(["durable", "worker"])
+    for attribute in ("max_concurrent_activities", "grace_period", "no_promote", "engine"):
+        assert getattr(top, attribute) == getattr(grouped, attribute), attribute
+
+
+def test_durable_commands_do_not_consume_codna_yaml():
+    """`codna.yaml` is model/privacy config; a durable command must not fail because it is absent."""
+    for argv in (["durable", "status", "--run", "r"], ["worker"], ["durable", "events", "--run", "r"]):
+        assert getattr(_parse(argv), "uses_config", False) is False, argv
+
+
+# ---- the Run API's two entrances --------------------------------------------------------------
+
+def test_the_top_level_parser_exposes_serve():
+    """`codna serve` is a product surface, not only a `durable` verb: the IDE connects to it.
+
+    Asserted on the parser rather than on prose, like `run`/`worker` above: a command that exists in
+    the documentation and not in `build_parser` is a command a user cannot type.
+    """
+    parser = cli.build_parser()
+    subcommands = next(a for a in parser._actions if getattr(a, "choices", None))
+    assert {"run", "worker", "serve", "durable"} <= set(subcommands.choices)
+
+
+def test_both_serve_spellings_accept_the_same_flags():
+    """One flag definition, two entrances — a flag on one spelling alone is a documented lie."""
+    top = _parse(["serve", "--port", "0", "--max-streams", "3", "--no-temporal"])
+    grouped = _parse(["durable", "serve", "--port", "0", "--max-streams", "3", "--no-temporal"])
+    for attribute in ("host", "port", "heartbeat_interval", "max_streams", "no_temporal"):
+        assert getattr(top, attribute) == getattr(grouped, attribute), attribute
+
+
+def test_serve_defaults_to_loopback_and_a_fixed_port():
+    """A stable address so the IDE can be configured once; loopback because it holds a token."""
+    args = _parse(["serve"])
+    assert args.host == "127.0.0.1"
+    assert args.port == 8790
+    assert args.no_temporal is False
+    assert args.max_streams > 0 and args.heartbeat_interval > 0
+
+
+def test_serve_resolves_the_durable_config():
+    """The Run API reads the same config `run` does (address, namespace, queue, runs root)."""
+    assert getattr(_parse(["serve"]), "uses_config", False) is True
+
+
+def test_serve_dispatches_through_the_durable_group():
+    """The grouped spelling routes through `cmd_durable`, like every other `durable` verb."""
+    from codna.durable.cli import cmd_durable
+
+    args = _parse(["durable", "serve"])
+    assert args.func is cmd_durable
+    assert args.durable_action == "serve"
+
+
+def test_there_is_no_flag_that_turns_off_the_loopback_rule():
+    """The refusal is not configurable: a flag to disable it is a flag somebody would disable."""
+    parser = cli.build_parser()
+    options = {
+        option
+        for action in parser._actions
+        for option in getattr(action, "option_strings", ())
+    }
+    assert not any("allow-remote" in option or "allow-public" in option for option in options)
+    serve = next(
+        action for action in parser._actions if getattr(action, "choices", None)
+    ).choices["serve"]
+    serve_options = {
+        option for action in serve._actions for option in getattr(action, "option_strings", ())
+    }
+    assert not any("allow" in option for option in serve_options), serve_options
