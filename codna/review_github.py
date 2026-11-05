@@ -326,6 +326,79 @@ def fetch_pr(repo_slug: str, pr_number: int, token: str | None) -> dict:
     }
 
 
+def find_open_pr_for_branch(repo_slug: str, branch: str, token: str) -> dict | None:
+    """The OPEN pull request whose head is ``branch``, or None.
+
+    The idempotency key for a durable run's ``open_pr``: the head branch is
+    ``codna/run-<run>/task-<n>``, which is unique per task, so "already opened" is exactly "a PR
+    exists whose head is this branch". ``head`` must be qualified with the repository's OWNER —
+    GitHub requires ``owner:branch`` to filter by head, and an unqualified value silently matches
+    nothing, which would open a duplicate PR on every retry.
+    """
+    import httpx
+
+    owner = repo_slug.split("/", 1)[0]
+    response = httpx.get(
+        f"{_API}/repos/{repo_slug}/pulls",
+        headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"},
+        params={"head": f"{owner}:{branch}", "state": "open", "per_page": 10},
+        timeout=30.0,
+        follow_redirects=True,
+    )
+    if response.status_code >= 300:
+        raise RuntimeError(
+            f"listing pull requests for {branch} failed: {response.status_code} {response.text[:200]}"
+        )
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(f"listing pull requests for {branch} returned {type(payload).__name__}")
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        head = item.get("head") or {}
+        if head.get("ref") == branch and isinstance(item.get("number"), int):
+            return {"number": item["number"], "url": item.get("html_url"), "branch": branch}
+    return None
+
+
+def create_pull_request(
+    repo_slug: str,
+    *,
+    token: str,
+    title: str,
+    head: str,
+    base: str,
+    body: str = "",
+    draft: bool = False,
+) -> dict:
+    """Open a pull request. Returns ``{"number", "url", "branch"}``, validating GitHub's answer.
+
+    A ``422`` is the expected race, not an exotic failure: a retried activity can arrive after the
+    first attempt's POST already succeeded, and GitHub answers "A pull request already exists".
+    The caller resolves it by looking the PR up again, so the message names the situation instead
+    of leaving a generic status code to be guessed at.
+    """
+    import httpx
+
+    response = httpx.post(
+        f"{_API}/repos/{repo_slug}/pulls",
+        headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"},
+        json={"title": title, "head": head, "base": base, "body": body, "draft": draft},
+        timeout=60.0,
+        follow_redirects=True,
+    )
+    if response.status_code >= 300:
+        raise RuntimeError(
+            f"opening a pull request for {head} failed: {response.status_code} {response.text[:200]}"
+        )
+    payload = response.json()
+    number = payload.get("number") if isinstance(payload, dict) else None
+    url = payload.get("html_url") if isinstance(payload, dict) else None
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise RuntimeError(f"opening a pull request returned no number: {payload!r}"[:400])
+    return {"number": number, "url": url, "branch": head}
+
+
 def fetch_pr_files(repo_slug: str, pr_number: int, token: str | None) -> set[str] | None:
     """The paths in the pull request's diff as GitHub sees it (``GET /pulls/{n}/files``, every page),
     or None when the answer is not certain: no httpx, a request failed, a page did not parse, or
