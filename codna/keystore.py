@@ -59,9 +59,25 @@ PROVIDER_ALIASES: dict[str, str] = {
     "engine": "CODNA_API_KEY",
 }
 
+#: Temporal payload-codec keys (E3). Stored under their own name so the codec's key can never be
+#: confused with a provider credential, and so `codna key list` shows it alongside the others
+#: WITHOUT printing any value. The current key uses the plain name; a RETIRED key that must keep
+#: old history readable is stored as `<prefix><key_id>` (see `durable/codec.py`).
+CODEC_KEY_NAME = "CODNA_TEMPORAL_CODEC_KEY"
+CODEC_RETIRED_PREFIX = "CODNA_TEMPORAL_CODEC_KEY__"
+
+
+def is_managed_key(name: str) -> bool:
+    """True for a provider key or a payload-codec key (the current one, or a retired one)."""
+    return name in MANAGED_KEYS or name == CODEC_KEY_NAME or name.startswith(CODEC_RETIRED_PREFIX)
+
 
 class KeystoreError(RuntimeError):
     """A keychain operation the user asked for could not be completed (surfaced with remediation)."""
+
+
+class CodecKeyMismatch(KeystoreError):
+    """A retired codec key's entry name claims a different key id than its value. Never auto-fixed."""
 
 
 def disabled() -> bool:
@@ -90,6 +106,8 @@ def normalize_key_name(name: str) -> str:
         raise KeystoreError("a provider name or *_API_KEY variable name is required")
     alias = PROVIDER_ALIASES.get(raw.lower())
     resolved = alias or raw.upper()
+    if resolved == CODEC_KEY_NAME or resolved.startswith(CODEC_RETIRED_PREFIX):
+        return resolved
     if resolved not in MANAGED_KEYS:
         managed = ", ".join(sorted(set(PROVIDER_ALIASES) | set(MANAGED_KEYS)))
         raise KeystoreError(f"unknown provider key '{name}'. Known: {managed}")
@@ -121,7 +139,7 @@ def _local_index_path() -> Path:
 
 
 def _normalize_index_names(names: list[str]) -> list[str]:
-    return sorted({name for name in names if name in MANAGED_KEYS})
+    return sorted({name for name in names if is_managed_key(name)})
 
 
 def _read_local_index() -> list[str] | None:

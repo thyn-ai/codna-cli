@@ -187,6 +187,56 @@ def test_setuptools_includes_runtime_package():
     assert "codna.runtime" in packages
 
 
+def test_the_policy_reader_module_ships_in_the_wheel():
+    """`python -m codna.policy_cli` is the sidecar's documented door into the policy validator.
+
+    A `[project.scripts]` entry cannot stand in for it: the sidecar invokes `python3 -m
+    codna.policy_cli` (see `agent-core/vendor/cline/algenta/server/policy-document.ts`), which
+    resolves through normal package import, so the MODULE has to ship. It is a plain module of the
+    declared `codna` package, which means `setuptools` already includes it — asserted here rather
+    than assumed, because the failure mode is silent until a packaged sidecar cannot enforce a
+    policy at all.
+
+    What this test deliberately does NOT claim: that a *source checkout* can run it with no path
+    help. It cannot — `codna` is not installed from a bare checkout — and that is why the sidecar
+    supplies `PYTHONPATH` (`policyReaderPathEntries`). `test_policy_document.py` covers that side.
+    """
+    # `setuptools` is not installed on the dependency-minimal `cli secure subsystem` lane, and this
+    # assertion needs its `build_py` module list. Skip cleanly there: a missing build tool is a fact
+    # about the runner, not about whether `codna.policy_cli` would ship.
+    pytest.importorskip("setuptools", reason="setuptools is not installed on this lane")
+    from setuptools import Distribution
+    from setuptools.command.build_py import build_py
+
+    declared = _data()["tool"]["setuptools"]["packages"]
+    # `package_dir` must point at `cli/`: without it setuptools resolves the declared package names
+    # against the CWD and dies with `DistutilsFileError: package directory 'codna' does not exist`
+    # whenever the tests are run from anywhere but `cli/` (the repo root, or a worktree).
+    dist = Distribution(
+        {"packages": declared, "script_name": "setup.py", "package_dir": {"": str(ROOT / "cli")}}
+    )
+    command = build_py(dist)
+    command.ensure_finalized()
+    shipped = {(package, module) for package, module, _src in command.find_all_modules()}
+    assert ("codna", "policy_cli") in shipped, (
+        "codna/policy_cli.py would NOT be in the wheel, so `python -m codna.policy_cli` fails for "
+        f"every packaged install. Shipped codna modules: {sorted(shipped)[:12]}"
+    )
+    assert ("codna", "policy_document") in shipped, "the reader it delegates to must ship too"
+
+    # A subpackage missing from `packages` would ship NOTHING of it, silently.
+    cli_root = ROOT / "cli"
+    actual = {
+        str(path.parent.relative_to(cli_root)).replace(os.sep, ".")
+        for path in (cli_root / "codna").rglob("__init__.py")
+    }
+    assert actual <= set(declared), (
+        f"codna subpackages exist that `[tool.setuptools].packages` does not declare, so they would "
+        f"be absent from the wheel: {sorted(actual - set(declared))}"
+    )
+
+
+
 def test_telys_package_data_is_manifest_scoped():
     package_data = _data()["tool"]["setuptools"]["package-data"]["codna"]
     assert package_data == [

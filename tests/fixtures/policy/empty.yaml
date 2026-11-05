@@ -1,0 +1,2 @@
+# An EMPTY file. Not "no policy" — a policy with NO permissions. Must DENY (`policy_denies_all`)
+# rather than fall through to the permissive approval profile.

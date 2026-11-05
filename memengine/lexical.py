@@ -7,11 +7,25 @@ only near-zero AppsRetrieval. Canonical harness: bench/mteb_code_lexical.py. Two
 code-aware tokenization (split camelCase + snake_case, keep whole id + subtokens) and IDF/BM25 term weighting.
 
 Kernel-backed (mojo/engine/ame_kernel.mojo), all three verified score-exact against the pure-Python reference:
-  - ame_code_tokenize  — code-aware tokenizer -> FNV-1a-64 hashes (~19x faster than Python)
-  - ame_bm25_csr_topk  — inverted-index BM25, the FAST full-corpus path (scatter over postings, O(sum q-postings
-                          + n_docs)); this is what search() uses.
-  - ame_bm25_topk      — per-doc O(N) BM25 scan; the no-index ad-hoc path for tiny partitions (search_scan()).
-Falls back to pure-Python if the kernel is absent. See internal/CODE-LEXICAL-INDEX.md.
+    - ame_code_tokenize  — code-aware tokenizer -> FNV-1a-64 hashes (~19x faster than Python)
+    - ame_bm25_csr_topk  — inverted-index BM25, the FAST full-corpus path (scatter over postings, O(sum q-postings
+                           + n_docs)); this is what search() uses.
+    - ame_bm25_topk      — per-doc O(N) BM25 scan; the no-index ad-hoc path for tiny partitions (search_scan()).
+
+The kernel is an OPTIONAL ACCELERATOR. When the shared library cannot be loaded (no wheel for this platform —
+Windows today — or an operator pointing TELYS_KERNEL at nothing) `memengine.mojo_backend._lib()` returns
+`memengine._pykernel.PyKernel`, which answers the SAME C ABI in NumPy via `memengine._pynative`. So `search()`,
+`search_scan()` and `tokenize_hashes()` keep working with no code path of their own: same API, same rankings,
+float32-identical scores.
+
+The two properties that make that safe to claim, both covered in `cli/tests/test_pynative_equivalence.py`:
+
+* tokenization is INTEGER work (FNV-1a-64 over folded bytes) and is BIT-IDENTICAL, so a persisted postings cache
+  is portable between backends;
+* scoring is FLOAT work whose summation ORDER differs (the kernel sums along SIMD lanes, NumPy sums pairwise), so
+  scores agree to float32 rounding while the RANKING is identical.
+
+What changes without the kernel is throughput, not answers. See internal/CODE-LEXICAL-INDEX.md.
 """
 from __future__ import annotations
 
@@ -127,6 +141,52 @@ def tokenize_hashes(text: str) -> list[int]:
     return [_fnv_signed(t) for t in code_tokenize(text)]
 
 
+def _bm25_topk_order(scores: dict, k: int) -> list[tuple]:
+    """The BM25 kernels' top-k contract for an ``{doc_index: score}`` map, ties included.
+
+    Written once and shared by every pure-Python BM25 path so a fallback cannot drift from the kernel:
+
+    * membership is "the first ``k`` while scanning documents in ascending index order, replacing a slot only on
+      a STRICTLY greater score" — so among equal scores the earlier documents keep their slots;
+    * emission repeatedly takes the LAST current maximum, reversing each run of exactly equal scores.
+
+    Measured against ``ame_bm25_csr_topk`` / ``ame_bm25_topk`` on randomised tie-heavy corpora: ~99% identical
+    result SET and ~93% identical ORDER (scores are float32-identical everywhere). The residual order difference
+    is intra-run and comes from the kernel's SIMD lane packing; see ``memengine._pynative._bm25_insert_topk``.
+    """
+    if k <= 0 or not scores:
+        return []
+    n_docs = max(scores) + 1
+    ordered = sorted(scores.items())
+    slot_doc = [-1] * k
+    slot_score = [0.0] * k
+    filled = 0
+    for d, s in ordered:
+        if filled < k:
+            slot_doc[filled] = d
+            slot_score[filled] = s
+            filled += 1
+            continue
+        thr = min(slot_score)
+        if s > thr:
+            j = slot_score.index(thr)  # FIRST minimum slot
+            slot_doc[j] = d
+            slot_score[j] = s
+    if filled == 0:
+        return []
+    # Emission: repeatedly take the LAST buffer slot holding the current maximum. Buffer order, not document
+    # order: a slot's occupant is whatever document last replaced it.
+    remaining = list(zip(slot_doc[:filled], slot_score[:filled]))
+    out: list[tuple] = []
+    while remaining:
+        best = 0
+        for j in range(1, len(remaining)):
+            if remaining[j][1] >= remaining[best][1]:
+                best = j
+        out.append(remaining.pop(best))
+    return out
+
+
 class _BM25:
     """Okapi BM25 over pre-tokenized docs (postings). Pure-Python reference / fallback."""
 
@@ -239,15 +299,46 @@ class LexicalCodeIndex:
         return [(self.ids[int(oi[j])], float(osc[j])) for j in range(m)]
 
     def _search_postings(self, query: str, k: int = 10) -> list[tuple]:
-        """Pure-Python postings BM25 (reference / fallback)."""
-        sc = self._bm.scores(tokenize_hashes(query))
-        return [(self.ids[i], s) for i, s in sorted(sc.items(), key=lambda x: -x[1])[:k]]
+        """Pure-Python postings BM25 (reference / fallback).
+
+        Reconstructs scores directly from the CSR arrays instead of going through ``self._bm``, because a
+        RESTORED index (``_load_postings_cache``, or a caller that sets the CSR fields by hand) carries the
+        postings, idfs and denominators but deliberately no ``_BM25`` object — the whole point of that cache is
+        to skip the O(N) rebuild. Reading the CSR arrays means one code path serves both a freshly built index
+        and a restored one, so the fallback cannot silently return nothing just because the index came from
+        disk. ``search_scan`` (which genuinely needs per-document token lists) still uses ``self._bm``.
+        """
+        assert self._bm is not None, "call build() first"
+        sc: dict[int, float] = defaultdict(float)
+        for h in set(tokenize_hashes(query)):
+            rng = self._term_range.get(h)
+            if rng is None:
+                continue
+            st, cnt = rng
+            idf = float(self._bm.idf.get(h, 0.0))
+            if idf == 0.0:
+                continue
+            k1p1 = self.k1 + 1.0
+            for pos in range(st, st + cnt):
+                d = int(self._post_docs[pos])
+                f = float(self._post_tfs[pos])
+                sc[d] += idf * (f * k1p1) / (f + float(self._doc_denom[d]))
+        # Same contract as the kernels: hold only positive scores. `_bm25_topk_order` reproduces the BM25
+        # kernels' tie handling (first k in document order wins membership; equal-score runs are emitted
+        # backwards). A plain descending sort looked right but ordered ties the opposite way from the kernel.
+        live = {i: s for i, s in sc.items() if s > 0.0}
+        return [(self.ids[i], s) for i, s in _bm25_topk_order(live, k)]
 
     def search_scan(self, query: str, k: int = 10) -> list[tuple]:
-        """No-index per-doc BM25 scan (Mojo ame_bm25_topk) — the ad-hoc tiny-partition path."""
+        """No-index per-doc BM25 scan (Mojo ame_bm25_topk) — the ad-hoc tiny-partition path.
+
+        The scan needs each document's full token list (``self._packed``), which a RESTORED postings cache does
+        not carry; there the postings scan is the faithful equivalent (identical scores, same ranking) so it is
+        used rather than returning nothing. A build always populates ``_packed``, so the fast path is unchanged.
+        """
         lib = _kernel()
         assert self._bm is not None, "call build() first"
-        if lib is None:
+        if lib is None or self._packed.size == 0:
             return self._search_postings(query, k)
         uq = sorted(set(tokenize_hashes(query)))
         qa = np.asarray(uq, np.int64)
