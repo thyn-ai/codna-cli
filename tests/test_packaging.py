@@ -157,6 +157,40 @@ def test_setup_bundles_agent_core_runtime_for_wheels_and_sdists():
     assert "run-server.bundle.mjs" in wheel_smoke
 
 
+def test_sidecar_build_collapses_duplicate_sdk_copies_and_minifies():
+    """The two build settings that bring the VS Code artifact under the marketplace default.
+
+    Measured on darwin-arm64 before the change: the archive was 27,260,153 bytes against a 26,214,400-byte
+    default. Two independent fixes were required and neither alone is sufficient:
+
+      * the vendored SDK graph shipped `@cline/llms` and `@cline/shared` TWICE — `algenta/*` resolves the bare
+        specifier to `dist/index.js` while `@cline/core`'s roll-up had already inlined `src/` — ~1.5 MB of
+        duplicated JavaScript with two sets of module-level caches;
+      * the compile step did not pass `--minify`.
+
+    This pins the WIRING, because `prepare_agent_core_bundle` is what the wheel, the desktop app and the VSIX
+    all build through: reverting either line silently restores the over-limit artifact, and no unit test of
+    the builder itself would notice.
+    """
+    builder = (ROOT / "scripts" / "build_cli_release_dist.py").read_text(encoding="utf-8")
+    # The bundle goes through the single-copy wrapper, not a bare `bun build … --outfile`.
+    assert "build_agent_core_bundle.ts" in builder
+    assert '"--cline-root"' in builder
+    assert '"--entry"' in builder
+    # …and the standalone is compiled minified.
+    assert '"--compile", "--minify"' in builder
+    # The wrapper and its plugin exist and are wired to each other.
+    wrapper = ROOT / "scripts" / "build_agent_core_bundle.ts"
+    plugin = ROOT / "scripts" / "single_sdk_copy.ts"
+    assert wrapper.is_file(), f"missing {wrapper}"
+    assert plugin.is_file(), f"missing {plugin}"
+    assert "singleSdkCopyPlugin" in wrapper.read_text(encoding="utf-8")
+    plugin_source = plugin.read_text(encoding="utf-8")
+    # The collapse list is the measured pair, and a bare specifier is what gets rewritten.
+    assert '"llms"' in plugin_source and '"shared"' in plugin_source
+    assert "packages" in plugin_source and '"src"' in plugin_source
+
+
 def test_cline_postbuild_is_concurrency_safe():
     script = ROOT / "agent-core" / "vendor" / "cline" / "algenta" / "postbuild.sh"
     processes = [
