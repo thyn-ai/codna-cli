@@ -671,3 +671,145 @@ def test_release_dist_builder_rejects_runtime_artifacts_in_sdist(tmp_path: Path,
         tool.assert_sdist_excludes_runtime(sdist)
 
     assert member_name in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------------------------------
+# THE SIDECAR BUILD STAMP
+#
+# `/health` answers "which build is running" from `CODNA_CLI_VERSION` / `CODNA_SIDECAR_BUILD_ID`, which the
+# host feeds from a stamp written beside the binary. `bun build --compile` ignores `--define` for
+# `process.env` (measured), so the value cannot be baked in — the stamp is the only carrier.
+#
+# Measured defect, 2026-11-06: `codna-sidecar` rebuilt at 14:24 beside a stamp from two days earlier that said
+# `0.2.96` with a `sha256` naming different bytes, while `cli/pyproject.toml` said `0.2.107`. Nothing in this
+# pipeline wrote the stamp, and both files are gitignored, so no review, test or CI leg could notice.
+#
+# These tests pin the two halves of the fix:
+#   1. `write_sidecar_stamp` makes the stamp a POSTCONDITION of compiling the binary;
+#   2. `assert_sidecar_stamp` refuses a stamp that does not describe the binary or the current version.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_cli_version_is_read_from_the_pyproject_not_guessed():
+    tool = _load_release_builder()
+    expected = _data()["project"]["version"]
+    assert tool.cli_version(ROOT / "cli") == expected
+
+
+def test_cli_version_fails_closed_when_the_pyproject_has_none(tmp_path: Path):
+    tool = _load_release_builder()
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "codna"\n', encoding="utf-8")
+    with pytest.raises(tool.ReleaseDistError) as excinfo:
+        tool.cli_version(tmp_path)
+    assert "no [project] version" in str(excinfo.value)
+
+
+def test_build_id_falls_back_to_the_commit_and_never_to_a_placeholder(monkeypatch):
+    tool = _load_release_builder()
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    assert tool.sidecar_build_id() == subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    monkeypatch.setenv("CODNA_SIDECAR_BUILD_ID", "explicit-id")
+    assert tool.sidecar_build_id() == "explicit-id"
+
+
+def test_write_sidecar_stamp_binds_the_digest_of_the_bytes_on_disk(tmp_path: Path):
+    """The stamp is written FROM the binary, so it cannot describe a different build by construction."""
+    tool = _load_release_builder()
+    binary = tmp_path / "codna-sidecar"
+    binary.write_bytes(b"a-compiled-escapement")
+    stamp = tool.write_sidecar_stamp(binary, version="0.2.107", build_id="704e2538", target="darwin-arm64")
+    assert stamp == {
+        "version": "0.2.107",
+        "build_id": "704e2538",
+        "target": "darwin-arm64",
+        "sha256": hashlib.sha256(b"a-compiled-escapement").hexdigest(),
+    }
+    # …and it is written BESIDE the binary, at the path the consumers read.
+    assert tool.sidecar_stamp_path(binary) == tmp_path / "codna-sidecar.build.json"
+    assert json.loads(tool.sidecar_stamp_path(binary).read_text(encoding="utf-8")) == stamp
+
+
+def test_assert_sidecar_stamp_accepts_a_matching_stamp(tmp_path: Path):
+    tool = _load_release_builder()
+    binary = tmp_path / "codna-sidecar"
+    binary.write_bytes(b"the real bytes")
+    tool.write_sidecar_stamp(binary, version="0.2.107", build_id="704e2538", target="darwin-arm64")
+    assert tool.assert_sidecar_stamp(binary, expected_version="0.2.107")["version"] == "0.2.107"
+
+
+def test_assert_sidecar_stamp_refuses_a_stale_binary(tmp_path: Path):
+    """The exact defect: a NEW binary beside an OLD stamp. The digest is what catches it."""
+    tool = _load_release_builder()
+    binary = tmp_path / "codna-sidecar"
+    binary.write_bytes(b"first build")
+    tool.write_sidecar_stamp(binary, version="0.2.107", build_id="704e2538", target="darwin-arm64")
+    binary.write_bytes(b"REBUILT build")  # new bytes, old stamp
+
+    with pytest.raises(tool.ReleaseDistError) as excinfo:
+        tool.assert_sidecar_stamp(binary, expected_version="0.2.107")
+    message = str(excinfo.value)
+    assert "does not describe" in message
+    assert "stamp is stale" in message
+
+
+def test_assert_sidecar_stamp_refuses_a_stale_version(tmp_path: Path):
+    tool = _load_release_builder()
+    binary = tmp_path / "codna-sidecar"
+    binary.write_bytes(b"bytes")
+    tool.write_sidecar_stamp(binary, version="0.2.96", build_id="00cc69f3", target="darwin-arm64")
+
+    with pytest.raises(tool.ReleaseDistError) as excinfo:
+        tool.assert_sidecar_stamp(binary, expected_version="0.2.107")
+    message = str(excinfo.value)
+    assert "version 0.2.96 != expected 0.2.107" in message
+    assert "stamp is stale" in message
+
+
+def test_assert_sidecar_stamp_refuses_a_missing_stamp(tmp_path: Path):
+    """Absent must never degrade into `unknown` — that is the state the comment says must not happen."""
+    tool = _load_release_builder()
+    binary = tmp_path / "codna-sidecar"
+    binary.write_bytes(b"bytes")
+    with pytest.raises(tool.ReleaseDistError) as excinfo:
+        tool.assert_sidecar_stamp(binary, expected_version="0.2.107")
+    message = str(excinfo.value)
+    assert "no sidecar build stamp beside" in message
+    assert "unknown" in message
+
+
+@pytest.mark.parametrize("payload", ["{ not json", "[]", '{"version": "0.2.107"}'])
+def test_assert_sidecar_stamp_refuses_an_unusable_stamp(tmp_path: Path, payload: str):
+    tool = _load_release_builder()
+    binary = tmp_path / "codna-sidecar"
+    binary.write_bytes(b"bytes")
+    (tmp_path / "codna-sidecar.build.json").write_text(payload, encoding="utf-8")
+    with pytest.raises(tool.ReleaseDistError):
+        tool.assert_sidecar_stamp(binary, expected_version="0.2.107")
+
+
+def test_packaging_target_maps_every_platform_and_refuses_an_unknown_one():
+    tool = _load_release_builder()
+    assert tool.packaging_target("macos-arm64") == "darwin-arm64"
+    assert tool.packaging_target("windows-x86_64") == "win32-x64"
+    with pytest.raises(tool.ReleaseDistError) as excinfo:
+        tool.packaging_target("plan9-riscv")
+    assert "no packaging target mapping" in str(excinfo.value)
+
+
+def test_prepare_agent_core_bundle_writes_the_stamp_as_a_postcondition():
+    """The WRITER is wired to the function that compiles the binary — not to a separate packaging path.
+
+    A structural assertion is the right instrument: the defect was a compile that produced a binary and left
+    whatever stamp was on disk, and no unit test of the writer alone would notice the wiring being absent.
+    """
+    builder = RELEASE_BUILDER.read_text(encoding="utf-8")
+    compile_section = builder[builder.index("def prepare_agent_core_bundle(") : builder.index("def verify_staged_runtime(")]
+    assert "write_sidecar_stamp(" in compile_section, "the compile must emit the stamp"
+    assert "cli_version(cli_source)" in compile_section, "the stamp version must come from cli/pyproject.toml"
+    assert "sidecar_build_id()" in compile_section
+    assert compile_section.index("_assert_sidecar_binary_clean(binary)") < compile_section.index("write_sidecar_stamp(")
