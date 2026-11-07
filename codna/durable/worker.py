@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Final, Mapping
 
 from .config import ENV_CLOUD_API_KEY
+from .publish import GITHUB_TOKEN_ENV as _GITHUB_TOKEN_ENV
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .config import DurableConfig
@@ -106,9 +107,11 @@ REGISTRATION_WAIT_S: Final = 15.0
 # stream. Bounded deliberately rather than left at Temporal's default (unbounded).
 DEFAULT_MAX_CONCURRENT_ACTIVITIES: Final = 2
 
-# Environment variables that may carry the GitHub write token, in precedence order. `CODNA_` first so
-# a user's personal token for other tools cannot be picked up by accident when both are set.
-GITHUB_TOKEN_ENV: Final[tuple[str, ...]] = ("CODNA_GITHUB_TOKEN", "GITHUB_TOKEN")
+# Environment variables that may carry the GitHub write token, in precedence order. Re-exported
+# from `publish` (a LEAF module) because that is where the publish step's refusal reads them: one
+# definition, so a token that resolves for the step cannot be invisible to this provider or vice
+# versa.
+GITHUB_TOKEN_ENV: Final[tuple[str, ...]] = _GITHUB_TOKEN_ENV
 
 # The sidecar's internal bearer (see `agent-core/.../server/http.ts`): absent means "local dev is
 # open", present means every request must carry it. Read, never invented.

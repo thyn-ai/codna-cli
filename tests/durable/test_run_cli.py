@@ -722,6 +722,220 @@ def test_the_wait_loop_refuses_a_non_positive_poll_interval() -> None:
     assert caught.value.code == "durable_poll_interval_invalid"
 
 
+# -- a run that closes after finishing is a SUCCESS, not a query error ---------------------
+#
+# Measured on the acceptance run for the publish-skip change: `codna run --wait` finished its polls,
+# the workflow then closed, and the NEXT poll raised `durable_query_failed` ("Query rejected, status:
+# 2") — so the command reported a finished, committed run as an error. A query only answers while the
+# workflow is open, so a run that completes inside one poll interval NEVER produces a terminal status;
+# the exit code therefore comes from the workflow's own RESULT, read when the query is rejected.
+#
+# The narrowness matters as much as the fix: an unreadable result, or an execution that never
+# completed, still fails with the ORIGINAL named query error.
+
+
+class _ClosingClient:
+    """A client whose query is rejected once the script runs out, but whose RESULT is readable.
+
+    ``RPCError(NOT_FOUND)`` is what the SDK raises for a closed execution; `query_workflow` wraps it
+    as the CLI's own ``durable_query_failed``, which is what the loop must act on.
+    """
+
+    def __init__(self, script: list[dict[str, Any]], *, outcome: Any = "completed") -> None:
+        self._script = list(script)
+        self.polls = 0
+        self._outcome = outcome
+        self.result_calls = 0
+
+    def get_workflow_handle(self, workflow_id: str) -> Any:
+        return _ClosingHandle(self, workflow_id)
+
+
+class _ClosingHandle:
+    def __init__(self, client: _ClosingClient, workflow_id: str) -> None:
+        self._client = client
+        self.workflow_id = workflow_id
+
+    async def query(self, _query: Any, **_kwargs: Any) -> dict[str, Any]:
+        from temporalio.service import RPCError, RPCStatusCode
+
+        index = self._client.polls
+        self._client.polls += 1
+        if index >= len(self._client._script):
+            raise RPCError("workflow execution already completed", RPCStatusCode.NOT_FOUND)
+        return dict(self._client._script[index])
+
+    async def result(self) -> Any:
+        from types import SimpleNamespace
+
+        from temporalio.service import RPCError, RPCStatusCode
+
+        self._client.result_calls += 1
+        if self._client._outcome is _UNREADABLE:
+            raise RPCError("workflow execution already completed", RPCStatusCode.NOT_FOUND)
+        return SimpleNamespace(outcome=self._client._outcome)
+
+
+_UNREADABLE = object()
+
+
+@pytest.mark.skipif(not HAS_EXTRA, reason="the `durable` extra is not installed")
+def test_a_run_that_closed_after_finishing_exits_zero_and_reports_its_result(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The acceptance-run failure, pinned: finished work must not read as a failed command."""
+    client = _ClosingClient([{"run_id": "r", "tasks_total": 1, "tasks_done": 0}])
+
+    async def scenario() -> int:
+        return await durable_cli._wait_run(client, _FakeConfig(), "r", poll_s=0.001, timeout_s=5.0)
+
+    assert asyncio.run(scenario()) == 0
+    assert client.result_calls == 1
+    printed = _json_objects(capsys.readouterr().out)
+    # The close is reported with the FACT that decided the exit code: the workflow's own outcome.
+    assert [entry.get("status", {}).get("tasks_done") for entry in printed if "status" in entry] == [0]
+    closed = [entry["closed"] for entry in printed if "closed" in entry]
+    assert closed and closed[0]["outcome"] == "completed"
+    assert closed[0]["workflow_id"] == "run:r"
+
+
+@pytest.mark.skipif(not HAS_EXTRA, reason="the `durable` extra is not installed")
+def test_a_run_whose_result_reports_a_non_completed_outcome_still_exits_non_zero() -> None:
+    """A closed run that did NOT complete is still a failure, read from the result — not inferred."""
+    client = _ClosingClient([{"run_id": "r", "tasks_total": 2, "tasks_done": 1}], outcome="stopped")
+
+    async def scenario() -> int:
+        return await durable_cli._wait_run(client, _FakeConfig(), "r", poll_s=0.001, timeout_s=5.0)
+
+    assert asyncio.run(scenario()) == 2
+
+
+@pytest.mark.skipif(not HAS_EXTRA, reason="the `durable` extra is not installed")
+def test_a_closed_run_whose_result_cannot_be_read_still_fails_by_name() -> None:
+    """Unreadable is not success: the ORIGINAL query failure is what the caller sees."""
+    client = _ClosingClient([{"run_id": "r", "tasks_total": 1, "tasks_done": 1}], outcome=_UNREADABLE)
+
+    async def scenario() -> int:
+        return await durable_cli._wait_run(client, _FakeConfig(), "r", poll_s=0.001, timeout_s=5.0)
+
+    with pytest.raises(DurableCliError) as caught:
+        asyncio.run(scenario())
+    assert caught.value.code == "durable_query_failed"
+
+
+@pytest.mark.skipif(not HAS_EXTRA, reason="the `durable` extra is not installed")
+def test_an_unrecognized_result_outcome_is_refused_rather_than_treated_as_success() -> None:
+    """A result this build does not understand must not be mapped to "fine"."""
+    client = _ClosingClient([{"run_id": "r", "tasks_total": 1, "tasks_done": 1}], outcome="something_new")
+
+    async def scenario() -> str:
+        return await durable_cli.workflow_outcome(await client.get_workflow_handle("run:r").result(),
+                                                  workflow_id="run:r")
+
+    with pytest.raises(DurableCliError) as caught:
+        asyncio.run(scenario())
+    assert caught.value.code == "durable_run_outcome_unknown"
+
+
+@pytest.mark.skipif(not HAS_EXTRA, reason="the `durable` extra is not installed")
+def test_a_FAILED_workflow_reports_the_error_that_ended_it_not_a_query_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The refusal case: a user must read "needed a token", never "query rejected".
+
+    MEASURED on the live refusal run: the workflow failed with `activity_pr_token_missing`, and the
+    CLI said `could not query workflow ... status: 3`, which sends a user looking for a server problem
+    instead of at their configuration. The cause is dug out of the SDK's wrapping and printed.
+    """
+    from temporalio.client import WorkflowFailureError
+    from temporalio.exceptions import ActivityError, ApplicationError
+
+    body = ApplicationError(
+        "opening a pull request needs a GitHub write token",
+        {"code": "activity_pr_token_missing", "details": {"variable_names": ["CODNA_GITHUB_TOKEN"]}},
+        # The wire's own shape, MEASURED on the live refusal run: the deepest error is an
+        # `ApplicationError` whose `type` names the ORIGINAL error (`ActivityError`).
+        type="ActivityError",
+    )
+    activity = ActivityError(
+        "activity failed",
+        scheduled_event_id=1,
+        started_event_id=2,
+        identity="worker",
+        activity_type="codna.step.open_pr",
+        activity_id="1",
+        retry_state=None,
+    )
+    activity.__cause__ = body
+    failure = WorkflowFailureError(cause=activity)
+
+    client = _FailingClient(failure)
+
+    async def scenario() -> int:
+        return await durable_cli._wait_run(client, _FakeConfig(), "r", poll_s=0.001, timeout_s=5.0)
+
+    assert asyncio.run(scenario()) == 2
+    printed = _json_objects(capsys.readouterr().out)
+    reported = [entry["failed"] for entry in printed if "failed" in entry]
+    assert reported, printed
+    # The ACTIVITY's own sentence reaches the user — the actionable part — and its type names where
+    # it came from. No code is claimed, because the wire does not carry one (it is in the message).
+    assert "needs a GitHub write token" in reported[0]["message"]
+    assert reported[0]["type"] == "ActivityError"
+
+
+@pytest.mark.skipif(not HAS_EXTRA, reason="the `durable` extra is not installed")
+def test_a_workflow_that_is_GONE_rather_than_failed_still_raises_the_query_error() -> None:
+    """A vanished execution is not a failure with a cause: nothing is invented for it."""
+    from temporalio.service import RPCError
+
+    client = _FailingClient(RPCError("gone", None, "not found"))
+
+    async def scenario() -> int:
+        return await durable_cli._wait_run(client, _FakeConfig(), "r", poll_s=0.001, timeout_s=5.0)
+
+    with pytest.raises(DurableCliError) as caught:
+        asyncio.run(scenario())
+    assert caught.value.code == "durable_query_failed"
+
+
+class _FailingClient:
+    """A client whose query is rejected because the workflow CLOSED and whose result RAISES."""
+
+    def __init__(self, failure: BaseException) -> None:
+        self._failure = failure
+        self.result_calls = 0
+
+    def get_workflow_handle(self, workflow_id: str) -> Any:
+        return _FailingHandle(self, workflow_id)
+
+
+class _FailingHandle:
+    def __init__(self, client: _FailingClient, workflow_id: str) -> None:
+        self._client = client
+        self.workflow_id = workflow_id
+
+    async def query(self, _query: Any, **_kwargs: Any) -> dict[str, Any]:
+        from temporalio.service import RPCError, RPCStatusCode
+
+        raise RPCError("workflow execution already completed", RPCStatusCode.NOT_FOUND)
+
+    async def result(self) -> Any:
+        self._client.result_calls += 1
+        raise self._client._failure
+
+
+@pytest.mark.skipif(not HAS_EXTRA, reason="the `durable` extra is not installed")
+def test_a_recorded_outcome_still_decides_before_the_close_is_considered() -> None:
+    """Unchanged: a run that reports a non-`completed` outcome exits non-zero on the outcome."""
+    client = _ScriptedClient([{"run_id": "r", "tasks_total": 1, "tasks_done": 1, "outcome": "budget_exhausted"}])
+
+    async def scenario() -> int:
+        return await durable_cli._wait_run(client, _FakeConfig(), "r", poll_s=0.001, timeout_s=5.0)
+
+    assert asyncio.run(scenario()) == 2
+
+
 class _FakeConfig:
     """The four config attributes `_wait_run` reads, so the loop is tested without a real config."""
 
@@ -1037,6 +1251,12 @@ def _git_repo(path: Path) -> Path:
         ["git", "init", "-q", "-b", "main"],
         ["git", "config", "user.email", "test@codna.ai"],
         ["git", "config", "user.name", "test"],
+        # A REAL origin, because the durable run's last step publishes: a repository with a GitHub
+        # remote takes the normal `open_pr` path (through the harness's scripted push), while one
+        # without a remote would legitimately finish `approved_unpublished`. These tests are about the
+        # Commands reaching a parked task, so the fixture gives them the publishable shape rather than
+        # making every approval assert a different outcome.
+        ["git", "remote", "add", "origin", "https://github.com/thyn-ai/codna.git"],
         ["git", "add", "-A"],
         ["git", "commit", "-q", "-m", "init"],
     ):

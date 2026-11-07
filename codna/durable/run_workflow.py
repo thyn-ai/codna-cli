@@ -227,11 +227,34 @@ class RunWorkflow:
         # task id (never by position) so `RunProgress`/`remaining_tasks` agree across a continue-as-new.
         order = {task.task_id: position for position, task in enumerate(remaining)}
         self._completed.sort(key=lambda summary: order.get(summary.task_id, len(order)))
+        await self._report_publish_skips(spec)
         await self._notify(
             "run.finished", f"run {spec.run_id}: {len(self._completed)} task(s) done"
         )
         await self._finalize("completed")
         return self.completion("completed")
+
+    async def _report_publish_skips(self, spec: RunSpec) -> None:
+        """Record ONCE, at the end, which tasks finished without publishing — and why.
+
+        The task's own ledger note (`publish.skipped`, written by the publish step) says what
+        happened to it; this summary is what makes the RUN's ledger answer "did this run open
+        anything?" without a reader walking every task's records. A run whose tasks all published
+        writes nothing new, so an existing history replays with the exact record set it had.
+
+        A notification, never a failure: the work is done, and the reason (no GitHub remote) is a
+        fact about the repository rather than a defect in the run.
+        """
+        skipped = tuple(summary for summary in self._completed if summary.unpublished)
+        if not skipped:
+            return
+        names = ", ".join(summary.task_id for summary in skipped)
+        await self._notify(
+            "note",
+            f"run {spec.run_id}: {len(skipped)} task(s) finished without a pull request "
+            f"({names}): the repository has nothing to publish to (no GitHub remote); the commits "
+            "are on each task's branch.",
+        )
 
     async def _run_tasks(
         self, spec: RunSpec, spec_payload: Mapping[str, Any], remaining: tuple[TaskSpec, ...]
@@ -315,6 +338,7 @@ class RunWorkflow:
             # The list is exhausted: the condition decides whether the run did what it was asked.
             # `_after_boundary` has already recorded the verdict and run the CI gate to its bound.
             if self._goal_met():
+                await self._report_publish_skips(spec)
                 await self._notify(
                     "run.finished",
                     f"run {spec.run_id}: goal met after {len(self._completed)} task(s) "
@@ -329,6 +353,7 @@ class RunWorkflow:
             await self._finalize("goal_unmet")
             return self.completion("goal_unmet")
 
+        await self._report_publish_skips(spec)
         await self._notify("run.finished", f"run {spec.run_id}: {len(self._completed)} task(s) done")
         # AFTER the "finished" notification, so a reader of the ledger sees the run complete before its
         # checkouts disappear — and so the sweep is the last thing that happens, never something a task
@@ -510,6 +535,7 @@ class RunWorkflow:
     def completion(self, outcome: RunOutcome) -> RunCompletion:
         spec = self._spec
         assert spec is not None
+        unpublished = sum(1 for summary in self._completed if summary.unpublished)
         return RunCompletion(
             run_id=spec.run_id,
             tasks=tuple(self._completed),
@@ -518,6 +544,7 @@ class RunWorkflow:
             outcome=outcome,
             goal_reason=self._goal_reason,
             ci_attempts=self._ci_attempts,
+            unpublished_tasks=unpublished,
         )
 
     # -- goal mode (D5) -------------------------------------------------------------------
@@ -805,6 +832,11 @@ class RunWorkflow:
             "paused": self._paused,
             "stopped": self._stopped,
             "completed": [summary.__dict__ for summary in self._completed],
+            # HOW MANY tasks finished their work WITHOUT publishing it (no GitHub remote to open a
+            # pull request against). Reported beside the summaries rather than only inside them,
+            # because it is the run-level question "did this run open anything?" and a UI that shows
+            # a green run must be able to say why there is no pull request to click.
+            "unpublished_tasks": sum(1 for summary in self._completed if summary.unpublished),
             # Goal mode. Reported even for a task-mode run so a client has ONE shape: `goal` is
             # null, and the two evidence fields are empty rather than absent.
             "goal": spec.goal.to_payload() if spec is not None and spec.goal is not None else None,

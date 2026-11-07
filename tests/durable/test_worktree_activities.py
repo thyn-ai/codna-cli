@@ -24,6 +24,7 @@ import pytest
 pytest.importorskip("temporalio", reason="the `durable` extra (temporalio) is not installed")
 
 from codna.durable.activity_steps import (
+    _review_via_findings,
     checkpoint_turn,
     open_pr,
     plan_task,
@@ -497,3 +498,88 @@ def test_the_cleanup_request_refuses_a_malformed_field(fields: dict[str, Any]):
     with pytest.raises(Exception) as caught:
         WorktreeCleanupRequest(**{**base, **fields}).validate()
     assert getattr(caught.value, "code", "") == "contract_invalid"
+
+
+# -- the review runs on the RUN's provider -------------------------------------------------
+
+
+def test_the_review_step_uses_the_runs_own_provider(monkeypatch, repo: Path, harness: fakes.Harness):
+    """A durable run's review must not silently fall back to the engine's `anthropic` default.
+
+    The review step is the ONE step on the durable path that is not a turn activity: it goes through
+    `codna.review_findings` and the packaged runner, which read the provider only from the process
+    environment. So a run started with `codna run --provider ollama` planned, implemented, verified and
+    checkpointed on Ollama and then died in review with `no API key in env for 'anthropic'` (measured:
+    run-20261107T165622Z). The context carries the coordinates; this pins that they are what reaches
+    the review.
+    """
+    from codna import review_findings
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_diff_review(repo_dir, **kwargs):
+        captured.update(kwargs, repo_dir=repo_dir)
+
+        class _Report:
+            conclusion = "success"
+            findings: tuple[Any, ...] = ()
+
+        return _Report()
+
+    monkeypatch.setattr(review_findings, "run_diff_review", fake_run_diff_review)
+    spec = TaskSpec(
+        run_id=RUN_ID,
+        task_id="task-1",
+        task_number=1,
+        brief="b",
+        repo_dir=str(repo),
+        base_branch="main",
+        verify_commands=("true",),
+        engine="plain",
+        provider="ollama",
+        model="qwen3-coder:latest",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+    context = TaskContext.from_spec(spec)
+    moved = run_cline_turn(context.turn_request("implement it", spec.initial_state()))
+    checkpoint = checkpoint_turn(CheckpointRequest(state=moved.state, context=context))
+
+    outcome = _review_via_findings(
+        ReviewRequest(state=checkpoint.state, context=context), checkpoint.sha, tree=str(repo)
+    )
+
+    assert outcome.conclusion == "success"
+    assert captured["provider"] == "ollama"
+    assert captured["model"] == "qwen3-coder:latest"
+    assert captured["base_url"] == "http://127.0.0.1:11434/v1"
+
+
+def test_a_run_with_no_provider_leaves_the_review_on_its_own_default(
+    monkeypatch, repo: Path, harness: fakes.Harness
+):
+    """Nothing named means nothing forwarded: a pre-feature run reviews exactly as it always did."""
+    from codna import review_findings
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_diff_review(repo_dir, **kwargs):
+        captured.update(kwargs)
+
+        class _Report:
+            conclusion = "success"
+            findings: tuple[Any, ...] = ()
+
+        return _Report()
+
+    monkeypatch.setattr(review_findings, "run_diff_review", fake_run_diff_review)
+    spec = TaskSpec(
+        run_id=RUN_ID, task_id="task-1", task_number=1, brief="b", repo_dir=str(repo),
+        base_branch="main", verify_commands=("true",), engine="plain",
+    )
+    context = TaskContext.from_spec(spec)
+    moved = run_cline_turn(context.turn_request("implement it", spec.initial_state()))
+    checkpoint = checkpoint_turn(CheckpointRequest(state=moved.state, context=context))
+
+    _review_via_findings(ReviewRequest(state=checkpoint.state, context=context), checkpoint.sha, tree=str(repo))
+
+    assert "provider" not in captured and "model" not in captured and "base_url" not in captured

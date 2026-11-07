@@ -61,16 +61,23 @@ from .run_cli import (
     cmd_run,
     cmd_serve,
     cmd_worker,
-    query_workflow as _query,
     register_into as _register_run_worker,
     register_top_level,
     run_payload_for,
 )
+# `query_workflow` lives with the wait loop it serves (see `run_wait.py`), and is re-exported here
+# under its historical private name because `cli.py`'s own status command queries through it.
+from .run_wait import query_workflow as _query
 # The run command's internals are re-exported under their original private names because they are
 # the CLI's TEST SEAMS: `_wait_run` is exercised directly (its poll/exit-code contract is not
 # reachable without a server), and both spellings of the durable surface must reach the same
 # function. Keeping them here means a test keeps addressing the module it always did.
+#
+# `run_cli` imports THIS module (for the shared error type), so these names are resolved from
+# `run_cli` at import time and must exist there first — they do, because `run_cli` is imported above
+# and defines every one of them. The block is a RE-EXPORT, not a second definition.
 from .run_cli import (  # noqa: F401 - re-exported test seams, see above
+    _exit_for_closed_run,
     _pin_choice,
     _run_is_finished,
     _run_with_worker,
@@ -78,6 +85,9 @@ from .run_cli import (  # noqa: F401 - re-exported test seams, see above
     _swarm_choice,
     _wait_run,
     _worker_choice,
+    workflow_completion,
+    workflow_failure_report,
+    workflow_outcome,
 )
 
 __all__ = [

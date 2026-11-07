@@ -432,3 +432,56 @@ def test_cloud_endpoints_that_cannot_be_a_cloud_server_are_refused(endpoint: str
     with pytest.raises(DurableConfigError) as excinfo:
         split_temporal_endpoint(endpoint)
     assert excinfo.value.code == "invalid_temporal_endpoint"
+
+
+# -- a loopback TEMPORAL_ADDRESS means a LOCAL server, never a Cloud attempt --------------
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["127.0.0.1:7233", "localhost:7233", "[::1]:7233", "http://127.0.0.1:7233"],
+)
+def test_a_loopback_temporal_address_is_the_local_profile(runtime: RuntimeConfig, address: str):
+    """``TEMPORAL_ADDRESS`` is the Temporal SDK's own variable.
+
+    A developer who exports it for ``temporal``/the SDK — pointing at a local dev server — used to be
+    inferred as a *Cloud* attempt, and every durable command then refused with
+    ``temporal_cloud_config_incomplete`` before reading anything. Measured on this host with
+    ``TEMPORAL_ADDRESS=127.0.0.1:7233`` exported in the shell: ``codna durable dev-server status``
+    exited nonzero naming ``TEMPORAL_API_KEY`` and ``TEMPORAL_NAMESPACE``. A loopback address can only
+    be a local server; the Cloud profile cannot connect to one.
+    """
+    config = _load(runtime, env={"TEMPORAL_ADDRESS": address})
+    assert config.profile == "local"
+    assert config.address == DEFAULT_TEMPORAL_ADDRESS
+
+
+def test_a_loopback_address_beside_a_credential_stays_cloud(runtime: RuntimeConfig):
+    """A key means the operator IS configuring Cloud, however the address looks: never downgrade it.
+
+    Reclassifying this to ``local`` would silently ignore a credential the operator deliberately
+    exported. The profile stays ``cloud``; whatever the Cloud profile then says about that address is
+    the Cloud profile's own rule, not this inference's.
+    """
+    env = {"TEMPORAL_ADDRESS": "127.0.0.1:7233", "TEMPORAL_NAMESPACE": "ns", "TEMPORAL_API_KEY": "k"}
+    assert _load(runtime, env=env).profile == "cloud"
+
+
+def test_an_explicit_cloud_profile_is_never_reclassified(runtime: RuntimeConfig):
+    """ ``CODNA_TEMPORAL_PROFILE=cloud`` is a statement; it outranks the loopback inference."""
+    with pytest.raises(DurableConfigError) as excinfo:
+        _load(
+            runtime,
+            env={"CODNA_TEMPORAL_PROFILE": "cloud", "TEMPORAL_ADDRESS": "127.0.0.1:7233"},
+        )
+    assert excinfo.value.code == "temporal_cloud_config_incomplete"
+
+
+def test_a_remote_address_with_no_credential_still_names_what_is_missing(
+    runtime: RuntimeConfig,
+):
+    """The partial-Cloud refusal this inference exists for is unchanged."""
+    with pytest.raises(DurableConfigError) as excinfo:
+        _load(runtime, env={"TEMPORAL_ADDRESS": "codna.cihxb.tmprl.cloud:7233"})
+    assert excinfo.value.code == "temporal_cloud_config_incomplete"
+    assert "TEMPORAL_API_KEY" in excinfo.value.details["missing"]

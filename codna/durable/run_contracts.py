@@ -74,6 +74,17 @@ class TaskSummary:
     verify_passed: bool | None = None
     review_verdict: str | None = None
 
+    @property
+    def unpublished(self) -> bool:
+        """Whether this task finished its work WITHOUT publishing it (nothing to publish to).
+
+        A property of the OUTCOME rather than of the state, because `TaskSummary` is what a run keeps
+        across a continue-as-new boundary: reading the state here would work on the first generation
+        and silently stop working after a restart, which is the one place the distinction must not
+        be lost.
+        """
+        return self.outcome == "approved_unpublished"
+
 
 @dataclass(frozen=True)
 class RunSpec:
@@ -362,6 +373,17 @@ class RunCompletion:
     # the workflow's own result.
     goal_reason: str = ""
     ci_attempts: int = 0
+    # How many of ``tasks`` finished ``approved_unpublished``: the work is done, and publishing was
+    # skipped because the repository had nothing to publish to (no GitHub remote). Additive and
+    # derived from the summaries, never carried separately, so it cannot disagree with them.
+    #
+    # The RUN outcome stays ``completed`` in that case, and deliberately: at run level ``completed``
+    # means "every task finished its work", which is true. Inventing a run-level
+    # "completed_unpublished" would break every consumer of `RunOutcome` (the CLI's `--wait` finish
+    # test, its exit code, the IDE's status projection, the soak harness) to say something the task
+    # summaries already say precisely. This field is what lets a reader of the COMPLETION state it
+    # without consulting them.
+    unpublished_tasks: int = 0
 
 
 @dataclass(frozen=True)

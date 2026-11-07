@@ -32,6 +32,11 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any, Final, Literal, Mapping
 
 from ..sandbox import WRITE_TOKEN_NAMES, WRITE_TOKEN_VALUE
+from .publish import (
+    PublishSkipReason,
+    publish_skip_from_payload,
+    validate_publish_skip,
+)
 from .state_coercion import Coercion
 
 __all__ = [
@@ -739,6 +744,10 @@ class TaskState:
     # indistinguishable from a turn that finished, and the router would send it to `verify`, i.e. it
     # would try to validate work that was never done.
     ask: "AskRef | None" = None
+    # WHY publishing was skipped: a closed set from `publish.py`. `None` is the normal case (a pull
+    # request was opened, or the publish step has not run). Without this field a SKIP and "never ran"
+    # would both be ``pr is None``. A REFUSAL is NOT recorded — it is an error the user must fix.
+    publish_skip: "PublishSkipReason | None" = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not self.run_id:
@@ -841,6 +850,9 @@ class TaskState:
             self.pending_approval.validate()
         if self.ask is not None:
             self.ask.validate()
+        # The publish-skip rules live in `publish.py` with the error type INJECTED, the same way
+        # `state_coercion` does it: `TaskStateError` is defined HERE, so importing it back is a cycle.
+        validate_publish_skip(self.publish_skip, pr=self.pr, fail=TaskStateError)
 
     # -- serialization ------------------------------------------------------------
 
@@ -865,6 +877,7 @@ class TaskState:
             "pending_approval": self.pending_approval.to_payload() if self.pending_approval else None,
             "attempts": self.attempts.to_payload(),
             "ask": self.ask.to_payload() if self.ask else None,
+            "publish_skip": self.publish_skip,
         }
         assert_state_encodable(payload)
         return payload
@@ -899,6 +912,9 @@ class TaskState:
             pending_approval=PendingApproval.from_payload(data.get("pending_approval")),
             attempts=Attempts.from_payload(data.get("attempts")),
             ask=AskRef.from_payload(data.get("ask")),
+            # Absent in a payload recorded before publishing could be skipped: `None` is what such a
+            # history meant (its `open_pr` either opened a pull request or failed).
+            publish_skip=publish_skip_from_payload(data.get("publish_skip"), fail=TaskStateError),
         )
         state.validate()
         _ = size  # already enforced; kept for the reader: the decode path checks the same bound
