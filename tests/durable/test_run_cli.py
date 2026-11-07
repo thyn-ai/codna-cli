@@ -36,7 +36,9 @@ import pytest
 
 from codna import cli as top_cli
 from codna.durable import cli as durable_cli
+from codna.durable import serve_cli
 from codna.durable.cli import DurableCliError, _task_workflow_id, cmd_durable, register
+from codna.durable.errors import DurableCliError as DurableError
 
 CLI_DIR = Path(__file__).resolve().parents[2]
 HAS_EXTRA = importlib.util.find_spec("temporalio") is not None and importlib.util.find_spec("langgraph") is not None
@@ -87,6 +89,67 @@ def test_the_parser_offers_the_command_the_ide_tells_users_to_run():
     grouped = top_cli.build_parser().parse_args(["durable", "serve", "--no-temporal"])
     assert grouped.func is cmd_durable
     assert grouped.durable_action == "serve"
+
+
+def test_serve_can_start_the_stack_in_one_command():
+    """`codna serve --start-dev-server` is the ONE command the IDE now prints as its remedy.
+
+    WHY THIS EXISTS. Every message before it asked a user to run TWO foreground commands —
+    ``codna durable dev-server start`` and then ``codna serve`` — and keep both alive. Both work (measured),
+    but a user who ran only the second got ``run_api_temporal_unavailable`` and was back where they started.
+    The flag closes that gap: `serve` starts its own Temporal dependency, idempotently, and then serves.
+
+    The parse is the contract: the IDE's `RUN_API_STACK_COMMAND` is `codna serve --start-dev-server`, so the
+    flag has to exist, default to False (starting a background server is a side effect nobody asked for by
+    default), and be reachable under both spellings.
+    """
+    parsed = top_cli.build_parser().parse_args(["serve", "--start-dev-server"])
+    assert parsed.func is not None
+    assert parsed.start_dev_server is True
+    # OPT-IN, not the default: a bare `serve` must not start anything behind the user's back.
+    assert top_cli.build_parser().parse_args(["serve"]).start_dev_server is False
+    grouped = top_cli.build_parser().parse_args(["durable", "serve", "--start-dev-server"])
+    assert grouped.start_dev_server is True
+
+
+def test_start_dev_server_beside_no_temporal_is_refused_not_silently_ignored():
+    """The two flags contradict each other, and a contradiction must be an error.
+
+    `--no-temporal` means "no Temporal client at all"; `--start-dev-server` means "bring Temporal up".
+    Accepting both and doing nothing would leave an operator believing a server is running — the exact class
+    of defect ("a flag that does nothing") this surface keeps being fixed for.
+    """
+    with pytest.raises(DurableError) as caught:
+        serve_cli.cmd_serve(
+            top_cli.build_parser().parse_args(["serve", "--start-dev-server", "--no-temporal"])
+        )
+    assert caught.value.code == "serve_start_dev_server_conflict"
+
+
+def test_the_approved_roots_refusal_names_the_fix_where_the_reader_will_see_it():
+    """The message must be actionable on its own, because a client may render only `message`.
+
+    MEASURED. The Run API answered the IDE's task sheet with
+    ``durable_repo_outside_allowed_roots`` and a `hint` naming ``CODNA_DURABLE_REPO_ROOTS`` — and the sheet
+    showed only ``error.message``, so the user saw a refusal with no way to respond. The default allowed root
+    is the server's own cwd (`allowed_repo_roots_from_env`), so a `serve` started from a subdirectory refuses
+    the workspace above it.
+    """
+    from pathlib import Path
+
+    from codna.durable.repo_validation import ALLOWED_REPO_ROOTS_ENV, http_repo_dir
+
+    workspace = Path("/tmp/codna-roots-test/workspace")
+    elsewhere = Path("/tmp/codna-roots-test/elsewhere")
+    workspace.mkdir(parents=True, exist_ok=True)
+    elsewhere.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(DurableError) as caught:
+        http_repo_dir(str(workspace), allowed_roots=(elsewhere,))
+    message = str(caught.value)
+    assert str(workspace) in message
+    # Both halves of the fix, in the sentence a caller actually renders.
+    assert ALLOWED_REPO_ROOTS_ENV in message
+    assert "codna serve" in message
 
 
 def test_the_run_api_spelling_the_product_used_to_print_is_not_a_command():
