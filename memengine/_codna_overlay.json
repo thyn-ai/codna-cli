@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "description": [
+    "Downstream overlay of the vendored memengine. Every path listed here is COD-NA-ONLY: upstream thyn-ai/telys",
+    "(packages/memengine-py) has never shipped it, so the automated sync from telys main must PRESERVE it rather",
+    "than mirror its absence. telys' sync-memengine-to-codna.yml runs `rsync -a --delete` from a source tree that",
+    "cannot contain these files, so --delete removes them on every sync; main's 5a13cd08 restored them once and",
+    "77868391 removed them again, and PR #697 (c7a64c05) did it a third time. This manifest is the machine-checked",
+    "record that makes the next recurrence fail loudly in codna CI instead of at a downstream release.",
+    "There is a SECOND mirroring path: scripts/sync_wheel_memengine_from_staged_runtime.py at publish time",
+    "rmtree's cli/memengine and copytree's the engine staged from the signed telys bundle, which has the same",
+    "absence. It now preserves every path listed here (see _preserved from this manifest) so a release cannot strip",
+    "the fallback even if a sync PR were merged without the restore.",
+    "Do not add a file here without a test that exercises it; see cli/tests/test_memengine_overlay.py."
+  ],
+  "telys_upstream_sha": "5760948a431e07669238a67c15670bfa8829d3a4",
+  "preserve": [
+    {
+      "path": "_pynative.py",
+      "role": "reference",
+      "why": "Pure-NumPy reference implementation of every kernel primitive (AGENTS.md 24.8). The baseline the native path is compared against in cli/tests/test_pynative_equivalence.py and the whole degraded-mode story for platforms with no Mojo wheel (Windows today)."
+    },
+    {
+      "path": "_pykernel.py",
+      "role": "adapter",
+      "why": "ctypes-shaped adapter that answers the kernel's C ABI using _pynative, so mojo_backend._lib() can substitute it with no second code path. Without it there is no fallback at all: the engine raises FileNotFoundError on any platform with no shared library."
+    }
+  ],
+  "overlaid_modules": [
+    {
+      "path": "mojo_backend.py",
+      "symbols": ["backend_kind", "_PYNATIVE_ACTIVE"],
+      "why": "backend_kind() makes 'which backend answered?' a question a program can ask (CONSUMERS: cli/codna/runtime_capabilities.py, python/codna_parity/telys_localize.py, ide bundle-telys.js preflight, bench)."
+    },
+    {
+      "path": "lexical.py",
+      "symbols": ["_bm25_topk_order"],
+      "why": "Tie handling that reproduces the BM25 kernels' top-k contract, so the pure-Python fallback cannot order ties the opposite way from the native kernel. Reinstate requires _pynative.py (_bm25_insert_topk)."
+    },
+    {
+      "path": "runtime.py",
+      "symbols": ["supports_compact_export", "supports_compact_open"],
+      "why": "LocalRuntime declares the compact serve-artifact capability it actually implements; cli/codna/runtime_capabilities.py reads these flags because hasattr() is true even when the method raises."
+    },
+    {
+      "path": "native_runtime.py",
+      "symbols": ["export_compact"],
+      "why": "Native shadow of the local sealer's compact export, byte-identical by test (cli/tests/test_native_compact_export.py). Upstream replaced it with a bare NotImplementedError."
+    }
+  ]
+}

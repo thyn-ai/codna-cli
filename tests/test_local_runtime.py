@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import codna.runtime.config as config_module
 from codna.runtime.health import ProbeResult
 import codna.runtime.health as health_module
 from codna.runtime.local_stack import LocalRuntimeError, ensure_running, inspect_runtime
+from codna.runtime.policy_reader import policy_reader_env
 from codna.runtime.ports import ListenerInfo
 import codna.runtime.local_stack as local_stack_module
 
@@ -234,6 +236,49 @@ def test_engine_spawn_uses_codna_owned_algenta_runtime_dirs(tmp_path, monkeypatc
     assert env["ALGENTA_AGENT_CORE_URL"] == config.sidecar_url
     assert "DATABASE_URL" not in env
     assert "ASYNC_DATABASE_URL" not in env
+
+
+def test_sidecar_launch_makes_the_policy_reader_importable(tmp_path, monkeypatch) -> None:
+    # MEASURED DEFECT. Every session was refused 403 `policy_verdict_unavailable` because the
+    # sidecar's policy reader runs `python -m codna.policy_cli` under PYTHONNOUSERSITE=1, and in a
+    # source checkout `codna` is reachable only through the user-site editable install — which that
+    # scrub removes. The env the sidecar is LAUNCHED with must name the directory containing `codna/`.
+    #
+    # Asserted at `ensure_agent_core_running`, the one place the spawn env is handed to the process,
+    # because that is where the helper is applied (`local_stack.py` is at the line ceiling).
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.delenv("CODNA_POLICY_PYTHONPATH", raising=False)
+    monkeypatch.setattr(
+        local_stack_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"node", "bun"} else None,
+    )
+    config = resolve_runtime_config()
+
+    _command, _cwd, env = local_stack_module._sidecar_spawn(config, "runtime-1")
+    spawn_env = dict(env)
+    policy_reader_env(spawn_env)
+
+    package_root = Path(local_stack_module.__file__).resolve().parent.parent
+    assert str(package_root.parent) in spawn_env["PYTHONPATH"].split(os.pathsep)
+
+
+def test_policy_reader_env_preserves_an_existing_pythonpath_entry() -> None:
+    # The reader's PYTHONPATH must ADD the CLI root without dropping what the caller already had:
+    # `_merged_child_env_from_keys` may have placed a genuine entry there.
+    env = {"PYTHONPATH": "/opt/already-there"}
+    policy_reader_env(env)
+    entries = env["PYTHONPATH"].split(os.pathsep)
+    cli_root = str(Path(local_stack_module.__file__).resolve().parent.parent.parent)
+    assert entries[0] == cli_root
+    assert "/opt/already-there" in entries
+
+
+def test_policy_reader_env_defers_to_the_operator_override() -> None:
+    # `CODNA_POLICY_PYTHONPATH` is the reader's own escape hatch; the spawn must not contradict it.
+    env = {"CODNA_POLICY_PYTHONPATH": "/opt/explicit", "PYTHONPATH": ""}
+    policy_reader_env(env)
+    assert env["PYTHONPATH"] == ""
 
 
 def test_sidecar_spawn_does_not_inherit_local_database_urls(tmp_path, monkeypatch) -> None:
