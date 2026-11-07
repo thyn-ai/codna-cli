@@ -90,7 +90,7 @@ So the five doing-nodes are **activities whose bodies are the real work**: each 
 from the graph state plus the config metadata, and hands it to `activities.py`. The
 `start_to_close_timeout` the plan asks for is still enforced — one level up, where the plugin
 schedules that node through `workflow.execute_activity(node_body, start_to_close_timeout=…)` from
-`PLUGIN_ACTIVITY_OPTIONS`, which is exactly where a missing timeout fails a workflow task.
+`_plugin_activity_options()`, which is exactly where a missing timeout fails a workflow task.
 
 `_run_step` therefore does ONE thing and has no branch: the node IS an activity, so it runs the step
 bodies itself, off the event loop. There is no "schedule it instead" path to choose between — an
@@ -152,7 +152,6 @@ __all__ = [
     "GRAPH_NAME",
     "GRAPH_VERSION",
     "NODE_EXECUTION",
-    "PLUGIN_ACTIVITY_OPTIONS",
     "STEP_TIMEOUT_S",
     "STEPS",
     "TASK_NODES",
@@ -195,6 +194,17 @@ NODE_EXECUTION: Final[dict[NodeName, Literal["activity", "workflow"]]] = {
 CONFIG_TASK_SPEC: Final = "codna_task"
 CONFIG_STEER: Final = "codna_steer"
 
+# A transport-level retry bound, distinct from the workflow's SEMANTIC bound (verify-fail →
+# implement, review-reject → implement, both capped by `max_attempts`). An activity failing the same
+# way four times will not succeed on the fifth, and an unbounded server-side retry means the workflow
+# never learns the turn is dead — the run would look alive forever.
+#
+# IT LIVES HERE, BESIDE `STEP_TIMEOUT_S`, because BOTH engines must read it: `workflow_activity` in
+# `workflow_support.py` (plain) and `_plugin_activity_options` below (graph). It used to live only in
+# `workflow_support.py`, which the plugin path could not read, so the graph engine silently ran with
+# Temporal's default policy — no attempt cap at all.
+ACTIVITY_RETRIES: Final = 3
+
 # Per-activity `start_to_close_timeout`, seconds. The one table both engines read — including the two
 # bookkeeping activities, which are scheduled from workflow code (habitually the same way) and would
 # otherwise be scheduled with no timeout, the exact failure the spike proved.
@@ -219,14 +229,35 @@ STEP_TIMEOUT_S: Final[dict[str, int]] = {
     NAME_WATCH_CI: ACTIVITY_TIMEOUT_S,
 }
 
-# Passed to `LangGraphPlugin(default_activity_options=...)`. `start_to_close_timeout` is not
-# optional: without it the plugin schedules an activity the SDK refuses, and the workflow task
-# fails with a bare ValueError (spike finding 1a). The heartbeat timeout is generous relative to the
-# turn's 10s beat: one missed beat must not retry a paid turn.
-PLUGIN_ACTIVITY_OPTIONS: Final[dict[str, Any]] = {
-    "start_to_close_timeout": timedelta(seconds=ACTIVITY_TURN_TIMEOUT_S),
-    "heartbeat_timeout": timedelta(seconds=ACTIVITY_HEARTBEAT_TIMEOUT_S),
-}
+def _plugin_activity_options() -> dict[str, Any]:
+    """The `default_activity_options` the graph engine hands to `LangGraphPlugin`.
+
+    WHY A FUNCTION AND NOT A MODULE CONSTANT. `graph.py` is a workflow-facing module and must
+    import cleanly inside Temporal's sandbox, where `temporalio` is not importable at module scope
+    (`tests/durable/test_import_hygiene.py` proved it: a module-level RetryPolicy made
+    `import codna.durable.graph` fail with `ModuleNotFoundError: No module named 'temporalio'`).
+    Building the policy here keeps the import lazy, at the one point a worker actually constructs
+    the plugin.
+
+    Both timeouts are mandatory: without `start_to_close_timeout` the plugin schedules an activity
+    the SDK refuses and the workflow task fails with a bare ValueError (spike finding 1a). The
+    heartbeat is generous relative to the turn's 10s beat — one missed beat must not retry a paid
+    turn.
+
+    The RETRY BOUND is the part that used to be missing. `workflow_activity` (the plain engine)
+    passes `retry_policy=_retry_policy()`, but this path passed only the two timeouts, so Temporal
+    applied its DEFAULT policy — no attempt cap. MEASURED in the installed app: a
+    `codna.task.plan` activity that could never succeed (403 from the policy reader) retried 27
+    times over 30 minutes while the run's ledger stayed at 4 records, and `codna durable control
+    --run ... stop` did not end it. Both engines now read `ACTIVITY_RETRIES`.
+    """
+    from temporalio.common import RetryPolicy
+
+    return {
+        "start_to_close_timeout": timedelta(seconds=ACTIVITY_TURN_TIMEOUT_S),
+        "heartbeat_timeout": timedelta(seconds=ACTIVITY_HEARTBEAT_TIMEOUT_S),
+        "retry_policy": RetryPolicy(maximum_attempts=ACTIVITY_RETRIES),
+    }
 
 _GRAPH_KEY: Final = GRAPH_NAME
 
@@ -632,7 +663,7 @@ def build_task_graph(
 
     plugin = LangGraphPlugin(
         graphs={_GRAPH_KEY: graph},
-        default_activity_options=dict(PLUGIN_ACTIVITY_OPTIONS),
+        default_activity_options=_plugin_activity_options(),
     )
     return TaskGraph(graph=graph, plugin=plugin)
 
