@@ -54,7 +54,7 @@ from temporalio.worker import Replayer, Worker  # noqa: E402
 from codna.durable.graph import (  # noqa: E402
     GRAPH_NAME,
     NODE_EXECUTION,
-    PLUGIN_ACTIVITY_OPTIONS,
+    _plugin_activity_options,
     build_plugin,
     build_task_graph,
     task_state_from_graph_state,
@@ -400,7 +400,28 @@ def test_an_activity_node_without_a_timeout_fails_the_workflow_task():
     # timed out because the task keeps retrying — both are "this graph cannot run". The production
     # graph, by contrast, always supplies the timeout.
     assert "start_to_close_timeout" in message or "timed out" in message.lower()
-    assert "start_to_close_timeout" in PLUGIN_ACTIVITY_OPTIONS
+    assert "start_to_close_timeout" in _plugin_activity_options()
+
+
+def test_plugin_activity_options_carry_a_bounded_retry_policy() -> None:
+    """The graph engine must bound retries, exactly as the plain engine does.
+
+    MEASURED DEFECT. The plugin activity options carried only the two timeouts, so the plugin path got
+    Temporal's DEFAULT retry policy — no attempt cap. A `codna.task.plan` activity that could never
+    succeed (the sidecar refused `create_session` with 403 `policy_verdict_unavailable`) retried 27
+    times over 30 minutes: the run's ledger stayed at four records, the thread said "Nothing has
+    happened in this run yet", and `codna durable control --run ... stop` reported `stopped: true`
+    without ending it. A deterministic failure has to stop on its bound or the run's "alive or dead"
+    signal is meaningless.
+    """
+    from codna.durable.graph import ACTIVITY_RETRIES, _plugin_activity_options
+    from codna.durable.workflow_support import _retry_policy
+
+    policy = _plugin_activity_options().get("retry_policy")
+    assert policy is not None, "the graph engine must not fall back to Temporal's default retry policy"
+    assert policy.maximum_attempts == ACTIVITY_RETRIES
+    # The two engines must agree: a graph run and a plain run failing the same way end the same way.
+    assert policy.maximum_attempts == _retry_policy().maximum_attempts
 
 
 # ---------------------------------------------------------------------------------------
