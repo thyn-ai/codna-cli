@@ -54,9 +54,10 @@ import os
 import re
 import socket
 from dataclasses import dataclass
-from typing import Final, Literal, Mapping
+from typing import Final, Literal, Mapping, Sequence
 from pathlib import Path
 
+from ..provider_url import is_loopback_host
 from ..runtime.config import RuntimeConfig, build_runtime_paths, resolve_runtime_config
 from .credentials import (
     ENV_CLIENT_CERT,
@@ -446,14 +447,73 @@ def _resolve_profile(env: Mapping[str, str]) -> TemporalProfile:
     but forgot the namespace" a named refusal instead of a run that talks to a loopback dev server
     nobody started. An explicit ``CODNA_TEMPORAL_PROFILE=local`` overrides the inference, which is
     the escape hatch for a host that exports the variables for the Temporal CLI.
+
+    **A FULLY LOOPBACK environment is the local profile, whatever named it.** ``TEMPORAL_ADDRESS`` is
+    the Temporal SDK's OWN variable, so a developer who exports it for ``temporal``/the SDK — the
+    normal way to point a tool at a local dev server — was inferred as a *Cloud* attempt and every
+    durable command then refused with ``temporal_cloud_config_incomplete`` ("TEMPORAL_API_KEY,
+    TEMPORAL_NAMESPACE is not set … there is no fallback to a local server"). That is the opposite of
+    a fallback: a loopback address can only be a local server, and the Cloud profile cannot connect to
+    one. MEASURED on this host: ``TEMPORAL_ADDRESS=127.0.0.1:7233`` exported in the shell made
+    ``codna durable dev-server status`` exit nonzero before it read anything.
+
+    The partial-Cloud refusal is untouched: an endpoint that is NOT loopback is still inferred as
+    Cloud and still names what is missing, and so is a half-configured credential or namespace.
     """
     explicit = parse_profile(_env(env, ENV_CLOUD_PROFILE))
     if explicit is not None:
         return explicit
     attempted = [name for name in _CLOUD_VARIABLES if _env(env, name) not in (None, "")]
+    if attempted and _names_a_loopback_server(env, attempted):
+        return "local"
     if attempted:
         return "cloud"
     return "local"
+
+
+def _names_a_loopback_server(env: Mapping[str, str], attempted: Sequence[str]) -> bool:
+    """Whether every coordinate this environment stated points at loopback.
+
+    True only when an ENDPOINT was named, it parses, and its host is loopback — and every other cloud
+    variable present is a namespace/profile name rather than a credential or a remote endpoint. A key
+    or certificate means the operator is configuring a real Cloud connection, however the address
+    looks, so that is never reclassified.
+    """
+    if any(name in attempted for name in (ENV_CLOUD_API_KEY, ENV_CLIENT_CERT, ENV_CLIENT_KEY)):
+        return False
+    endpoint = _env(env, ENV_CLOUD_ENDPOINT) or _env(env, ENV_CLOUD_ADDRESS)
+    if endpoint is None:
+        return False
+    host = _host_of_endpoint(endpoint)
+    return host is not None and is_loopback_host(host)
+
+
+def _host_of_endpoint(value: str) -> str | None:
+    """The host part of a ``host[:port]`` / ``scheme://host[:port]``, or ``None`` if it is not one.
+
+    Deliberately SEPARATE from `split_temporal_endpoint`: that function enforces the CLOUD profile's
+    rules (a dotted hostname, TLS schemes only), and the question here is asked BEFORE a profile is
+    chosen. Reusing it would make ``localhost:7233`` look unparseable — which is exactly the value a
+    developer exports for the SDK — and leave the Cloud inference in place for it.
+    """
+    text = value.strip()
+    if not text or any(ch.isspace() for ch in text):
+        return None
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    if any(marker in text for marker in ("/", "?", "#", "@")):
+        return None
+    host = text
+    if text.startswith("["):  # a bracketed IPv6 literal, e.g. [::1]:7233
+        end = text.find("]")
+        if end < 0:
+            return None
+        host, _, rest = text[1:end], "", text[end + 1 :]
+        if rest and not rest.startswith(":"):
+            return None
+    elif ":" in text:
+        host = text.rpartition(":")[0]
+    return host.strip() or None
 
 
 def _require_cloud_coordinates(env: Mapping[str, str]) -> tuple[str, int, str]:
