@@ -1,0 +1,5 @@
+---
+description: Team Python baseline (imported from Cursor; shadowed by .codna/rules/python.mdc)
+alwaysApply: true
+---
+PROJECT-SCOPE PYTHON RULE — must NOT appear, because the TEAM rule with the same name wins.

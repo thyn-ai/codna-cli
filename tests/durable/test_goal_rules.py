@@ -75,6 +75,20 @@ def test_codna_rules_reaches_the_turn(tmp_path: Path):
     assert "Prefer small diffs." in project_rules_for(str(repo))
 
 
+def test_globs_scoped_rules_are_attached_to_a_durable_turn(tmp_path: Path):
+    """A durable turn's file set is UNKNOWN, so a globbed rule must still reach it.
+
+    The durable agent may edit anything in its tree. Withholding a glob-scoped convention because the
+    caller did not enumerate files would be silent under-application: the agent would never be told the
+    convention governing the files it is about to change.
+    """
+    repo = fakes.make_repo(tmp_path / "repo")
+    (repo / ".codna" / "rules").mkdir(parents=True)
+    (repo / ".codna" / "rules" / "ts.mdc").write_text(
+        "---\nglobs: src/**/*.ts\n---\nTS ONLY\n", encoding="utf-8")
+    assert "TS ONLY" in project_rules_for(str(repo))
+
+
 def test_the_rules_are_bounded_for_the_PROMPT_not_just_the_file(tmp_path: Path):
     """A 16 KB rules file would be a larger system prompt on every turn of every task of every run."""
     repo = fakes.make_repo(tmp_path / "repo")
