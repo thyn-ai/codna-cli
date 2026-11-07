@@ -447,6 +447,58 @@ def _build_server():
         """
         return await asyncio.to_thread(report_bug_json, title, body, product, include_diagnostics)
 
+    @server.tool(annotations=ToolAnnotations(
+        title="Pull one project rule by name",
+        readOnlyHint=True,
+        idempotentHint=True,
+        # It only reads markdown inside the repository; it opens no connection and writes nothing.
+        openWorldHint=False,
+    ))
+    def codna_request_rule(repo: str = ".", name: str = "") -> str:
+        """Fetch the FULL text of one project rule, by the name the prompt catalogued.
+
+        Codna attaches `alwaysApply` and glob-matched rules in full, but a rule with only a
+        `description` is catalogued as a single line so it costs a token, not a kilobyte, on the turns
+        it has nothing to do with. Call this when that line looks relevant: `name` is the identifier
+        the catalog printed, with or without a leading `@`.
+
+        Requires the one-time free `codna login` device authorization (free community
+        license); fully offline thereafter.
+
+        repo: a local path (default: current directory).
+        name: the rule name from the catalog, e.g. "python" or "@python".
+        Returns the rule's scope, source path and full body, or a structured `rule_not_found`.
+        """
+        gate = _login_required_error("codna_request_rule")
+        if gate:
+            return gate
+        if not name or not name.strip():
+            return "codna_request_rule error: name is required"
+        try:
+            from .rules import request_rule
+
+            rule = request_rule(_default_repo(repo), name)
+        except Exception as exc:  # noqa: BLE001 — surface as tool text, never crash the server
+            return f"codna_request_rule error: {exc}"
+        if rule is None:
+            return json.dumps({
+                "error": {
+                    "code": "rule_not_found",
+                    "message": f"no rule named {name!r}",
+                    "details": {"requested": name, "repo": _default_repo(repo)},
+                },
+            }, indent=2)
+        return json.dumps({
+            "name": rule.name,
+            "scope": rule.scope.value,
+            "mode": rule.mode.value,
+            "source_path": rule.source_path,
+            "base_dir": rule.base_dir,
+            "description": rule.description,
+            "globs": list(rule.globs),
+            "body": rule.body,
+        }, indent=2)
+
     @server.resource("codna://capabilities")
     def capabilities() -> str:
         """codna's MCP capabilities — @-mentionable so the client knows what codna offers."""
@@ -458,6 +510,8 @@ def _build_server():
                 "codna_secure": "prove which scanner findings are reachable (read-only)",
                 "codna_recall": "recall code from local on-device memory",
                 "codna_report_bug": "file a bug/feature/question to thyn-ai/feedback",
+                "codna_request_rule": "pull one project rule's full text by name (the description-only "
+                                      "rules the prompt only catalogues)",
             },
             "default_repo": os.environ.get("CODNA_MCP_DEFAULT_REPO", "."),
         }, indent=2)

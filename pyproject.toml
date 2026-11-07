@@ -140,7 +140,11 @@ requires = ["setuptools>=68", "wheel>=0.43"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["codna", "codna.durable", "codna.runtime", "memengine"]
+# Every subpackage must be listed: setuptools' `packages` is an explicit allow-list, so a subpackage
+# that is missing here ships NOTHING of itself and the import fails only in a packaged install —
+# which is exactly what `cli/tests/test_packaging.py` refuses. `codna.rules` is listed because the
+# rule engine is imported by `project_rules`, `durable.rules` and the `codna rules` command.
+packages = ["codna", "codna.durable", "codna.rules", "codna.runtime", "memengine"]
 
 [tool.setuptools.package-data]
 codna = [

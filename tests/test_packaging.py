@@ -270,6 +270,40 @@ def test_the_policy_reader_module_ships_in_the_wheel():
     )
 
 
+def test_the_rule_engine_and_its_bridge_ship_in_the_wheel():
+    """The rule engine is imported by `project_rules`, `durable.rules` and `codna rules`.
+
+    `codna.rules_bridge` is spawned as `python -m codna.rules_bridge` by the IDE backend
+    (`ide/packages/codna-engine-client/src/projectRules.ts`), which resolves through normal package
+    import — so both have to ship. A missing subpackage would fail only in a PACKAGED install, where
+    the failure is an ImportError at the first turn rather than anything a checkout test would see.
+    """
+    pytest.importorskip("setuptools", reason="setuptools is not installed on this lane")
+    from setuptools import Distribution
+    from setuptools.command.build_py import build_py
+
+    declared = _data()["tool"]["setuptools"]["packages"]
+    dist = Distribution(
+        {"packages": declared, "script_name": "setup.py", "package_dir": {"": str(ROOT / "cli")}}
+    )
+    command = build_py(dist)
+    command.ensure_finalized()
+    shipped = {(package, module) for package, module, _src in command.find_all_modules()}
+
+    assert ("codna", "rules_bridge") in shipped, (
+        "codna/rules_bridge.py would NOT be in the wheel, so the IDE's `python -m codna.rules_bridge` "
+        f"fails for every packaged install. Shipped codna modules: {sorted(shipped)[:12]}"
+    )
+    for module in ("model", "globs", "frontmatter", "discovery", "select", "render"):
+        assert ("codna.rules", module) in shipped, f"codna/rules/{module}.py must ship"
+
+
+def test_the_rules_subpackage_is_declared_because_it_is_a_package():
+    """An explicit pin: `codna.rules` is a package, so it needs a `packages` entry, not just files."""
+    packages = _data()["tool"]["setuptools"]["packages"]
+    assert "codna.rules" in packages
+
+
 
 def test_telys_package_data_is_manifest_scoped():
     package_data = _data()["tool"]["setuptools"]["package-data"]["codna"]

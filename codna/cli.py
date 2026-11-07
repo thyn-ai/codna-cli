@@ -900,6 +900,9 @@ def build_parser() -> argparse.ArgumentParser:
     pin.add_argument("--no-agents", dest="no_agents", action="store_true", help="do not write AGENTS.md")
     pin.set_defaults(func=cmd_init)
 
+    from .rules_cli import register as _register_rules  # project-rule inspection
+    _register_rules(sub)
+
     pstat = sub.add_parser("status", help="Concise health: engine · telys · keys (vs the verbose `doctor`).")
     pstat.set_defaults(func=cmd_status)
 
