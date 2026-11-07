@@ -1,6 +1,6 @@
 [project]
 name = "codna"
-version = "0.2.107"
+version = "0.2.109"
 description = "Understand. Fix. Evolve. Codna maps your repository before it spends a token, reviews pull requests, fixes bugs and proves which scanner findings are reachable. Runs on your machine."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -163,3 +163,6 @@ codna = [
 # rather than a checkout. Quoted key because `codna` above is an ARRAY, so a dotted `codna.durable`
 # would try to extend it (TOML refuses that: "cannot extend value of type array with a dotted key").
 "codna.durable" = ["temporal_cli.lock.json"]
+# The memengine overlay record ships with the engine's audit tool (`memengine._codna_overlay`): an
+# installed package must be able to answer "did a sync strip codna's fallback?" without a checkout.
+memengine = ["_codna_overlay.json"]
