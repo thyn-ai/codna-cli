@@ -645,12 +645,28 @@ def _review_via_findings(request: ReviewRequest, sha: str, *, tree: str) -> Any:
     """The real review: the shared findings pipeline over the commit range, read in ``tree``."""
     from ..review_findings import load_review_config, run_diff_review
 
+    # The run's OWN provider, not the engine's default. `codna run --provider ollama` is a decision
+    # for the whole task, and a review is part of it: without these the review step read only the
+    # process environment, so a durable run on a keyless local provider planned, implemented,
+    # verified and checkpointed on it and then failed its review with "no API key in env for
+    # 'anthropic'" (measured: run-20261107T165622Z, ledger `verify passed` → review error).
+    #
+    # `provider_key_source` is deliberately NOT forwarded: it tells a SESSION where a credential
+    # comes from, and a review request carries no credential at all (the runner resolves one below
+    # the model). Passing it would be a field `run_diff_review` does not have.
+    context = request.context
+    coordinates = (
+        {"provider": context.provider, "model": context.model, "base_url": context.base_url}
+        if context.provider is not None
+        else {}
+    )
     return run_diff_review(
         tree,
         repository=tree,
-        diff_range=f"{request.base_sha or request.context.base_branch}...{sha}",
+        diff_range=f"{request.base_sha or context.base_branch}...{sha}",
         config=load_review_config(tree),
         head_sha=sha,
+        **coordinates,
     )
 
 
