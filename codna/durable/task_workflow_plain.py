@@ -49,6 +49,7 @@ from .routing import after_plan, after_review, after_verify
 from .state import TaskState
 from .workflow_support import (
     adopt,
+    approved_outcome,
     task_completion,
     approver_identity,
     initial_state,
@@ -233,8 +234,13 @@ class TaskWorkflowPlain:
         )
         # The OUTCOME is what happened to the task, not what the human said: a task parked on an
         # exhausted budget finished budget_exhausted, and saying "approved" would hide the reason it
-        # stopped.
-        self._outcome = "budget_exhausted" if reason == "budget_exhausted" else "approved"
+        # stopped. A budget park is unchanged; an approval routes through the SHARED helper, because
+        # whether an unpublished task succeeded is a fact about its state and both engines must read
+        # it the same way.
+        if reason == "budget_exhausted":
+            self._outcome = "budget_exhausted"
+        else:
+            self._outcome = approved_outcome(state)
         return state.resumed()
 
     async def _respect_pause(self) -> None:
@@ -310,6 +316,10 @@ class TaskWorkflowPlain:
             "review_verdict": state.review_verdict,
             "verify_passed": state.verify_ref.passed if state.verify_ref else None,
             "pr": state.pr.to_payload() if state.pr else None,
+            # WHY there is no pull request, when there is none ON PURPOSE (`no_remote`, or a remote
+            # that is not GitHub). `pr: null` alone cannot distinguish "publishing was skipped" from
+            # "the publish step has not run", and a UI showing a completed run needs the difference.
+            "publish_skip": state.publish_skip,
             "approvals": list(self._approvals),
             "nodes_run": list(self._nodes_run),
             "outcome": self._outcome,

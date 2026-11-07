@@ -94,6 +94,11 @@ def _git_repo(path: Path) -> Path:
         ["git", "init", "-q", "-b", "main"],
         ["git", "config", "user.email", "test@codna.ai"],
         ["git", "config", "user.name", "test"],
+        # A REAL origin, because the durable run's last step publishes. Without one the step correctly
+        # SKIPS (`publish.skipped` / `approved_unpublished`) — which is the contract its own tests
+        # pin — and this test is about Temporal + the CLI reaching the PR, not about publishing being
+        # unavailable. The push itself is the harness's scripted seam, so no network is used.
+        ["git", "remote", "add", "origin", "https://github.com/thyn-ai/codna.git"],
         ["git", "add", "-A"],
         ["git", "commit", "-q", "-m", "init"],
     ):

@@ -45,8 +45,9 @@ import os
 import posixpath
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Final, Mapping, Sequence
+from typing import Any, Final, Sequence
 
+from . import publish_steps as _publish_steps
 from .activity_support import (
     ActivityError,
     ActivityRuntime,
@@ -65,8 +66,6 @@ from .contracts import (
     NotifyOutcome,
     NotifyRequest,
     PlanRequest,
-    PullRequestOutcome,
-    PullRequestRequest,
     ReviewRequest,
     TaskContext,
     TurnRequest,
@@ -75,7 +74,7 @@ from .contracts import (
     WorktreeCleanupRequest,
 )
 from .ledger import RunLedger
-from .state import AskRef, CheckpointRef, PullRequestRef, TaskState, TaskStateError, VerifyRef
+from .state import AskRef, CheckpointRef, TaskState, TaskStateError, VerifyRef
 from .worktree import remove_run_worktrees
 
 __all__ = [
@@ -645,12 +644,28 @@ def _review_via_findings(request: ReviewRequest, sha: str, *, tree: str) -> Any:
     """The real review: the shared findings pipeline over the commit range, read in ``tree``."""
     from ..review_findings import load_review_config, run_diff_review
 
+    # The run's OWN provider, not the engine's default. `codna run --provider ollama` is a decision
+    # for the whole task, and a review is part of it: without these the review step read only the
+    # process environment, so a durable run on a keyless local provider planned, implemented,
+    # verified and checkpointed on it and then failed its review with "no API key in env for
+    # 'anthropic'" (measured: run-20261107T165622Z, ledger `verify passed` → review error).
+    #
+    # `provider_key_source` is deliberately NOT forwarded: it tells a SESSION where a credential
+    # comes from, and a review request carries no credential at all (the runner resolves one below
+    # the model). Passing it would be a field `run_diff_review` does not have.
+    context = request.context
+    coordinates = (
+        {"provider": context.provider, "model": context.model, "base_url": context.base_url}
+        if context.provider is not None
+        else {}
+    )
     return run_diff_review(
         tree,
         repository=tree,
-        diff_range=f"{request.base_sha or request.context.base_branch}...{sha}",
+        diff_range=f"{request.base_sha or context.base_branch}...{sha}",
         config=load_review_config(tree),
         head_sha=sha,
+        **coordinates,
     )
 
 
@@ -673,131 +688,15 @@ def _findings_summary(report: Any) -> dict[str, int]:
 
 
 # -- open_pr -----------------------------------------------------------------------------
+#
+# The publish decision — open a pull request, record a SKIP when the repository has nothing to
+# publish to, or refuse with a named code when a GitHub remote has no write token — lives in
+# `publish_steps.py`. It moved there because this module is at the repository's 1000-line ceiling and
+# because the reasoning is worth reading as one piece: see that module's docstring for the contract.
+# It is RE-EXPORTED here on the same rule as every other step, so `activities.py` registers one object
+# and a test calling `activity_steps.open_pr` calls what a worker runs.
 
-
-def open_pr(request: PullRequestRequest) -> PullRequestOutcome:
-    """Push the checkpoint commit and open (or find) the pull request. Idempotent by branch.
-
-    Idempotency is the branch name: the PR's head is ``codna/run-<run>/task-<n>``, so a retried
-    activity finds the open PR instead of opening a second one. The lookup runs FIRST — a retry
-    whose first attempt already pushed and opened must neither push again nor fail because there is
-    nothing new to send.
-    """
-    active = _runtime()
-    state = decode_request(request, "open_pr")
-    checkpoint = state.checkpoint_ref
-    if checkpoint is None:  # pragma: no cover - the contract already refuses this
-        raise ActivityError(
-            "a pull request needs a checkpoint commit",
-            code="activity_pr_without_checkpoint",
-            details={"task_id": request.context.task_id},
-        )
-    active.beat({"task_id": request.context.task_id, "phase": "open_pr", "sha": checkpoint.sha})
-    # `push_branch` verifies the sha exists in the repository it is given; a worktree shares that
-    # object store, so pushing from here finds the commit the checkpoint made there. The ORIGIN URL is
-    # read from the task's tree too (a worktree inherits the parent's remotes).
-    tree = ensure_checkout(active, request.context)
-    opened = (
-        active.push_and_open(request, checkpoint.sha)
-        if active.push_and_open is not None
-        else _push_and_open(active, request, checkpoint.sha, tree=tree)
-    )
-    pr = _pr_ref_from(opened, branch=request.context.branch, sha=checkpoint.sha)
-    updated = replace(state, pr=pr, attempts=state.attempts.incremented("open_pr"))
-    active.ledger(request.context.run_id).append(
-        "note",
-        task_id=request.context.task_id,
-        payload={
-            "event": "pull_request.opened",
-            "number": pr.number,
-            "url": pr.url,
-            "branch": pr.branch,
-            "head_sha": pr.head_sha,
-        },
-    )
-    return PullRequestOutcome(
-        state=updated.to_payload(),
-        details={"number": pr.number, "url": pr.url, "branch": pr.branch},
-    )
-
-
-def _push_and_open(
-    runtime: ActivityRuntime, request: PullRequestRequest, sha: str, *, tree: str
-) -> Mapping[str, Any]:
-    """Push the branch, then create (or find) the PR through the shared GitHub helpers."""
-    from .. import review_github
-    from ..gitpush import GitPushError, push_branch
-
-    token = runtime.github_token() if runtime.github_token is not None else _env_github_token()
-    if not token:
-        raise ActivityError(
-            "opening a pull request needs a GitHub write token, and none was configured",
-            code="activity_pr_token_missing",
-            details={"task_id": request.context.task_id, "branch": request.context.branch},
-        )
-    slug = review_github.repo_slug_from_url(_origin_url(runtime, tree))
-    if not slug:
-        raise ActivityError(
-            "the repository has no parseable GitHub origin, so a pull request cannot be opened",
-            code="activity_pr_no_origin",
-            details={"repo_dir": tree},
-        )
-    existing = review_github.find_open_pr_for_branch(slug, request.context.branch, token)
-    if existing is not None:
-        return existing
-    try:
-        push_branch(
-            tree,
-            branch=request.context.branch,
-            sha=sha,
-            push_url=f"https://x-access-token:{token}@github.com/{slug}.git",
-        )
-    except GitPushError as exc:
-        raise ActivityError(
-            f"pushing {request.context.branch} failed: {exc}",
-            code="activity_push_failed",
-            details={"branch": request.context.branch},
-        ) from exc
-    return review_github.create_pull_request(
-        slug,
-        token=token,
-        title=request.title,
-        head=request.context.branch,
-        base=request.context.base_branch,
-        body=request.body,
-    )
-
-
-def _env_github_token() -> str | None:
-    for name in ("CODNA_GITHUB_TOKEN", "GITHUB_TOKEN"):
-        value = os.environ.get(name)
-        if value and value.strip():
-            return value.strip()
-    return None
-
-
-def _origin_url(runtime: ActivityRuntime, repo_dir: str) -> str:
-    out = git_ok(runtime, repo_dir, ["config", "--get", "remote.origin.url"])
-    return (out or "").strip()
-
-
-def _pr_ref_from(opened: Mapping[str, Any], *, branch: str, sha: str) -> PullRequestRef:
-    number = opened.get("number")
-    url = opened.get("url")
-    if not isinstance(number, int) or isinstance(number, bool) or not isinstance(url, str):
-        raise ActivityError(
-            "the pull request result is missing an integer number or a url",
-            code="activity_pr_response_invalid",
-            details={"number": repr(number), "url": repr(url)},
-        )
-    try:
-        return PullRequestRef(number=number, url=url, branch=branch, head_sha=sha)
-    except TaskStateError as exc:
-        raise ActivityError(
-            f"the pull request result is not representable in task state: {exc}",
-            code="activity_pr_response_invalid",
-            details={"cause": exc.as_dict()["error"]},
-        ) from exc
+open_pr = _publish_steps.open_pr
 
 
 # -- episode + notify --------------------------------------------------------------------

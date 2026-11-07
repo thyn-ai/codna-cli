@@ -37,6 +37,7 @@ from .contracts import (
 )
 from .state import TaskState
 from .workflow_support import (
+    approved_outcome,
     task_completion,
     approver_identity,
     initial_state,
@@ -107,7 +108,13 @@ class TaskWorkflow:
 
         await self._drive(state.to_payload())
         final = TaskState.from_payload(self._state)
-        outcome = self._outcome or ("approved" if final.pr is not None else "rejected")
+        # The fallback (`self._outcome` never set) is the same rule as an approval: a task whose
+        # review approved finished on success, and whether it was PUBLISHED is read from the state by
+        # the SHARED helper. `pr is not None` used to stand in for "approved", which would call a
+        # legitimately unpublished task rejected — the defect this change removes.
+        outcome = self._outcome or (
+            approved_outcome(final) if final.review_verdict == "approved" else "rejected"
+        )
         episode = await self._remember(final, outcome)
         await self._notify("task.finished", f"task {self._task_id} finished: {outcome}")
         return task_completion(
@@ -249,7 +256,11 @@ class TaskWorkflow:
         await self._notify(
             "approval.granted", f"task {self._task_id} approved by {identity}", actor=identity
         )
-        self._outcome = "budget_exhausted" if parked.get("budget_exhausted") else "approved"
+        if parked.get("budget_exhausted"):
+            self._outcome = "budget_exhausted"
+        else:
+            # The SHARED rule, so an unpublished task is `approved_unpublished` on both engines.
+            self._outcome = approved_outcome(TaskState.from_payload(self._state))
         return {"identity": identity, "approved": True}
 
     def _compile(self) -> Any:
@@ -351,6 +362,9 @@ class TaskWorkflow:
             "review_verdict": state.review_verdict,
             "verify_passed": state.verify_ref.passed if state.verify_ref else None,
             "pr": state.pr.to_payload() if state.pr else None,
+            # WHY there is no pull request, when there is none ON PURPOSE. See the plain engine's
+            # `status` for the reason the two must be reported together.
+            "publish_skip": state.publish_skip,
             "approvals": list(self._approvals),
             "nodes_run": list(self._nodes_run),
             "outcome": self._outcome,

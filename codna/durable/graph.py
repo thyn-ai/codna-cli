@@ -541,6 +541,10 @@ async def wait_for_human(state: dict[str, Any]) -> dict[str, Any]:
         "verify_ref": current.verify_ref.ref if current.verify_ref else None,
         "review_verdict": current.review_verdict,
         "pr": current.pr.to_payload() if current.pr else None,
+        # WHY there is no pull request, when there is none on purpose: a human being asked to approve
+        # the change must be able to read "the repository has no GitHub remote, so publishing was
+        # skipped" instead of "pr: null" and having to guess.
+        "publish_skip": current.publish_skip,
         "budget_exhausted": current.budget.exhausted,
     }
     decision = interrupt(prompt)

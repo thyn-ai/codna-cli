@@ -37,6 +37,7 @@ from .contracts import (
     NAME_WATCH_CI,
     NAME_WORKTREE_CLEANUP,
     RunProgress,
+    TaskOutcome,
     TaskSpec,
     TaskSummary,
 )
@@ -46,6 +47,7 @@ from .state import Budget, PendingApproval, TaskState
 __all__ = [
     "ACTIVITY_NAMES",
     "BOOKKEEPING_ACTIVITIES",
+    "approved_outcome",
     "park_kind",
     "park_reason",
     "workflow_activity",
@@ -189,6 +191,27 @@ def initial_state(spec: TaskSpec, remaining_usd: float | None) -> TaskState:
             unpriced_tokens=0,
         ),
     )
+
+
+def approved_outcome(state: TaskState) -> TaskOutcome:
+    """The outcome of a task whose review APPROVED — `approved`, or `approved_unpublished`.
+
+    PURE, and shared by both engines: the graph engine and the plain engine must not disagree about
+    whether an unpublished task succeeded, and the only state that can answer is the one the publish
+    step returned.
+
+    ``publish_skip`` set means publishing was SKIPPED (a repository with no GitHub remote, or a
+    remote that is not GitHub): the work is done — committed, verified and approved — and there was
+    nothing to open a pull request against. That is ``approved_unpublished`` rather than ``approved``,
+    because reporting it as a plain approval would let a reader claim a pull request exists when none
+    does. A REFUSAL (a GitHub remote with no token) never reaches here: it is an activity failure, so
+    the task fails loudly instead of finishing as if publishing had been unnecessary.
+
+    A state with neither a pull request nor a skip is still ``approved`` here: this function is only
+    called on the approved path, and the older histories it must replay reached that point with a
+    ``pr`` (or with the old hard failure, which never produced a completion at all).
+    """
+    return "approved_unpublished" if state.publish_skip is not None else "approved"
 
 
 def approver_identity(payload: Any, *, handler: str) -> str:

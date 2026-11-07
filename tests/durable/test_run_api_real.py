@@ -64,6 +64,9 @@ def _git_repo(path: Path) -> Path:
         ["git", "init", "-q", "-b", "main"],
         ["git", "config", "user.email", "test@codna.ai"],
         ["git", "config", "user.name", "test"],
+        # The run's last step publishes: with a GitHub origin it takes the normal `open_pr` path
+        # (through the harness's scripted push), so these tests exercise the route they describe.
+        ["git", "remote", "add", "origin", "https://github.com/thyn-ai/codna.git"],
         ["git", "add", "-A"],
         ["git", "commit", "-q", "-m", "init"],
     ):
