@@ -1379,3 +1379,64 @@ def test_pr_head_now_is_best_effort(monkeypatch):
     monkeypatch.setattr(rg, "fetch_pr", boom)
     assert review._pr_head_now("o/r", 5, "t") is None
     assert review._pr_head_now(None, 5, "t") is None and review._pr_head_now("o/r", None, "t") is None
+
+
+# ---- the provider a review runs on (durable runs) ----------------------------------------------
+#
+# A durable run names its provider on the TaskSpec (`codna run --provider ollama`), and the REVIEW
+# step is the one step that is not a turn activity: it goes through the packaged runner, which used to
+# read the provider ONLY from the process environment. So a run configured for a keyless local provider
+# planned, implemented, verified and checkpointed on it and then failed its review with
+# "no API key in env for 'anthropic'" — a provider nobody configured. Measured on this host:
+# run-20261107T165622Z reached ledger `verify passed` and died at review.
+
+def test_the_review_request_carries_the_provider_it_was_given(monkeypatch, tmp_path):
+    """The coordinates reach the request, not just the prompt's model id."""
+    seen = _stub_sidecar(monkeypatch, [_Result('{"findings": []}')])
+    rf.run_review_agent(
+        str(tmp_path),
+        "Review ...",
+        provider="ollama",
+        model="qwen3-coder:latest",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+    assert seen[0].provider == "ollama"
+    assert seen[0].base_url == "http://127.0.0.1:11434/v1"
+    # The model id is still provider-qualified for the engine, which parses `provider/model`.
+    assert seen[0].model == "ollama/qwen3-coder:latest"
+
+
+def test_the_review_request_defaults_to_anthropic_when_nothing_is_named(monkeypatch, tmp_path):
+    """`codna review` has no spec to inherit from, so its behaviour is unchanged."""
+    seen = _stub_sidecar(monkeypatch, [_Result('{"findings": []}')])
+    rf.run_review_agent(str(tmp_path), "Review ...")
+    assert seen[0].provider == "anthropic"
+    assert seen[0].base_url is None
+
+
+def test_run_diff_review_forwards_the_provider_to_the_agent(monkeypatch, tmp_path):
+    """The public entry point is the one the durable step calls; it must not drop the coordinates."""
+    captured = {}
+
+    def fake_agent(repo_dir, prompt, **kw):
+        captured.update(kw)
+        return [{"path": "a.py", "line": 1}], {"model": "m"}
+
+    monkeypatch.setattr(rf, "run_review_agent", fake_agent)
+    monkeypatch.setattr(
+        rf,
+        "compute_diff",
+        lambda *a, **k: ("diff --git a/a.py b/a.py\n+print(1)\n", ["a.py"]),
+    )
+    rf.run_diff_review(
+        str(tmp_path),
+        repository="local",
+        base="HEAD",
+        config=rf.ReviewConfig(),
+        provider="ollama",
+        model="qwen3-coder:latest",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+    assert captured["provider"] == "ollama"
+    assert captured["model"] == "qwen3-coder:latest"
+    assert captured["base_url"] == "http://127.0.0.1:11434/v1"

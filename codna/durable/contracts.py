@@ -227,7 +227,18 @@ NAME_WORKTREE_CLEANUP: Final = "codna.step.worktree_cleanup"
 # in it would be a field nothing validates, growing with the request, in the one place that must not.
 GRAPH_ENGINES: Final[tuple[GraphEngine, ...]] = ("langgraph", "plain")
 
-TaskOutcome = Literal["approved", "rejected", "budget_exhausted", "stopped"]
+# What happened to a TASK. `approved` means the work passed review AND was published; a task whose
+# review approved but whose repository had nothing to publish to finishes `approved_unpublished` —
+# the same work, truthfully reported, rather than a failure that would read as broken code. The name
+# is a SIBLING of `approved` (not a separate axis) because every consumer already distinguishes
+# success from non-success by this one value, and a task-level "was it published" flag beside an
+# `approved` outcome would let a reader who only saw the outcome claim a pull request exists.
+#
+# Additive and safe: a consumer that does not know the new value sees a non-`completed` string it can
+# render, and the RUN stays `completed` (the work IS done) — see `RunWorkflow`.
+TaskOutcome = Literal[
+    "approved", "approved_unpublished", "rejected", "budget_exhausted", "stopped"
+]
 
 # Ceilings, not detectors. The turn activity heartbeats every 10s (see `activities.run_cline_turn`),
 # so a wedged worker is retried seconds after it dies; these are the outer limits for a turn that is

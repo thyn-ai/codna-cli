@@ -37,6 +37,11 @@ TERMINAL_OK = "session.turn_completed"
 TERMINAL_FAILED = "session.turn_failed"
 TERMINAL_ABORTED = "session.turn_aborted"
 
+# The origin every harness repository carries by default, so the publish step finds a GitHub remote
+# and the scripted push is what runs. `make_repo(..., origin=None)` builds the local-only repository
+# instead — the case the product actually meets and the one `publish_skip` exists for.
+GITHUB_ORIGIN = "https://github.com/thyn-ai/codna.git"
+
 
 @dataclass
 class FakeTurn:
@@ -489,6 +494,11 @@ class Harness:
                 route.append(record.kind)
             elif record.kind == "note" and record.payload.get("event") == "pull_request.opened":
                 route.append("open_pr")
+            elif record.kind == "note" and record.payload.get("event") == "publish.skipped":
+                # The publish step RAN and recorded why it published nothing. Kept as its own route
+                # entry rather than dropped, so "the route ends at review because `open_pr` never
+                # ran" stays distinguishable from "it ran and skipped".
+                route.append("open_pr_skipped")
         return route
 
     def checkpoints(self, run_id: str = "run-1") -> list[dict[str, Any]]:
@@ -572,13 +582,21 @@ def git(repo: Path, *args: str) -> str:
     return completed.stdout
 
 
-def make_repo(path: Path) -> Path:
-    """A real repository on ``main`` with one commit, ready for the checkpoint activity."""
+def make_repo(path: Path, *, origin: str | None = GITHUB_ORIGIN) -> Path:
+    """A real repository on ``main`` with one commit, ready for the checkpoint activity.
+
+    ``origin`` is a REAL remote (`git remote add`), not a stubbed helper, because it is what the
+    publish step probes: with one, a task publishes (through the harness's scripted push); with
+    ``None`` the repository is local-only and publishing is SKIPPED. A fixture that faked the origin
+    would test the fake, and the "no remote" case is exactly what this suite must be able to build.
+    """
     path.mkdir(parents=True, exist_ok=True)
     (path / "app.py").write_text("def hello():\n    return 'hello'\n", encoding="utf-8")
     git(path, "init", "-q", "-b", "main")
     git(path, "config", "user.email", "test@codna.ai")
     git(path, "config", "user.name", "test")
+    if origin:
+        git(path, "remote", "add", "origin", origin)
     git(path, "add", "-A")
     git(path, "commit", "-q", "-m", "init")
     return path

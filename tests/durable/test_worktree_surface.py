@@ -125,6 +125,9 @@ def _git_repo(path: Path) -> Path:
         ["git", "init", "-q", "-b", "main"],
         ["git", "config", "user.email", "test@codna.ai"],
         ["git", "config", "user.name", "test"],
+        # A GitHub origin, so the run's publish step takes the normal path rather than correctly
+        # SKIPPING (which its own tests cover) on the route these tests describe.
+        ["git", "remote", "add", "origin", "https://github.com/thyn-ai/codna.git"],
         ["git", "add", "-A"],
         ["git", "commit", "-q", "-m", "init"],
     ):

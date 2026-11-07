@@ -23,12 +23,25 @@ one object and one seam.
 from __future__ import annotations
 
 import contextlib
-import time
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
 from . import cli as _cli
 from .config import DurableConfig, validate_run_id
+from .errors import cli_error
+# The wait loop and the exit-code contract live in their own module (see `run_wait.py`); these
+# names are RE-EXPORTED because every caller of `codna durable run --wait` addresses this module,
+# and because `cli.py` exposes them as the CLI's test seams.
+from .run_wait import (  # noqa: F401 - re-exported
+    EXIT_NOT_SUCCESS,
+    _exit_for_closed_run,
+    _run_is_finished,
+    _wait_run,
+    query_workflow,
+    workflow_completion,
+    workflow_failure_report,
+    workflow_outcome,
+)
 # The closed set of credential sources, imported at module scope: `contracts` is a sandbox-clean leaf
 # (stdlib + dataclasses), so this keeps `run_cli` importable without the durable extra — and it means
 # a `--provider-key-source` the contract would refuse cannot be typed into the parser at all.
@@ -79,18 +92,18 @@ __all__ = [
 DEFAULT_RUN_TIMEOUT_S: Final = 7 * 24 * 60 * 60
 DEFAULT_WAIT_POLL_S: Final = 2.0
 
-# Exit code for "the command ran, the run is not in a success state" (shared with `cli.py`).
-EXIT_NOT_SUCCESS: Final = 2
+# Exit code for "the command ran, the run is not in a success state". Defined in `run_wait.py` (which
+# computes it) and re-exported above, so there is ONE number rather than two that agree for now.
+# `Final` is not re-stated here: this name is an import, not a second definition.
 
 
 def _error(message: str, *, code: str, details: dict[str, object] | None = None, hint: str = "") -> Any:
-    """The CLI's error type, constructed lazily.
+    """The CLI's error type, from the ONE definition in `errors.py`.
 
-    `DurableCliError` is re-exported by `cli.py`, which imports THIS module for registration — so
-    reaching it through the module object avoids a cycle and keeps one definition: a test that swaps
-    `cli.DurableCliError` sees the change here too.
+    Bound here as a module-level alias rather than re-implemented: `run_cli` already imports `errors`
+    for the class, and a second copy is how the hint or the code style drifts between commands.
     """
-    return _cli.DurableCliError(message, code=code, details=details, hint=hint)
+    return cli_error(message, code=code, details=details, hint=hint)
 
 
 # -- the run spec --------------------------------------------------------------------------
@@ -431,91 +444,6 @@ async def _start_run(
     pin_report["build_id"] = config.build_id
     setattr(handle, "codna_pin_report", pin_report)  # noqa: B010 - attribute on a foreign object
     return handle
-
-
-async def _wait_run(
-    client: Any,
-    config: DurableConfig,
-    run_id: str,
-    *,
-    poll_s: float,
-    timeout_s: float,
-    stop: Any | None = None,
-) -> int:
-    """Poll the run's status until it completes, printing each change as JSON.
-
-    Polling a QUERY (not ``result()``) so a parked task is visible while it is parked: ``result()``
-    would block for the whole approval wait with no output, which reads as a hung command.
-
-    ``stop`` (an ``asyncio.Event``) ends the wait when a signal arrives — the in-process worker's
-    SIGINT/SIGTERM sets it. The run itself is NOT cancelled: it lives on the server, so "stop waiting"
-    must leave a resumable run rather than destroy one the user paid for. The exit code says so.
-    """
-    import asyncio
-
-    from .run_workflow import RunWorkflow
-
-    if poll_s <= 0:
-        raise _error(
-            "--poll-interval must be positive.",
-            code="durable_poll_interval_invalid",
-            details={"poll_interval": poll_s},
-        )
-    deadline = time.monotonic() + timeout_s
-    last: dict[str, Any] | None = None
-    while True:
-        status = await query_workflow(client, config.run_workflow_id(run_id), RunWorkflow.status)
-        if status != last:
-            _cli._print({"status": status})
-            last = status
-        if _run_is_finished(status):
-            return 0 if status.get("outcome") == "completed" else EXIT_NOT_SUCCESS
-        if stop is not None and stop.is_set():
-            _cli._print(
-                {
-                    "detached": {
-                        "run_id": run_id,
-                        "workflow_id": config.run_workflow_id(run_id),
-                        "note": "the run continues on the server; reattach with "
-                        f"`codna durable status --run {run_id} --wait`",
-                    }
-                }
-            )
-            return EXIT_NOT_SUCCESS
-        if time.monotonic() >= deadline:
-            raise _error(
-                f"run {run_id} did not finish within {timeout_s:g}s.",
-                code="durable_run_wait_timeout",
-                details={"run_id": run_id, "timeout_s": timeout_s, "last_status": status},
-                hint="the run continues on the server; check `codna durable status --run`",
-            )
-        await asyncio.sleep(poll_s)
-
-
-def _run_is_finished(status: Mapping[str, Any]) -> bool:
-    """A run reports ``outcome`` only in its completion; a running one has not reached it."""
-    return status.get("outcome") in ("completed", "budget_exhausted", "stopped")
-
-
-async def query_workflow(client: Any, workflow_id: str, query: Any) -> dict[str, Any]:
-    """Read one workflow's QUERY result, reporting a closed/unknown workflow as a CLI error.
-
-    Public (not ``_query``) because `cli.py`'s status/approval commands query too. One definition:
-    the "workflow may be gone" message and its hint must not differ between `status` and `--wait`.
-    """
-    from temporalio.common import QueryRejectCondition
-
-    handle = client.get_workflow_handle(workflow_id)
-    try:
-        result = await handle.query(query, reject_condition=QueryRejectCondition.NOT_OPEN)
-    except Exception as exc:  # noqa: BLE001 - a closed/unknown workflow is a CLI-level answer
-        raise _error(
-            f"could not query workflow {workflow_id}: {exc}",
-            code="durable_query_failed",
-            details={"workflow_id": workflow_id},
-            hint="the workflow may not exist yet, or may have completed and been removed by retention",
-        ) from exc
-    return dict(result)
 
 
 async def _run_with_worker(
