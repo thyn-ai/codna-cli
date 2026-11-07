@@ -40,7 +40,7 @@ from .contracts import (
     TaskSpec,
     TaskSummary,
 )
-from .graph import STEP_TIMEOUT_S
+from .graph import ACTIVITY_RETRIES, STEP_TIMEOUT_S
 from .state import Budget, PendingApproval, TaskState
 
 __all__ = [
@@ -87,11 +87,9 @@ BOOKKEEPING_ACTIVITIES: Final[frozenset[str]] = frozenset(
     {NAME_EPISODE, NAME_NOTIFY, NAME_WORKTREE_CLEANUP, NAME_RECALL, NAME_WATCH_CI}
 )
 
-# A transport-level retry bound, distinct from the workflow's SEMANTIC bound (verify-fail →
-# implement, review-reject → implement, both capped by `max_attempts`). An activity failing the same
-# way four times will not succeed on the fifth, and an unbounded server-side retry means the workflow
-# never learns the turn is dead — the run would look alive forever.
-_ACTIVITY_RETRIES: Final = 3
+# The transport-level retry bound lives in `graph.py` beside `STEP_TIMEOUT_S`, because BOTH engines
+# read it: `workflow_activity` here (plain) and `_plugin_activity_options()` there (the graph engine,
+# which could not import this module). Keeping a second copy here is what let the two drift.
 
 
 def activity_timeout(name: str) -> timedelta:
@@ -141,7 +139,7 @@ def result_type(name: str) -> type:
 def _retry_policy() -> Any:
     from temporalio.common import RetryPolicy
 
-    return RetryPolicy(maximum_attempts=_ACTIVITY_RETRIES)
+    return RetryPolicy(maximum_attempts=ACTIVITY_RETRIES)
 
 
 def workflow_activity(name: str, request: Any) -> Any:

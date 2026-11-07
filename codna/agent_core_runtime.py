@@ -33,6 +33,7 @@ from .runtime.health import (
     wait_until_ready,
 )
 from .runtime.local_stack import LocalRuntimeError, _log_paths, _sidecar_spawn
+from .runtime.policy_reader import policy_reader_env
 from .runtime.ports import ListenerInfo, listeners_on_port
 from .runtime.processes import (
     ensure_directories,
@@ -673,6 +674,11 @@ def _start_sidecar(
     rotate_log(sidecar_log, max_bytes=LOG_ROTATE_BYTES, backups=LOG_ROTATE_FILES)
     runtime_id = str(uuid.uuid4())
     command, cwd, env = _sidecar_spawn(config, runtime_id, keys=keys)
+    # The sidecar's policy reader shells out to `python -m codna.policy_cli` under
+    # PYTHONNOUSERSITE=1; without this every session is refused 403 policy_verdict_unavailable.
+    # Applied HERE rather than in `_sidecar_spawn` because `local_stack.py` sits at the 1000-line
+    # modularity ceiling, and this is the one place the sidecar is actually launched with this env.
+    policy_reader_env(env)
     ready_timeout_s = _agent_core_ready_timeout_seconds()
     process = spawn_detached_process(command, cwd=cwd, env=env, log_path=sidecar_log)
     probe = wait_until_ready(
