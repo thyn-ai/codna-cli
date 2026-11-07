@@ -78,3 +78,29 @@ def test_the_provider_comes_from_the_same_place(monkeypatch):
     monkeypatch.setenv("CODNA_AGENT_PROVIDER", "ollama")
     payload = par._sidecar_payload(_request(), Path("/tmp"))
     assert payload["provider"] == "ollama"
+
+
+def test_an_explicit_coordinate_beats_the_environment(monkeypatch):
+    """A caller that names a provider has already decided (the durable run's TaskSpec).
+
+    The environment is the fallback for the CLI's own commands, which have no spec to inherit from. If
+    the environment won, a durable run started for Ollama could be redirected to whatever a developer's
+    shell happened to export — and would bill the wrong provider for every review.
+    """
+    monkeypatch.setenv("ALGENTA_AGENT_PROVIDER", "anthropic")
+    monkeypatch.setenv("CODNA_AGENT_MODEL", "claude-sonnet-4")
+    monkeypatch.setenv(config_file.BASE_URL_ENV, "https://llm.example.com/v1")
+    payload = par._sidecar_payload(
+        _request(provider="ollama", model_id="qwen3-coder:latest", base_url="http://127.0.0.1:11434/v1"),
+        Path("/tmp"),
+    )
+    assert payload["provider"] == "ollama"
+    assert payload["model"] == "qwen3-coder:latest"
+    assert payload["base_url"] == "http://127.0.0.1:11434/v1"
+
+
+def test_an_absent_coordinate_leaves_the_environment_in_charge(monkeypatch):
+    """`codna review` (no spec) keeps reading the developer's own configuration."""
+    monkeypatch.setenv("ALGENTA_AGENT_PROVIDER", "ollama")
+    payload = par._sidecar_payload(_request(), Path("/tmp"))
+    assert payload["provider"] == "ollama"

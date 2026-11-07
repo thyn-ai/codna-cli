@@ -130,13 +130,18 @@ def _sidecar_payload(request: PackagedAgentRunRequest, workspace: Path) -> dict[
     timeout_ms = _timeout_ms_for_request(request)
     max_turns = _max_turns_for_request(request)
     requested_provider, requested_model = _provider_model_from_request(request.model)
+    # DURABLE REVIEW: an explicit source beats BOTH environment variables when set, because a caller
+    # that names a provider has already decided; the environment stays the fallback for the CLI's own
+    # `codna review`, which has no spec to inherit from. See `PackagedAgentRunRequest.provider`.
     provider = (
-        os.environ.get("ALGENTA_AGENT_PROVIDER")
+        (request.provider or "").strip()
+        or os.environ.get("ALGENTA_AGENT_PROVIDER")
         or os.environ.get("CODNA_AGENT_PROVIDER")
         or requested_provider
     )
     model = (
-        os.environ.get("ALGENTA_AGENT_MODEL")
+        (request.model_id or "").strip()
+        or os.environ.get("ALGENTA_AGENT_MODEL")
         or os.environ.get("CODNA_AGENT_MODEL")
         or requested_model
     )
@@ -177,9 +182,12 @@ def _sidecar_payload(request: PackagedAgentRunRequest, workspace: Path) -> dict[
     if model:
         payload["model"] = model
     # The provider ENDPOINT override. It may only come from the user's own config (`~/.codna/config.yaml`,
-    # applied to CODNA_AGENT_BASE_URL by config_file) or the environment — never from a repository file, and
-    # never from the run request. The engine validates and normalizes it again on arrival.
-    base_url = (os.environ.get(BASE_URL_ENV) or "").strip()
+    # applied to CODNA_AGENT_BASE_URL by config_file), the environment, or — for a durable run — the
+    # `TaskSpec` the caller already validated (`durable/provider.py` enforces the same loopback rule), never
+    # from a repository file. The engine validates and normalizes it again on arrival.
+    base_url = (getattr(request, "base_url", None) or "").strip() or (
+        os.environ.get(BASE_URL_ENV) or ""
+    ).strip()
     if base_url:
         payload["base_url"] = base_url
     return payload

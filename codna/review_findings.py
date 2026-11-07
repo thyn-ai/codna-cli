@@ -557,6 +557,7 @@ def run_diff_review(
     head_sha: str | None = None,
     model: str | None = None,
     provider: str = "anthropic",
+    base_url: str | None = None,
     max_iterations: int | None = None,
     timeout_s: int | None = None,
     diff_paths: list[str] | None = None,
@@ -584,7 +585,7 @@ def run_diff_review(
     resolved_head = head_sha or resolve_head_sha(repo_dir, diff_range)
     prompt = build_review_prompt(diff_text, changed, guidance, config, prior_feedback)
     raw, agent = run_review_agent(
-        repo_dir, prompt, provider=provider, model=model,
+        repo_dir, prompt, provider=provider, model=model, base_url=base_url,
         max_iterations=iterations, timeout_s=timeout_s,
         changed_lines=diff_changed_lines(diff_text), changed_files=len(changed),
     )
@@ -609,6 +610,7 @@ def run_review_agent(
     *,
     provider: str = "anthropic",
     model: str | None = None,
+    base_url: str | None = None,
     max_iterations: int = 12,
     timeout_s: int | None = None,
     changed_lines: int = 0,
@@ -665,6 +667,11 @@ def run_review_agent(
                 "raw_repo_token_estimate": prompt_tokens,
             },
             task_kind="review",
+            # DURABLE REVIEW: the provider the caller resolved, so a run on a keyless local provider
+            # does not get its review sent to the engine's `anthropic` default. See
+            # `PackagedAgentRunRequest.provider`.
+            provider=provider,
+            base_url=base_url,
         )
         started = time.monotonic()
         try:

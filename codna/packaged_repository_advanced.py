@@ -35,6 +35,22 @@ class PackagedAgentRunRequest:
     evidence_bundle: dict[str, Any]
     snapshot: dict[str, Any]
     task_kind: str = "fix"
+    # DURABLE REVIEW: the provider the CALLER already resolved for this work, when it has one.
+    #
+    # A durable run names its provider on the `TaskSpec` (`codna run --provider ollama`), which the
+    # turn activities honour — but the review step is not a turn activity: it goes through this runner,
+    # which until now read the provider ONLY from the process environment (`ALGENTA_AGENT_PROVIDER` /
+    # `CODNA_AGENT_PROVIDER`). So a run configured for a keyless local provider planned, implemented,
+    # verified and checkpointed on it, then had its review die with `no API key in env for 'anthropic'`
+    # — a provider nobody configured. Measured on this host: run-20261107T165622Z reached ledger
+    # `verify passed` and failed at `review`.
+    #
+    # These coordinates are EXPLICIT SOURCES and beat BOTH environment variables when set, because a caller
+    # that names a provider has already decided; the environment stays the fallback for the CLI's own
+    # `codna review`, which has no spec to inherit from.
+    provider: str | None = None
+    model_id: str | None = None
+    base_url: str | None = None
 
 
 @dataclass(frozen=True)
