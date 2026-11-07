@@ -76,6 +76,22 @@ def cmd_serve(args: Any) -> int:
     if not getattr(args, "no_temporal", False):
         require_durable()
     config = _cli_module()._config(args)
+    # THE STACK, IN ONE COMMAND. `--start-dev-server` brings Temporal up (idempotently: `ensure_started`
+    # adopts a server that is already answering) BEFORE the backend connects, so the very next thing this
+    # process does — `TemporalRunBackend(config)` — finds the address live instead of refusing. Refused
+    # beside `--no-temporal`, where there is no Temporal client to connect at all: accepting the pair would
+    # silently do nothing, and a flag that does nothing is the class of defect this whole surface exists to
+    # stop shipping.
+    if getattr(args, "start_dev_server", False):
+        if getattr(args, "no_temporal", False):
+            raise _error(
+                "--start-dev-server cannot be combined with --no-temporal.",
+                code="serve_start_dev_server_conflict",
+                details={"start_dev_server": True, "no_temporal": True},
+                hint="drop --no-temporal to use durable mode, or drop --start-dev-server for ledger-only mode",
+            )
+        with _cli_module()._dev_server_errors():
+            _cli_module()._dev_server(config).ensure_started(timeout_s=args.start_timeout)
     try:
         settings = RunApiSettings.for_config(
             config,
@@ -296,6 +312,20 @@ def add_serve_flags(serve: Any) -> None:
                        help="LEDGER-ONLY mode: serve GET /runs and /runs/:id/events (the run list and "
                             "its history); starting or controlling a run is refused with "
                             "run_api_temporal_disabled. Needs no Temporal server and no durable extra.")
+    # ONE COMMAND INSTEAD OF TWO, and the reason is the product, not convenience. The IDE cannot start a
+    # task unless this API is up in DURABLE mode, which needs a Temporal server. Every message that told a
+    # user to run `codna durable dev-server start` and THEN `codna serve` asked them to keep two processes
+    # alive by hand, and a user who ran only the second got `run_api_temporal_unavailable`. This flag makes
+    # the documented remedy a single command, and it is the same flag `codna worker` already carries, so the
+    # two execution surfaces start their dependency the same way.
+    #
+    # It is OPT-IN, deliberately: starting a background server is a side effect on the user's machine, so it
+    # happens when a person (or the IDE, with consent) asks for it — never as a silent default of `serve`.
+    serve.add_argument("--start-dev-server", action="store_true",
+                       help="start the local Temporal dev server first if it is not running, then serve in "
+                            "durable mode (one command instead of `codna durable dev-server start` + `codna serve`)")
+    serve.add_argument("--start-timeout", type=float, default=60.0,
+                       help="how long --start-dev-server may take to bring Temporal up (default: 60)")
     # -- the identity layer ------------------------------------------------------------------
     #
     # `token` is the default because it is what every existing caller already has. `oidc` is the

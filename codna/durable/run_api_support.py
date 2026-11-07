@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, Final, Mapping
 
 from .config import DurableConfigError, validate_run_id
 from .ledger import GENESIS_HASH, LedgerError, LedgerRecord, compute_hash
+from . import repo_validation
 from ..runtime.processes import ensure_directories
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; `config` reaches httpx, which a leaf must not
@@ -351,7 +352,9 @@ def constant_time_token_equals(expected: str, provided: str) -> bool:
 # -- settings ----------------------------------------------------------------------------------
 
 
-ALLOWED_REPO_ROOTS_ENV: Final = "CODNA_DURABLE_REPO_ROOTS"
+# The spelling lives in `repo_validation`, beside the refusal that tells a reader which variable widens the
+# boundary; re-exported here so the settings layer and every caller keep one import site.
+ALLOWED_REPO_ROOTS_ENV: Final = repo_validation.ALLOWED_REPO_ROOTS_ENV
 
 
 def allowed_repo_roots_from_env(env: Mapping[str, str] | None = None) -> tuple[Path, ...]:
