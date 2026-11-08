@@ -933,7 +933,6 @@ _TAIL_WINDOW_BYTES: Final = 64 * 1024
 # so a small bound finds it without turning a summary into a full scan.
 _OUTCOME_SCAN_RECORDS: Final = 32
 
-
 def _tail_records(path: Path, *, limit: int) -> list[LedgerRecord]:
     """Up to ``limit`` complete records from the end of the file, reading only the last 64 KiB."""
     try:

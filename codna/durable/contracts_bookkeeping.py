@@ -138,6 +138,20 @@ class NotifyRequest:
     # executed an Update, from the Update's own payload — never from anything the workflow observed
     # outside it, so a replay derives the same value. Empty for notifications nobody caused.
     actor: str = ""
+    # WHICH CHECKOUT this run works in, carried by the run's opening notification so ``GET /runs`` can
+    # say which repository a run belongs to. Without it every row is labelled with whatever folder the
+    # window happens to have open, so a run from repo A is listed under repo B the moment the IDE is
+    # reopened elsewhere.
+    #
+    # It rides on an EXISTING activity call rather than a new one on purpose: a run's history replays
+    # its COMMAND sequence, and a second bookkeeping activity would make every recorded history
+    # diverge — the one kind of change replay cannot absorb. The value is the run spec's own
+    # ``repo_dir``, which `RunSpec.validate` has already required to be absolute; a replay therefore
+    # derives the same string from the same input.
+    #
+    # ``""`` means "this notification is not about a checkout", which is every notification except the
+    # opening one — so the field costs nothing on the rows that cannot use it.
+    repo_dir: str = ""
 
     def validate(self) -> None:
         _require_ref(self.run_id, "run_id")
@@ -181,6 +195,21 @@ class NotifyRequest:
                 "a notification may not carry secret-like data",
                 code="contract_contains_secret",
                 details={"findings": findings},
+            )
+        if not isinstance(self.repo_dir, str):
+            raise ContractError(
+                "notify repo_dir must be a string",
+                code="contract_invalid",
+                details={"field": "repo_dir", "type": type(self.repo_dir).__name__},
+            )
+        if self.repo_dir and not self.repo_dir.startswith("/"):
+            # The same rule `RunSpec.repo_dir` is held to, restated here because this value is what
+            # `GET /runs` reports: a relative path would be resolved against whatever directory the
+            # reader happened to be in, which is a different run than the one recorded.
+            raise ContractError(
+                "notify repo_dir must be an absolute path",
+                code="contract_invalid",
+                details={"field": "repo_dir"},
             )
 
 

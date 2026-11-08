@@ -35,6 +35,7 @@ from .config import GRAPH_ENGINES, validate_run_id
 from .ledger import LedgerError
 from .roles import Principal, required_role, route_key
 from .run_api_backend import translate
+from .run_repo import repo_dir_of
 from .run_api_support import (
     DEFAULT_LIST_LIMIT,
     MUTATION_ROUTES,
@@ -658,6 +659,11 @@ class RunApiHandler(BaseHTTPRequestHandler):
                         "updated_ts": round(stat.st_mtime, 6),
                         "ledger_bytes": stat.st_size,
                         "last_seq": last_seq_of(ledger_path),
+                        # WHICH REPOSITORY this run works in, so a row can be labelled by the fact rather
+                        # than by whichever folder the reading window has open. `None` for a ledger
+                        # written before the field existed: a caller must present that as unknown, not
+                        # substitute its own workspace and call it the run's.
+                        "repo_dir": repo_dir_of(ledger_path),
                         "outcome": verdict["outcome"],
                         # `ended` is the fact that stops a spinner, reported apart from `outcome`
                         # because a ledger can prove its run is over while saying nothing about why.

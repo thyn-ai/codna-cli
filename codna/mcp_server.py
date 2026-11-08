@@ -74,6 +74,47 @@ def _mcp_memory_db_path(repo: str) -> str:
     return str(_mcp_memory_root() / "mcp" / digest)
 
 
+def load_skill_json(repo: str = ".", name: str = "") -> str:
+    """The body of ``codna_load_skill``, as a module-level function.
+
+    Defined HERE rather than only inside ``_build_server`` for the same reason ``fix_json`` /
+    ``secure_json`` / ``recall_json`` are: the minimal-dependency CI lane installs no ``mcp`` extra, so a
+    tool whose only test is behind that extra is a tool that is never tested there. The registered tool
+    below is a thin wrapper over this, so there is one implementation and two ways to reach it.
+
+    Returns the skill as JSON (body + bundled file paths), or a structured ``skill_not_found`` — never a
+    raise, because a tool must answer.
+    """
+    if not name or not name.strip():
+        return "codna_load_skill error: name is required"
+    try:
+        from .rules import load_skill
+
+        skill = load_skill(repo, name)
+    except Exception as exc:  # noqa: BLE001 — surface as tool text, never crash the server
+        return f"codna_load_skill error: {exc}"
+    if skill is None:
+        return json.dumps({
+            "error": {
+                "code": "skill_not_found",
+                "message": f"no skill named {name!r}",
+                "details": {"requested": name, "repo": repo},
+            },
+        }, indent=2)
+    return json.dumps({
+        "name": skill.name,
+        "scope": skill.scope.value,
+        "mode": skill.mode.value,
+        "source_path": skill.source_path,
+        "description": skill.description,
+        "paths": list(skill.paths),
+        # Paths RELATIVE TO THE SKILL FOLDER, so the body's references resolve without the reader
+        # having to know where the repository is checked out.
+        "bundled": list(skill.bundled),
+        "body": skill.body,
+    }, indent=2)
+
+
 def recall_json(repo: str = ".", query: str = "", service: str = "", language: str = "",
                 final_k: int = 8) -> str:
     """Return local Telys memory recall as JSON without crashing the MCP server."""
@@ -447,6 +488,91 @@ def _build_server():
         """
         return await asyncio.to_thread(report_bug_json, title, body, product, include_diagnostics)
 
+    @server.tool(annotations=ToolAnnotations(
+        title="Pull one project rule by name",
+        readOnlyHint=True,
+        idempotentHint=True,
+        # It only reads markdown inside the repository; it opens no connection and writes nothing.
+        openWorldHint=False,
+    ))
+    def codna_request_rule(repo: str = ".", name: str = "") -> str:
+        """Fetch the FULL text of one project rule, by the name the prompt catalogued.
+
+        Codna attaches `alwaysApply` and glob-matched rules in full, but a rule with only a
+        `description` is catalogued as a single line so it costs a token, not a kilobyte, on the turns
+        it has nothing to do with. Call this when that line looks relevant: `name` is the identifier
+        the catalog printed, with or without a leading `@`.
+
+        Requires the one-time free `codna login` device authorization (free community
+        license); fully offline thereafter.
+
+        repo: a local path (default: current directory).
+        name: the rule name from the catalog, e.g. "python" or "@python".
+        Returns the rule's scope, source path and full body, or a structured `rule_not_found`.
+        """
+        gate = _login_required_error("codna_request_rule")
+        if gate:
+            return gate
+        if not name or not name.strip():
+            return "codna_request_rule error: name is required"
+        try:
+            from .rules import request_rule
+
+            rule = request_rule(_default_repo(repo), name)
+        except Exception as exc:  # noqa: BLE001 — surface as tool text, never crash the server
+            return f"codna_request_rule error: {exc}"
+        if rule is None:
+            return json.dumps({
+                "error": {
+                    "code": "rule_not_found",
+                    "message": f"no rule named {name!r}",
+                    "details": {"requested": name, "repo": _default_repo(repo)},
+                },
+            }, indent=2)
+        return json.dumps({
+            "name": rule.name,
+            "scope": rule.scope.value,
+            "mode": rule.mode.value,
+            "source_path": rule.source_path,
+            "base_dir": rule.base_dir,
+            "description": rule.description,
+            "globs": list(rule.globs),
+            "body": rule.body,
+        }, indent=2)
+
+    @server.tool(annotations=ToolAnnotations(
+        title="Pull one skill's instructions by name",
+        readOnlyHint=True,
+        idempotentHint=True,
+        # It only reads markdown inside the repository; it opens no connection and writes nothing.
+        openWorldHint=False,
+    ))
+    def codna_load_skill(repo: str = ".", name: str = "") -> str:
+        """Fetch one skill's FULL instructions, by the name the prompt catalogued.
+
+        The prompt carries a CATALOGUE of skills — one line each with the name, the description and
+        the `paths` they apply to — and never their bodies. That is what keeps a repository with
+        dozens of skills from costing dozens of full prompts on every turn. Call this when a catalogue
+        line looks relevant: `name` is the identifier it printed, with or without a leading `/` or `@`.
+
+        The SAME pull serves `/skill-name`: a skill the user invokes and a skill you ask for are the
+        same body through the same tool, so the two can never diverge.
+
+        Requires the one-time free `codna login` device authorization (free community
+        license); fully offline thereafter.
+
+        repo: a local path (default: current directory).
+        name: the skill name from the catalogue, e.g. "pdf-processing" or "/pdf-processing".
+        Returns the skill's scope, source path, body and the files it ships beside its SKILL.md
+        (`scripts/`, `references/`, `assets/`), or a structured `skill_not_found`.
+        """
+        gate = _login_required_error("codna_load_skill")
+        if gate:
+            return gate
+        # The SAME function the module-level body exposes, so the minimal-dependency lane tests the real
+        # implementation rather than a second copy that could drift from it.
+        return load_skill_json(_default_repo(repo), name)
+
     @server.resource("codna://capabilities")
     def capabilities() -> str:
         """codna's MCP capabilities — @-mentionable so the client knows what codna offers."""
@@ -458,6 +584,10 @@ def _build_server():
                 "codna_secure": "prove which scanner findings are reachable (read-only)",
                 "codna_recall": "recall code from local on-device memory",
                 "codna_report_bug": "file a bug/feature/question to thyn-ai/feedback",
+                "codna_request_rule": "pull one project rule's full text by name (the description-only "
+                                      "rules the prompt only catalogues)",
+                "codna_load_skill": "pull one skill's full instructions by name (the skills the prompt "
+                                    "only catalogues), including the files it ships",
             },
             "default_repo": os.environ.get("CODNA_MCP_DEFAULT_REPO", "."),
         }, indent=2)

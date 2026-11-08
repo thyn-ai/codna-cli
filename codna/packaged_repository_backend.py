@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
+from .ignore import IgnoreStack
 from .packaged_git import MaterializedRepository, materialize_repository
 from .packaged_repository_advanced import PackagedAgentRunner, PackagedRepositoryAdvanced
 
@@ -651,12 +652,33 @@ class PackagedRepositoryBackend:
 
 
 def _iter_repo_files(repo_root: Path) -> list[Path]:
+    """Repo files for the packaged backend, minus the ignore stack.
+
+    This backend feeds the agent's file inventory, so it must agree with the indexer about what
+    exists: a gitignored ``data/`` that the index omits but this walker lists would hand the agent
+    a path it cannot recall and invite it to read the one thing the user excluded.
+    """
+    stack = IgnoreStack.build(repo_root)
+    has_negation = stack.has_negation()
     output: list[Path] = []
     for current_root, dirnames, filenames in os.walk(repo_root):
-        dirnames[:] = sorted(name for name in dirnames if name not in IGNORED_DIR_NAMES)
         current = Path(current_root)
+        rel_root = current.relative_to(repo_root).as_posix()
+        kept: list[str] = []
+        for name in dirnames:
+            rel_dir = name if rel_root == "." else f"{rel_root}/{name}"
+            # A floor-excluded directory can never be re-included, so it is always pruned.
+            if stack.is_floor_ignored_dir(rel_dir):
+                continue
+            if stack.is_ignored_dir(rel_dir) and not has_negation:
+                continue
+            kept.append(name)
+        dirnames[:] = sorted(kept)
         for filename in sorted(filenames):
             path = current / filename
+            rel = filename if rel_root == "." else f"{rel_root}/{filename}"
+            if stack.is_ignored(rel):
+                continue
             if path.is_file() and not path.is_symlink():
                 output.append(path)
     return output
