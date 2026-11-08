@@ -485,8 +485,17 @@ def test_the_session_body_never_carries_a_key_when_the_source_is_not_environment
     assert "require_provider_api_key" not in body
 
 
-def test_a_keyless_local_provider_reaches_create_session_with_no_credential(tmp_path: Path):
-    """Track P's keyless path, now usable for a durable run."""
+def test_a_keyless_local_provider_reaches_create_session_with_no_credential(tmp_path: Path, monkeypatch):
+    """Track P's keyless path, now usable for a durable run.
+
+    ``HOME`` is isolated because the context reader honours the USER layer (``~/.codna/rules``,
+    ``~/.cursor/skills``, ``~/.agents/skills`` …) exactly as Cursor does. Without this, "the exact
+    create body" would be a statement about what the machine running the suite happens to have
+    installed rather than about the session this test builds — and the assertion below would fail on a
+    developer's laptop for a reason unrelated to the provider path it exists to prove.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
     repo = fakes.make_repo(tmp_path / "repo")
     runs_root = repo / "runs"
     runs_root.mkdir(exist_ok=True)
