@@ -261,6 +261,29 @@ def is_not_found(exc: BaseException) -> bool:
     return "not found" in text or "notfound" in text or "no such workflow" in text
 
 
+def _is_query_rejected(exc: BaseException) -> bool:
+    """Whether this is Temporal refusing a query because the execution is CLOSED.
+
+    ``reject_condition=QueryRejectCondition.NOT_OPEN`` is the CLI's own choice, so its rejection is
+    the documented way to learn "this workflow already ended" — not a server fault.
+
+    STRUCTURAL FIRST, AND THE TEXT ONLY AS THE SDK's OWN SENTENCE. Measured on a finished run, the
+    outer error is ``DurableCliError`` and its ``__cause__`` is
+    ``temporalio.client._exceptions.WorkflowQueryRejectedError`` — both covered by the type checks. The
+    text branch exists only for an SDK build whose class name changes; it matches the exact prefix that
+    SDK raises (``"Query rejected, status: N"``) rather than the bare words, because a substring like
+    "query rejected" would also match an unrelated backend's rejection and route a genuine server
+    failure down the closed-workflow path — a 502 turned into a fabricated ending.
+    """
+    if type(exc).__name__ == "WorkflowQueryRejectedError":
+        return True
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and type(cause).__name__ == "WorkflowQueryRejectedError":
+        return True
+    text = str(exc)
+    return text.startswith("Query rejected, status:") or "Query rejected, status:" in text
+
+
 def translate(exc: BaseException, *, run_id: str) -> RunApiError:
     """Map a CLI/Temporal failure onto this surface's statuses, preserving code, details and hint.
 
@@ -427,7 +450,23 @@ class TemporalRunBackend(RunBackend):
         }
 
     def status(self, run_id: str) -> dict[str, Any] | None:
-        """The run's live status. ``None`` when Temporal has no such execution (a 404 at the edge)."""
+        """The run's live status, from the OPEN workflow or from the one that CLOSED.
+
+        ``None`` when Temporal has no such execution (a 404 at the edge).
+
+        THE CLOSED CASE IS NOT AN ERROR, AND IT USED TO BE ANSWERED AS ONE. `query_workflow` sends
+        ``reject_condition=QueryRejectCondition.NOT_OPEN`` (correct for `--wait`, which must not
+        query a closed execution — it reads the result instead). This method called it directly, so
+        the moment a run reached a terminal state every ``GET /runs/:id`` answered 502
+        ``run_api_backend_failed … Query rejected, status: 2`` — measured on
+        ``run-20261108T221611Z``, a run that had just finished ``approved_unpublished``. The list
+        route kept working because it reads the ledger, so the IDE showed a *done* row it could not
+        open: the detail pane is `GET /runs/:id`.
+
+        A closed execution still has a full audit record (``describe`` gives its status, ``result``
+        gives its completion or its own failure) and the ledger under it survives retention. So the
+        answer is built from those, and only a genuinely gone execution is ``None``.
+        """
         from . import run_cli
         from .run_workflow import RunWorkflow
 
@@ -441,9 +480,73 @@ class TemporalRunBackend(RunBackend):
         except RunApiError:
             raise
         except BaseException as exc:  # noqa: BLE001 - "gone" is an answer; anything else is not
+            cause = getattr(exc, "__cause__", None) or exc
+            if is_not_found(exc) or is_not_found(cause):
+                return None
+            if not _is_query_rejected(cause):
+                raise translate(exc, run_id=run_id) from exc
+            # The workflow CLOSED between the list read and this one. Its ending is a fact about the
+            # run, not a server failure, so read it rather than reporting a 502.
+            return self._closed_status(run_id)
+
+    def _closed_status(self, run_id: str) -> dict[str, Any] | None:
+        """A CLOSED run's status, read from its execution and its completion.
+
+        Deliberately not a second status model: the shape carries the same fields a client reads from
+        `RunWorkflow.status`, plus ``closed`` so a caller can tell a read-after-the-end from a live
+        one. What a closed execution cannot know — the in-flight counters — is not invented.
+        """
+        from . import run_wait
+
+        workflow_id = self._config.run_workflow_id(run_id)
+
+        async def describe() -> Any:
+            return await self._client.get_workflow_handle(workflow_id).describe()
+
+        try:
+            description = self._call(describe())
+        except RunApiError:
+            raise
+        except BaseException as exc:  # noqa: BLE001
             if is_not_found(exc) or is_not_found(getattr(exc, "__cause__", None) or exc):
                 return None
             raise translate(exc, run_id=run_id) from exc
+
+        status_value = getattr(description, "status", None)
+        status_name = getattr(status_value, "name", None) or str(status_value)
+        # `result()` is an ANSWER for a completed execution and the run's OWN error for a failed one;
+        # neither is a query failure, and neither is invented here.
+        outcome: str | None = None
+        error: dict[str, Any] | None = None
+        try:
+            completion = self._call(run_wait.workflow_completion(self._client, workflow_id))
+            outcome = run_wait.workflow_outcome(completion, workflow_id=workflow_id)
+        except BaseException as exc:  # noqa: BLE001 - a failed run reports why, not a 502
+            report = run_wait.workflow_failure_report(exc)
+            if report is not None:
+                error = dict(report)
+                outcome = "failed"
+            elif is_not_found(exc) or is_not_found(getattr(exc, "__cause__", None) or exc):
+                return None
+            else:
+                # THE ENDING COULD NOT BE READ, WHICH IS NOT AN ENDING. `workflow_failure_report`
+                # walks the SDK's `.cause` chain; an error from THIS package (e.g.
+                # `durable_run_outcome_unknown` for a result whose outcome is not in the contract's
+                # vocabulary) carries Python's `__cause__` instead, so the report is None and
+                # `is_not_found` is False. Falling through would present `outcome: null, error: null`
+                # as a successful read — the "unreadable is not success" rule this module is built on,
+                # broken. So it is a 502, and the caller learns the read failed rather than reading a
+                # run that appears to have ended without saying how.
+                raise translate(exc, run_id=run_id) from exc
+        close_time = getattr(description, "close_time", None)
+        return {
+            "run_id": run_id,
+            "closed": True,
+            "workflow_status": status_name,
+            "outcome": outcome,
+            "error": error,
+            "completed_at": close_time.isoformat() if hasattr(close_time, "isoformat") else None,
+        }
 
     def update(self, run_id: str, *, task_id: str, action: str, payload: Mapping[str, Any]) -> Any:
         """Send one Update to a TASK workflow, through the CLI's engine-discovering sender."""

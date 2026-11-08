@@ -5,7 +5,7 @@ from codna import cli, scaffold, status
 
 def test_init_writes_files(tmp_path):
     res = scaffold.init_project(tmp_path)
-    assert res == {"codna.yaml": "written", "AGENTS.md": "written"}
+    assert res == {"codna.yaml": "written", "AGENTS.md": "written", ".codnaignore": "written"}
     config = (tmp_path / "codna.yaml").read_text()
     assert "# model:" in config
     assert "#   provider: openai" in config
@@ -15,6 +15,22 @@ def test_init_writes_files(tmp_path):
     assert "# egress: fail-closed" in config
     assert "  egress: fail-closed" not in config
     assert (tmp_path / "AGENTS.md").is_file()
+
+
+def test_init_scaffolds_an_ignore_template(tmp_path):
+    """`codna init` explains the ignore system and pre-excludes nothing."""
+    assert scaffold.init_project(tmp_path)[".codnaignore"] == "written"
+    text = (tmp_path / ".codnaignore").read_text()
+    assert "gitignore" in text
+    assert "!pattern" in text
+    assert "cannot be weakened" in text
+    # Every line is a comment: a scaffold must not silently change what gets indexed.
+    assert all(line.startswith("#") or not line.strip() for line in text.splitlines())
+    # And the scaffolded file is a no-op matcher over a normal repo.
+    from codna.ignore import IgnoreStack
+
+    stack = IgnoreStack.build(tmp_path)
+    assert stack.is_ignored("src/app.py") is False
 
 
 def test_init_no_clobber_without_force(tmp_path):

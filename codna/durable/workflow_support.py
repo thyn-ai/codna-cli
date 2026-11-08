@@ -323,6 +323,9 @@ def spec_from(payload: Mapping[str, Any]) -> TaskSpec:
         # Absent in a payload recorded before project rules existed: `False` is what that history
         # meant, so such a run replays with the prompts it actually sent.
         attach_project_rules=bool(payload.get("attach_project_rules", False)),
+        # Absent in a payload recorded before user-defined subagents existed: `False` is what that
+        # history meant, so such a run replays the sessions it actually recorded.
+        attach_subagents=bool(payload.get("attach_subagents", False)),
         # Absent before MCP could be carried: `()` is exactly what such a run sent, so it replays with
         # the sessions it recorded rather than gaining an MCP attachment it never had.
         mcp_servers=_recorded_mcp_servers(payload.get("mcp_servers")),

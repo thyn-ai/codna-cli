@@ -25,6 +25,7 @@ from typing import Any
 
 from .contracts import provider_session_spec, resolve_provider_env_key
 from .mcp import mcp_session_spec
+from .subagents import subagent_session_spec
 from .swarm import swarm_session_spec
 
 # NOTE: `owner_for` lives in `activity_support`, which imports THIS module, so it is resolved at call
@@ -80,16 +81,27 @@ def _session_spec(context: Any, *, read_only: bool, working_tree: str = "") -> d
     # `swarm.swarm_session_spec`. This is the ONLY place a session is created, which is why the flags
     # are added here rather than at each turn: no step can forget what it never has to remember.
     spec.update(swarm_session_spec(context))
+    # USER-DEFINED SUBAGENTS: the repository's `.cursor/agents` roster, when this task may delegate and
+    # asked for it. Read from the TREE THE TURN EDITS (never the shared checkout, never the worker's
+    # `~`), because a delegated agent's system prompt is that file's body. Absent for every run that
+    # did not ask, so the pre-feature request stays byte-identical — see `subagents.py`.
+    spec.update(subagent_session_spec(context, working_tree))
     spec.update(provider_session_spec(context, key=_provider_key(context)))
     return spec
 
 
 def _project_rules(context: Any, working_tree: str) -> str:
-    """The repository's conventions for this turn, or ``""`` (D5).
+    """The repository's conventions AND skills for this turn, or ``""`` (D5).
 
-    Read from ``working_tree`` — the tree the turn is about to edit — because a rules file can differ
-    between a task's branch and the shared checkout. ``""`` when the task opted out; the read itself
-    is bounded in `rules.project_rules_for`.
+    Read from ``working_tree`` — the tree the turn is about to edit — because a rules file or a
+    ``SKILL.md`` can differ between a task's branch and the shared checkout. ``""`` when the task opted
+    out; the read itself is bounded in ``rules.project_context_for``.
+
+    **Skills travel here rather than as a second field.** A durable turn's create-session body has one
+    ``injected_context`` string, and the skills CATALOGUE belongs in the same prompt as the rules: it is
+    the same kind of content, it is spent from the same budget, and a second field would need a second
+    agreement with the engine for no gain. The rules are rendered first, the catalogue takes what is
+    left — see ``rules.load_context``.
     """
     if not getattr(context, "attach_project_rules", False):
         return ""
@@ -97,9 +109,9 @@ def _project_rules(context: Any, working_tree: str) -> str:
         # No tree named means the caller did not say where the turn works; falling back to
         # `repo_dir` would read the SHARED checkout, which may be another task's branch.
         return ""
-    from .rules import project_rules_for
+    from .rules import project_context_for
 
-    return project_rules_for(working_tree)
+    return project_context_for(working_tree)
 
 
 def _provider_key(context: Any) -> str | None:
