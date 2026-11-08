@@ -111,13 +111,20 @@ MUTATION_ROUTES: Final[frozenset[str]] = frozenset(
 
 DEFAULT_HEARTBEAT_S: Final = 15.0
 DEFAULT_POLL_INTERVAL_S: Final = 0.25
-DEFAULT_MAX_STREAMS: Final = 8
+# How many concurrent SSE streams a server will serve before answering 503. RAISED FROM 8 for a product reason:
+# several conversations in one window are normal now and each holds a stream, so 8 was reachable by ordinary use.
+# Measured cost per stream: one thread and ~0.1 MB RSS (`ThreadingHTTPServer` holds a thread per stream and
+# allocates nothing else per stream), so 16 is ~1.6 MB — and still a HARD bound: past it a stream is a 503.
+# Reported by the capability document as `max_streams` (see `run_api.capabilities_payload_for`), so a client reads
+# the number instead of assuming it.
+DEFAULT_MAX_STREAMS: Final = 16
 DEFAULT_REQUEST_TIMEOUT_S: Final = 30.0
 DEFAULT_WRITE_TIMEOUT_S: Final = 10.0
 DEFAULT_LIST_LIMIT: Final = 50
 MAX_LIST_LIMIT: Final = 500
 MAX_IDENTITY_CHARS: Final = 320
 MAX_TASK_ID_CHARS: Final = 128
+
 
 # -- SSE framing, transcribed from server/http.ts:44-158 ----------------------------------------
 #
@@ -932,7 +939,6 @@ _TAIL_WINDOW_BYTES: Final = 64 * 1024
 # How far back the outcome scan looks. A terminal is followed by at most a handful of control notes,
 # so a small bound finds it without turning a summary into a full scan.
 _OUTCOME_SCAN_RECORDS: Final = 32
-
 
 def _tail_records(path: Path, *, limit: int) -> list[LedgerRecord]:
     """Up to ``limit`` complete records from the end of the file, reading only the last 64 KiB."""

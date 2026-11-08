@@ -145,7 +145,12 @@ def cmd_serve(args: Any) -> int:
                 # Kept as the ADDRESS-OR-NULL field existing callers already read. `capabilities`
                 # carries the rest; the two are derived from the same object, so they cannot disagree.
                 "temporal": capabilities.temporal_address,
-                "capabilities": capabilities.as_payload(),
+                # THE SAME COMPOSER THE ROUTES USE (`RunApi.capabilities_payload`), not a second
+                # `as_payload()` plus a hand-added field. The banner is what an operator reads to
+                # know what they started, and it must say the same thing `GET /capabilities` does —
+                # including the stream ceiling, which is the one capability that comes from
+                # `--max-streams` rather than from the backend.
+                "capabilities": server.api.capabilities_payload(),
                 "task_queue": config.task_queue,
             }
         }
