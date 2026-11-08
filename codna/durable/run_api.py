@@ -252,6 +252,7 @@ class RunApi:
     def ledger_summary(self, run_id: str) -> dict[str, Any]:
         """A bounded summary of the run's ledger: one read for counts, a tail read for the outcome."""
         from .run_api_support import ledger_problems
+        from .run_repo import repo_dir_of
 
         path = self.config.ledger_path(run_id)
         if not path.is_file():
@@ -264,6 +265,11 @@ class RunApi:
                 "problems": [],
                 "terminal": False,
                 "outcome": None,
+                # WHICH CHECKOUT this run works in — the same fact `GET /runs` carries per row. `None` for a
+                # ledger written before the field existed: a caller must present that as unknown rather than
+                # substitute whichever folder its window happens to have open (the bug #719 fixed on the list
+                # route, which stays fixed here for the detail route that feeds the sidebar and the cursors).
+                "repo_dir": None,
             }
         tail = LedgerTail(path)
         try:
@@ -287,6 +293,9 @@ class RunApi:
             # `terminal: false` beside `outcome: "completed"` contradicts itself.
             "terminal": ended,
             "outcome": outcome,
+            # The run's OWN repository, from the same bounded head scan the list route uses. One reader,
+            # so a run cannot be labelled from its list row and re-labelled from its detail.
+            "repo_dir": repo_dir_of(path),
         }
 
     def audit_control(self, run_id: str, *, action: str, identity: str, principal: Principal | None = None) -> int:

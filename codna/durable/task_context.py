@@ -67,6 +67,10 @@ class TaskContext:
     # D5: attach the repository's own conventions to this task's turns. The POLICY, not the text —
     # see `TaskSpec.attach_project_rules`.
     attach_project_rules: bool = True
+    # Whether this task's turns are given the repository's user-defined subagents. The POLICY, not the
+    # roster — see `TaskSpec.attach_subagents`. Travelling WITH the context is what makes a retried
+    # activity's roster independent of anything the worker remembers.
+    attach_subagents: bool = True
     # D5/MCP: the servers this task's turns are given — validated CONFIGURATION, with `env` entries as
     # `{"from_env": "NAME"}` references rather than values (see `TaskSpec.mcp_servers`). It travels on
     # the context for the same reason the provider coordinates do: a retried activity must build the
@@ -104,6 +108,7 @@ class TaskContext:
             worktree=spec.worktree,
             worktree_task_id=spec.worktree_task_id,
             attach_project_rules=spec.attach_project_rules,
+            attach_subagents=spec.attach_subagents,
             mcp_servers=tuple(spec.mcp_servers),
             enable_spawn_agent=bool(spec.enable_spawn_agent),
             enable_agent_teams=bool(spec.enable_agent_teams),
@@ -156,6 +161,12 @@ class TaskContext:
                 "context.attach_project_rules must be a boolean",
                 code="contract_invalid",
                 details={"field": "attach_project_rules"},
+            )
+        if not isinstance(self.attach_subagents, bool):
+            raise ContractError(
+                "context.attach_subagents must be a boolean",
+                code="contract_invalid",
+                details={"field": "attach_subagents"},
             )
         # The MCP config is re-validated from the context too: a context is what a REQUEST carries, and
         # a request that crossed a channel is still untrusted. The same normalizer the spec uses, so
