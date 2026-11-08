@@ -16,6 +16,8 @@ import re
 from dataclasses import dataclass
 from typing import Iterator, Protocol
 
+from .ignore import IgnoreLayer, IgnoreStack, parse_patterns
+
 # The filter columns the memory collection declares. ``CodeUnit.metadata()`` returns EXACTLY these
 # (plus the physical partition key ``scope_key``), so Telys' ingest never KeyErrors on a missing column.
 FILTER_COLUMNS = ["repo_id", "service", "language", "path", "symbol_type", "commit_sha", "branch"]
@@ -29,6 +31,10 @@ _DEFAULT_IGNORE = (
     ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build", ".codna-memory",
 )
+# `_DEFAULT_IGNORE` is retained ONLY as the documented legacy name list. The walk no longer
+# consults it: `extract_repo` decides every path with `codna.ignore`, whose FLOOR encodes these
+# same trees as path patterns. Keeping the tuple avoids breaking an out-of-tree caller that
+# imported it, and `test_ignore.py` asserts the floor is at least as strict.
 
 
 @dataclass(frozen=True)
@@ -234,22 +240,65 @@ except Exception as exc:  # noqa: BLE001 — tree-sitter is optional, but the fa
     _record_extractor_error("tree-sitter", f"{type(exc).__name__}: {exc}")
 
 
+def _build_ignore_stack(repo_path: str, extra: tuple[str, ...] | None) -> IgnoreStack:
+    """Build the ignore stack for ``repo_path``: discovered files + the floor + caller extras."""
+    stack = IgnoreStack.build(repo_path)
+    if not extra:
+        return stack
+    # Caller-supplied patterns are an ADDITIONAL layer, applied last, and still subject to the
+    # floor (the floor is evaluated before every layer in `_decide`).
+    extra_layer = IgnoreLayer(
+        base="",
+        path="<caller>",
+        rules=tuple(parse_patterns(extra, base="", source="<caller>")),
+    )
+    return IgnoreStack(root=stack.root, layers=stack.layers + (extra_layer,), floor=stack.floor)
+
+
 def extract_repo(repo_path: str, repo_id: str, *, languages: tuple[str, ...] | None = None,
-                 ignore: tuple[str, ...] = _DEFAULT_IGNORE) -> tuple[list[CodeUnit], ExtractStats]:
-    """Walk ``repo_path`` and return (units, stats). Files that fail to parse are skipped + counted."""
+                 ignore: tuple[str, ...] | None = None,
+                 ignore_stack: IgnoreStack | None = None) -> tuple[list[CodeUnit], ExtractStats]:
+    """Walk ``repo_path`` and return (units, stats). Files that fail to parse are skipped + counted.
+
+    Every path is decided by :mod:`codna.ignore` on its **repo-relative** path, which is what stops
+    a gitignored ``data/`` from being embedded and recalled. ``ignore`` is a tuple of additional
+    gitignore-syntax patterns layered ON TOP of the discovered files (never instead of the floor);
+    ``ignore_stack`` injects a pre-built stack when a caller already has one (e.g. a sibling reader
+    deciding the same repo), so two readers cannot disagree.
+
+    Passing ``ignore_stack=None`` and ``ignore=None`` means "discover ``.gitignore`` /
+    ``.cursorignore`` / ``.codnaignore`` plus the floor" — the normal path.
+    """
     langs = set(resolve_languages(languages))
     units: list[CodeUnit] = []
     stats = ExtractStats()
-    ignore_set = set(ignore)
+    stack = ignore_stack if ignore_stack is not None else _build_ignore_stack(repo_path, ignore)
+    # Computed ONCE: it is a property of the rule set, not of a directory. Calling it per entry
+    # would make the walk O(rules × directories) for no extra information.
+    has_negation = stack.has_negation()
     for root, dirs, files in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if d not in ignore_set and not d.startswith(".")]
+        # Prune by repo-relative path, not by directory NAME: `**/node_modules/` is a path rule.
+        # A FLOOR-excluded directory is pruned unconditionally (nothing can re-include beneath it).
+        # Any other ignored directory is pruned only when no negation exists anywhere — otherwise
+        # a re-included file inside it would be lost.
+        keep: list[str] = []
+        for name in dirs:
+            rel_dir = os.path.relpath(os.path.join(root, name), repo_path).replace(os.sep, "/")
+            if stack.is_floor_ignored_dir(rel_dir):
+                continue
+            if stack.is_ignored_dir(rel_dir) and not has_negation:
+                continue
+            keep.append(name)
+        dirs[:] = keep
         for fn in files:
+            relpath = os.path.relpath(os.path.join(root, fn), repo_path).replace(os.sep, "/")
+            if stack.is_ignored(relpath):
+                continue
             ext = os.path.splitext(fn)[1]
             ex = _EXTRACTORS.get(ext)
             if ex is None or ex.language not in langs:
                 continue
             full = os.path.join(root, fn)
-            relpath = os.path.relpath(full, repo_path)
             try:
                 with open(full, encoding="utf-8", errors="replace") as f:
                     source = f.read()
