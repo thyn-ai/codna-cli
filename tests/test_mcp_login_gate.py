@@ -107,7 +107,7 @@ def test_report_bug_gets_past_the_gate_when_authorized(authorized_device, monkey
     assert payload["submitted"] is False
 
 
-# ── full server path (needs the mcp extra): introspection free, all 5 executions gated ────────────
+# ── full server path (needs the mcp extra): introspection free, all 6 executions gated ────────────
 def _result_text(content) -> str:
     return content[0].text if isinstance(content, (list, tuple)) else content
 
@@ -117,12 +117,13 @@ def test_introspection_stays_credential_free(scrubbed_device):
     server = mcp_server._build_server()  # noqa: SLF001
     tools = asyncio.run(server.list_tools())
     assert sorted(t.name for t in tools) == [
-        "codna_fix", "codna_recall", "codna_report_bug", "codna_secure", "codna_triage",
+        "codna_fix", "codna_recall", "codna_report_bug", "codna_request_rule", "codna_secure",
+        "codna_triage",
     ]
 
 
 @mcp_required
-def test_all_five_tools_gate_end_to_end(scrubbed_device):
+def test_all_six_tools_gate_end_to_end(scrubbed_device):
     server = mcp_server._build_server()  # noqa: SLF001
     calls = {
         "codna_triage": {"repo": ".", "issue": "x"},
@@ -130,6 +131,7 @@ def test_all_five_tools_gate_end_to_end(scrubbed_device):
         "codna_secure": {"repo": ".", "sarif_path": "x.sarif"},
         "codna_recall": {"repo": ".", "query": "x"},
         "codna_report_bug": {"title": "x"},
+        "codna_request_rule": {"repo": ".", "name": "x"},
     }
     for name, arguments in calls.items():
         content, _structured = asyncio.run(server.call_tool(name, arguments))
@@ -160,5 +162,32 @@ def test_triage_executes_when_authorized(authorized_device, monkeypatch, tmp_pat
 def test_tool_descriptions_disclose_the_login_requirement(scrubbed_device):
     server = mcp_server._build_server()  # noqa: SLF001
     tools = {t.name: t for t in asyncio.run(server.list_tools())}
-    for name in ("codna_triage", "codna_secure", "codna_recall", "codna_fix", "codna_report_bug"):
+    for name in ("codna_triage", "codna_secure", "codna_recall", "codna_fix", "codna_report_bug",
+                 "codna_request_rule"):
         assert "codna login" in tools[name].description, name
+
+
+@mcp_required
+def test_request_rule_returns_the_body_when_authorized(authorized_device, tmp_path):
+    """The catalogued-rule pull: the body comes back by the name the catalog prints."""
+    rules_dir = tmp_path / ".codna" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "db.mdc").write_text(
+        "---\ndescription: database conventions\n---\nUSE MIGRATIONS\n", encoding="utf-8")
+    server = mcp_server._build_server()  # noqa: SLF001
+    content, _structured = asyncio.run(
+        server.call_tool("codna_request_rule", {"repo": str(tmp_path), "name": "db"}))
+    payload = json.loads(_result_text(content))
+    assert payload["body"] == "USE MIGRATIONS"
+    assert payload["mode"] == "catalog"
+    assert payload["source_path"] == ".codna/rules/db.mdc"
+
+
+@mcp_required
+def test_request_rule_reports_a_missing_name_structurally(authorized_device, tmp_path):
+    server = mcp_server._build_server()  # noqa: SLF001
+    content, _structured = asyncio.run(
+        server.call_tool("codna_request_rule", {"repo": str(tmp_path), "name": "nope"}))
+    payload = json.loads(_result_text(content))
+    assert payload["error"]["code"] == "rule_not_found"
+    assert payload["error"]["details"]["requested"] == "nope"

@@ -132,7 +132,7 @@ def changed_files(repo_dir: str, base: str = "HEAD") -> list[str]:
 def run_review(c, args) -> dict:
     """Register + triage the changed files. Returns a structured review result."""
     from . import cli as _cli
-    from .project_rules import read_project_guidance
+    from .project_rules import guidance_for_files
 
     local = os.path.abspath(os.path.expanduser(args.repo))
     if not os.path.isdir(local):
@@ -146,7 +146,9 @@ def run_review(c, args) -> dict:
         "issue_text": getattr(args, "issue", None) or "Review these changes for bugs, regressions, and risk.",
         "changed_files": files,
     }
-    guidance = read_project_guidance(local)
+    # Scoped to the CHANGED files: this review is about them, so a rule whose globs match none of them
+    # is not paid for. (The unscoped read attached every glob rule in the repository to every review.)
+    guidance = guidance_for_files(local, files)
     if guidance:
         sig["project_guidance"] = guidance
     tri = _cli._dump(c.triage_repository(rid, {"snapshot_id": snap["snapshot_id"], "signals": sig}))
@@ -249,7 +251,7 @@ def run_findings_review(args) -> dict:
     from . import review_findings as rf
     from . import review_github as rg
     from .cline_agent import ReviewTurnTimeout
-    from .project_rules import read_project_guidance
+    from .project_rules import guidance_for_files
 
     diff_range = getattr(args, "diff", None)
     base = None if diff_range else getattr(args, "base", None)
@@ -313,7 +315,11 @@ def run_findings_review(args) -> dict:
         except Exception as exc:  # noqa: BLE001 — malformed config fails closed with a clear message
             _fail(f"review config error: {exc}")
 
-        guidance = read_project_guidance(local)
+        # Scoped to the files this review actually covers: the incremental PR file list when the
+        # review is incremental, else the working-tree diff. A glob rule for files outside the diff is
+        # cost with no possible bearing on the findings.
+        review_files = diff_paths if diff_paths is not None else changed_files(local, base or "HEAD")
+        guidance = guidance_for_files(local, review_files)
         try:
             result = rf.run_diff_review(
                 local, repository=args.repo, diff_range=diff_range, base=base, config=cfg,

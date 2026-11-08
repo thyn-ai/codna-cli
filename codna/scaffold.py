@@ -36,6 +36,30 @@ _AGENTS_MD = """\
 - Do not touch: build artifacts, vendored code, generated files.
 """
 
+# The `.codnaignore` template. Deliberately ALL comments: a scaffolded ignore file that
+# pre-excluded something would be a behaviour change the user did not ask for, and an empty
+# rule set is what "no opinion yet" looks like. The format note is what makes the file
+# self-explanatory when a user opens it to add a rule.
+_CODNAIGNORE = """\
+# .codnaignore — paths Codna must not index, recall, or read.
+#
+# Same syntax as .gitignore: `*` (not across /), `**` (any depth), `?`, `[abc]`, `#` comments,
+# trailing `/` for directories only, `/pattern` anchored to this directory, `!pattern` to negate.
+# The LAST matching pattern wins. Files in a subdirectory apply only to that subtree.
+#
+# Precedence, lowest to highest: .gitignore -> .cursorignore -> .codnaignore. Your .gitignore and
+# an existing .cursorignore are read automatically, so a Cursor repo needs no changes.
+#
+# A built-in floor (secrets, VCS internals, node_modules, build output, hidden directories) is
+# always applied and cannot be weakened here: `!.env` re-exposes nothing.
+#
+# Examples:
+#   data/            # a directory the index must skip
+#   fixtures/        # test fixtures you never want embedded
+#   *.generated.py   # a generated-file pattern
+#   !docs/**         # re-include something an earlier rule excluded
+"""
+
 
 class ScaffoldError(Exception):
     """Surfaced to the user."""
@@ -53,4 +77,7 @@ def init_project(cwd: Path | None = None, *, force: bool = False, with_agents: b
     result = {"codna.yaml": _write(root / "codna.yaml", _CODNA_YAML, force=force)}
     if with_agents:
         result["AGENTS.md"] = _write(root / "AGENTS.md", _AGENTS_MD, force=force)
+    # The ignore template is always scaffolded: it is the one file that decides what the index
+    # sees, and a user who never learns it exists keeps paying for embeddings they excluded.
+    result[".codnaignore"] = _write(root / ".codnaignore", _CODNAIGNORE, force=force)
     return result
