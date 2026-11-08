@@ -14,8 +14,14 @@ dist/
 .idea/
 .DS_Store
 
-# Local Codna state — analysis caches are user data, never repository content
-.codna/
+# Local Codna state — analysis caches are user data, never repository content.
+# `.codna/*` rather than `.codna/` for the same reason as the root file: git will not descend into an
+# ignored directory, so the rules exception below would be unreachable under the directory form.
+.codna/*
+# …except the rules directory, which is committed convention: `.codna/rules/**` is the TEAM layer of the
+# rule engine and is meant to be shared through git (see `cli/codna/rules`).
+!.codna/rules/
+!.codna/rules/**
 .codna-memory/
 
 # Secrets — never commit key material of any kind

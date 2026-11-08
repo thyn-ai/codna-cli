@@ -67,6 +67,7 @@ pytest.importorskip("temporalio", reason="the `durable` extra (temporalio) is no
 
 from codna.durable import run_api as api_module
 from codna.durable import run_api_support as support
+from codna.durable import run_repo
 from codna.durable.config import load_durable_config
 from codna.durable.identity import AUTH_MODE_TOKEN, IdentityConfig, IdentityResolver
 from codna.durable.ledger import RunLedger
@@ -1322,6 +1323,100 @@ def test_get_runs_lists_the_runs_whose_ledgers_exist(server: Running) -> None:
         assert entry["last_seq"] == 5
         assert entry["ledger_bytes"] > 0
         assert entry["outcome"] == "completed"
+
+
+def test_a_ledger_without_a_repo_reports_null_rather_than_inventing_one(server: Running) -> None:
+    """AN OLD LEDGER HAS NO REPOSITORY ON RECORD, and the route must say exactly that.
+
+    `repo_dir` was added to the ledger after the first runs were written. For those, the honest answer
+    is `None` — a caller that substitutes its own workspace labels the run with a repository it may
+    never have touched, which is the bug this field exists to remove. `null` is a documented value, not
+    a missing key: a client can branch on it without guessing whether the server is old.
+    """
+    ledger = RunLedger.for_run(server.config.paths, "run-old")
+    # The shape every pre-change ledger has: a `run.started` note with no `repo_dir` in its payload.
+    ledger.append("run.started", payload={"event": "notification", "kind": "run.started", "message": "go"})
+    status, body = server.json("GET", "/runs")
+    assert status == 200
+    assert [entry["run_id"] for entry in body["runs"]] == ["run-old"]
+    assert "repo_dir" in body["runs"][0]
+    assert body["runs"][0]["repo_dir"] is None
+
+
+def test_the_run_list_reports_the_repository_the_run_works_in(server: Running, tmp_path: Path) -> None:
+    """A run's row names ITS repository, not the one the reading window happens to have open.
+
+    This is the field the sidebar's project grouping was missing: without it every durable row was
+    stamped with `defaultProjectId` — the open folder's name — so a run from repo A appeared under repo
+    B the moment the window was reopened elsewhere.
+    """
+    repo = git_repo(tmp_path / "repo-a")
+    ledger = RunLedger.for_run(server.config.paths, "run-with-repo")
+    # The shape `notify` writes: a ledger `note` whose payload names the notification. Only a note is a
+    # run-level fact, which is what `run_repo.repo_dir_of` reads.
+    ledger.append(
+        "note",
+        payload={
+            "event": "notification",
+            "kind": "run.started",
+            "message": "run run-with-repo: 1 task(s) to go",
+            "repo_dir": str(repo),
+        },
+    )
+    status, body = server.json("GET", "/runs")
+    assert status == 200
+    entry = body["runs"][0]
+    assert entry["run_id"] == "run-with-repo"
+    # The absolute path the run recorded, not the folder the server was started from.
+    assert entry["repo_dir"] == str(repo.resolve())
+    assert entry["repo_dir"] != str(server.config.runs_root)
+
+
+def test_the_repo_scan_reads_notes_near_the_head_and_ignores_turn_events(server: Running) -> None:
+    """The repository lives on a run-level NOTE, so a turn event's copy of the key is not a candidate.
+
+    A ledger can hold thousands of turn events; scanning all of them to answer "which repository" would
+    make a list read proportional to the largest run on the machine. The scan is a bounded head window —
+    which is also what makes the answer cheap for a run that predates the field.
+    """
+    ledger = RunLedger.for_run(server.config.paths, "run-buried")
+    ledger.append("run.started", payload={"event": "notification", "kind": "run.started"})
+    # Not a `note`, so this is not a run-level fact and must not be reported.
+    ledger.append(
+        "turn.event",
+        session_id="s1",
+        event_index=1,
+        payload={"event_type": "agent.done", "payload": {}, "repo_dir": "/not/a/note"},
+    )
+    ledger.append(
+        "note",
+        payload={"event": "notification", "kind": "note", "message": "later", "repo_dir": "/after/start"},
+    )
+    _, body = server.json("GET", "/runs")
+    assert body["runs"][0]["repo_dir"] == "/after/start"
+
+
+def test_a_repo_beyond_the_head_window_reports_null_rather_than_a_full_scan(server: Running) -> None:
+    """A repo written far past the front is not found, and the route says `null` instead of scanning.
+
+    The field is only ever written by the run's opening notification, so a value that far into the file
+    is not a shape any version of the product produces. Reporting `null` keeps the read bounded; the
+    alternative (walk the whole ledger) would make listing O(all events on disk).
+    """
+    ledger = RunLedger.for_run(server.config.paths, "run-far")
+    ledger.append("run.started", payload={"event": "notification", "kind": "run.started"})
+    for index in range(run_repo._HEAD_SCAN_RECORDS + 4):
+        ledger.append(
+            "turn.event",
+            session_id="s1",
+            event_index=index + 1,
+            payload={"event_type": "agent.done", "payload": {}},
+        )
+    ledger.append(
+        "note", payload={"event": "notification", "kind": "note", "repo_dir": "/too/far/to/be/read"}
+    )
+    _, body = server.json("GET", "/runs")
+    assert body["runs"][0]["repo_dir"] is None
 
 
 def test_the_run_list_reports_no_outcome_for_an_unfinished_run(server: Running) -> None:
