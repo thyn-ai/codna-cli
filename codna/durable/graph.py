@@ -105,6 +105,7 @@ rather than an aspiration.
 """
 from __future__ import annotations
 
+import contextvars
 import threading
 from dataclasses import dataclass
 from datetime import timedelta
@@ -456,42 +457,94 @@ async def _run_step(name: str, state: Mapping[str, Any]) -> dict[str, Any]:
     implementation is the same function the plugin's activity wraps, so what the graph runs and what
     `TaskWorkflowPlain` schedules are literally the same code.
 
-    Heartbeating is promoted for the paid turn: the body beats at the start and every
-    `HEARTBEAT_INTERVAL_S` while the stream is open, which is what lets the workflow's
+    Heartbeating is promoted for the paid turn: while the body runs on an executor thread, a task on
+    THIS loop beats every `HEARTBEAT_INTERVAL_S`, which is what lets the workflow's
     `heartbeat_timeout` notice a dead worker mid-turn rather than at the 60-minute ceiling.
 
     The state is copied, never mutated: LangGraph keeps the dict it was handed (and writes
     ``__interrupt__`` into it), so mutating in place would leak an `Interrupt` object — which is not
     JSON — into the next node's payload.
     """
-    import asyncio
-
-    from . import activities as activity_module
-
     context = _node_context()
     merged = dict(state)
     for step in STEPS[name]:
         request = step.build(context, merged)
-        outcome = await asyncio.to_thread(_beat_around(activity_module.impl_for(step.activity)), request)
+        outcome = await _run_step_with_heartbeat(step.activity, request)
         merged.update(outcome.state)
     return merged
 
 
-def _beat_around(body: Callable[[Any], Any]) -> Callable[[Any], Any]:
-    """Wrap a body so it proves liveness on the loop while the work runs on a thread.
+async def _run_step_with_heartbeat(activity_name: str, request: Any) -> Any:
+    """Await one step body on an executor thread while beating from THIS loop.
 
-    A body that takes longer than the heartbeat timeout without beating is retried — correct for a
-    dead worker, wasteful for a healthy long turn. The wrapper is what keeps the two apart, and it
-    lives here (not in `activities.py`) because it is only needed on the graph path: the plain
-    workflow's activity already runs on a worker thread that Temporal heartbeats from the loop.
+    **The beat must be an asyncio task, not a thread.** `codna.task.<step>` is an ASYNC activity
+    (temporalio's langgraph contrib wraps the node in `async def`), and `activity.heartbeat()` in an
+    async activity resolves the running event loop and schedules `_heartbeat_async` on it. Every
+    THREAD-based beat therefore failed, in two different ways, and `_beat_once` swallowed both:
+
+      * a bare `threading.Thread`          -> RuntimeError('Not in activity context')
+      * `threading.Thread(ctx.run(...))`   -> RuntimeError('no running event loop')
+      * a task created on the activity's   -> works
+        own loop
+
+    A thread can therefore never beat for an async activity, whatever context it carries. MEASURED
+    against the real dev server: `loop -> ok`, `executor_thread_copied -> 'no running event loop'`,
+    `nested_thread_bare -> 'Not in activity context'`. The consequence was a wrapper that never beat:
+    a turn that streamed longer than `ACTIVITY_HEARTBEAT_TIMEOUT_S` (120s) failed the workflow with
+    "activity Heartbeat timeout", discarding work the user had already paid for.
+
+    So this awaits the body and the beat loop CONCURRENTLY, cancelling the beat as soon as the body
+    returns or fails. `asyncio` is imported HERE rather than at module scope on purpose: importing it
+    at module scope pulls `socket` into `sys.modules`, which the workflow sandbox refuses
+    (`tests/durable/test_import_hygiene.py`).
+    """
+    import asyncio
+
+    from . import activities as activity_module
+
+    body = activity_module.impl_for(activity_name)
+    beat = asyncio.ensure_future(_beat_loop(activity_name))
+    try:
+        return await asyncio.to_thread(body, request)
+    finally:
+        beat.cancel()
+        try:
+            await beat
+        except asyncio.CancelledError:
+            pass
+
+
+async def _beat_loop(activity_name: str) -> None:
+    """Beat every `HEARTBEAT_INTERVAL_S` until cancelled. Runs on the activity's own loop."""
+    import asyncio
+
+    while True:
+        _beat_once({"activity": activity_name})
+        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+
+
+def _beat_around(body: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """Wrap a SYNCHRONOUS body so it proves liveness while the work runs on another thread.
+
+    Kept for callers that run a body on a thread from a context where `activity.heartbeat()` is
+    served synchronously (a sync activity). The graph path no longer uses it: its activities are
+    ASYNC, and a beat from any thread fails there — see `_run_step_with_heartbeat`, which is what
+    the graph actually calls now.
+
+    The thread must run inside a COPY of the caller's context: a bare `threading.Thread` starts with
+    an EMPTY `contextvars` context, and `temporalio.activity.heartbeat` reads the activity from
+    exactly that contextvar, so a bare thread's beat raises `RuntimeError('Not in activity
+    context')`. MEASURED in a sync activity: `activity_thread -> ok`,
+    `bare_thread -> 'Not in activity context'`, `copied_context_thread -> ok`.
     """
 
     def wrapped(request: Any) -> Any:
         stop = threading.Event()
+        context = contextvars.copy_context()
 
         def beat() -> None:
             while not stop.is_set():
-                _beat_once({"activity": getattr(body, "__name__", "activity")})
+                context.run(_beat_once, {"activity": getattr(body, "__name__", "activity")})
                 stop.wait(HEARTBEAT_INTERVAL_S)
 
         worker = threading.Thread(target=beat, name="codna-heartbeat", daemon=True)

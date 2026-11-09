@@ -109,6 +109,26 @@ MUTATION_ROUTES: Final = frozenset({"steer", "approve", "pause", "resume", "budg
 
 # -- the routes --------------------------------------------------------------------------------
 
+# The capability field that reports `max_streams` — what `--max-streams` set. One spelling: the composer below, the
+# banner `serve` prints and the client's parser all read the same word, so the document cannot disagree with itself.
+MAX_STREAMS_FIELD: Final = "max_streams"
+
+
+def capabilities_payload_for(settings: RunApiSettings, capabilities: Any) -> dict[str, Any]:
+    """The capability document: the backend's route/mode facts, plus this PROCESS's stream ceiling.
+
+    THE ONE COMPOSITION. Three callers send it — `GET /capabilities`, `GET /runs`, and the banner `serve`
+    prints — and all three go through here, so a surface and an operator cannot be told different things
+    about the same process. The ceiling comes from ``settings`` (what `--max-streams` set), which is the
+    SAME value `RunApi._streams` was built from: advertise anything else and the client budgets slots the
+    server will refuse.
+
+    Free rather than a method so the composition is testable without constructing a backend or a socket.
+    """
+    payload = capabilities.as_payload()
+    payload[MAX_STREAMS_FIELD] = settings.max_streams
+    return payload
+
 
 class RunApi:
     """The routes, over a backend. Transport-agnostic: a test can call it without a socket."""
@@ -224,6 +244,27 @@ class RunApi:
     def __repr__(self) -> str:  # pragma: no cover - formatting only, and it must never print the token
         return f"RunApi(config={self.config.address!r}, streams={self.settings.max_streams})"
 
+    # -- what this server can do ----------------------------------------------
+
+    def capabilities_payload(self) -> dict[str, Any]:
+        """The capability document every route that reports one sends.
+
+        ONE COMPOSER, for the reason this whole seam exists. The document is two facts from two owners:
+        the backend knows which routes it can serve, and THIS object owns the stream semaphore, so
+        ``max_streams`` is read from the same ``settings`` the semaphore was built from
+        (``self._streams = BoundedSemaphore(settings.max_streams)``). A client is therefore told the
+        exact number it will be refused at, not a second copy of it.
+
+        Why it is here and not in ``RunCapabilities``: a capability is a property of the backend's
+        CONNECTION (a ledger-only server and a durable one differ), while the stream ceiling is a
+        property of the PROCESS — ``--max-streams``, which the backend is never told. Putting it on the
+        backend would mean passing the settings down to a type that has no semaphore, which is how the
+        advertised number and the enforced one drift apart in the first place.
+
+        Delegates to ``capabilities_payload_for`` so a test can assert the composition without a socket.
+        """
+        return capabilities_payload_for(self.settings, self.backend.capabilities())
+
     # -- run existence ---------------------------------------------------------
 
     def require_run(self, run_id: str) -> dict[str, Any] | None:
@@ -252,6 +293,7 @@ class RunApi:
     def ledger_summary(self, run_id: str) -> dict[str, Any]:
         """A bounded summary of the run's ledger: one read for counts, a tail read for the outcome."""
         from .run_api_support import ledger_problems
+        from .run_repo import repo_dir_of
 
         path = self.config.ledger_path(run_id)
         if not path.is_file():
@@ -264,6 +306,11 @@ class RunApi:
                 "problems": [],
                 "terminal": False,
                 "outcome": None,
+                # WHICH CHECKOUT this run works in — the same fact `GET /runs` carries per row. `None` for a
+                # ledger written before the field existed: a caller must present that as unknown rather than
+                # substitute whichever folder its window happens to have open (the bug #719 fixed on the list
+                # route, which stays fixed here for the detail route that feeds the sidebar and the cursors).
+                "repo_dir": None,
             }
         tail = LedgerTail(path)
         try:
@@ -287,6 +334,9 @@ class RunApi:
             # `terminal: false` beside `outcome: "completed"` contradicts itself.
             "terminal": ended,
             "outcome": outcome,
+            # The run's OWN repository, from the same bounded head scan the list route uses. One reader,
+            # so a run cannot be labelled from its list row and re-labelled from its detail.
+            "repo_dir": repo_dir_of(path),
         }
 
     def audit_control(self, run_id: str, *, action: str, identity: str, principal: Principal | None = None) -> int:
