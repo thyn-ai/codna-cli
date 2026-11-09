@@ -455,6 +455,40 @@ def test_turn_without_a_key_is_never_marked_replayed(client: SidecarClient):
     assert start.events_url and "turn_id=" in start.events_url
 
 
+def test_a_turn_carries_its_own_write_scope_and_all_three_states_differ(client: SidecarClient, sidecar: FakeSidecar):
+    """The turn's scope has THREE wire states, and collapsing any pair is a defect.
+
+    * omitted — inherit the session's scope;
+    * ``[]`` — this turn writes nothing;
+    * ``None`` (JSON ``null``) — explicitly NO additional restriction, overriding the session's.
+
+    The middle one is the original defect (`[]` used to mean "unrestricted"). The third is why
+    ``None`` cannot stand in for "omitted": a durable session is created READ-ONLY, so its writable
+    ``implement`` turn has to lift that scope explicitly — a silent turn would inherit it.
+    """
+    client.create_session(working_dir="/repo")
+
+    client.start_turn("session_fake", "plan only", allowed_write_paths=[])
+    client.start_turn("session_fake", "implement it", allowed_write_paths=None)
+    client.start_turn("session_fake", "one shot")  # OMIT_WRITE_SCOPE
+
+    posts = sidecar.recorded.find("POST", "/v1/sessions/session_fake/turns")
+    # Present and empty: a read-only turn.
+    assert posts[0]["body"]["allowed_write_paths"] == []
+    # Present and null: unrestricted for this turn (JSON-serialised, not a Python `None` that vanished).
+    assert "allowed_write_paths" in posts[1]["body"]
+    assert posts[1]["body"]["allowed_write_paths"] is None
+    # ABSENT (not `[]`, not null): keep the session's scope.
+    assert "allowed_write_paths" not in posts[2]["body"]
+
+
+def test_a_narrowed_turn_sends_its_allow_list(client: SidecarClient, sidecar: FakeSidecar):
+    client.create_session(working_dir="/repo")
+    client.start_turn("session_fake", "edit calc.py", allowed_write_paths=["calc.py"])
+    posts = sidecar.recorded.find("POST", "/v1/sessions/session_fake/turns")
+    assert posts[0]["body"]["allowed_write_paths"] == ["calc.py"]
+
+
 def test_start_turn_reports_an_empty_prompt_precisely(client: SidecarClient):
     with pytest.raises(SidecarClientError) as excinfo:
         client.start_turn("session_fake", "")

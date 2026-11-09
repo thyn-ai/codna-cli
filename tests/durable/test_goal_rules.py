@@ -52,8 +52,16 @@ def _spec(repo: Path, **overrides: Any) -> TaskSpec:
 # -- the reader ----------------------------------------------------------------------------------
 
 
-def test_a_repository_with_no_rules_yields_an_empty_answer(tmp_path: Path):
-    """Empty is a real answer: most repositories have no rules file, and a run must still work."""
+def test_a_repository_with_no_rules_yields_an_empty_answer(tmp_path: Path, monkeypatch):
+    """Empty is a real answer: most repositories have no rules file, and a run must still work.
+
+    ``HOME`` is pointed at an empty directory because the reader also honours the USER layer
+    (``~/.codna/rules``, ``~/.cursor/skills`` …), exactly as Cursor does. Without that, this assertion
+    would be about whatever the machine running the suite happens to have installed rather than about
+    the repository under test.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
     repo = fakes.make_repo(tmp_path / "repo")
     assert project_rules_for(str(repo)) == ""
     assert _project_rules(TaskContext.from_spec(_spec(repo)), str(repo)) == ""
@@ -73,6 +81,20 @@ def test_codna_rules_reaches_the_turn(tmp_path: Path):
     (repo / ".codna").mkdir()
     (repo / ".codna" / "rules").write_text("Prefer small diffs.\n", encoding="utf-8")
     assert "Prefer small diffs." in project_rules_for(str(repo))
+
+
+def test_globs_scoped_rules_are_attached_to_a_durable_turn(tmp_path: Path):
+    """A durable turn's file set is UNKNOWN, so a globbed rule must still reach it.
+
+    The durable agent may edit anything in its tree. Withholding a glob-scoped convention because the
+    caller did not enumerate files would be silent under-application: the agent would never be told the
+    convention governing the files it is about to change.
+    """
+    repo = fakes.make_repo(tmp_path / "repo")
+    (repo / ".codna" / "rules").mkdir(parents=True)
+    (repo / ".codna" / "rules" / "ts.mdc").write_text(
+        "---\nglobs: src/**/*.ts\n---\nTS ONLY\n", encoding="utf-8")
+    assert "TS ONLY" in project_rules_for(str(repo))
 
 
 def test_the_rules_are_bounded_for_the_PROMPT_not_just_the_file(tmp_path: Path):
@@ -145,8 +167,10 @@ def _create_session_spec(
     return dict(harness.sidecar.sessions[-1]["spec"])
 
 
-def test_the_plan_turn_carries_the_rules_in_the_field_the_engine_reads(tmp_path: Path):
+def test_the_plan_turn_carries_the_rules_in_the_field_the_engine_reads(tmp_path: Path, monkeypatch):
     """`injected_context` is what the engine folds into the system prompt — asserted, not assumed."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
     repo = fakes.make_repo(tmp_path / "repo")
     (repo / "AGENTS.md").write_text("# Rules\n- Use the sandbox\n", encoding="utf-8")
     runs_root = tmp_path / "runs"
@@ -160,6 +184,63 @@ def test_the_plan_turn_carries_the_rules_in_the_field_the_engine_reads(tmp_path:
     # ...and the identity this feature must not disturb.
     assert sent["multi_turn"] is True
     assert sent["owner"] == "codna-run-run-rules"
+
+
+def test_the_plan_turn_carries_the_SKILL_CATALOGUE_in_the_same_field(tmp_path: Path):
+    """A durable turn gets skills the same way it gets rules: one `injected_context`, one budget.
+
+    The catalogue — not the body. A durable run may go for hours and invoke several skills; carrying
+    every body on every turn of every task would be the token cost this feature exists to remove.
+    """
+    repo = fakes.make_repo(tmp_path / "repo")
+    (repo / "AGENTS.md").write_text("# Rules\n- Use the sandbox\n", encoding="utf-8")
+    skills = repo / ".cursor" / "skills" / "pdf"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text(
+        "---\ndescription: fill a PDF form\n---\nUNIQUE-SKILL-BODY\n", encoding="utf-8")
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    harness = fakes.build_harness(repo, runs_root)
+
+    sent = _create_session_spec(harness, _spec(repo), tree=str(repo))
+
+    injected = sent.get("injected_context", "")
+    assert "Use the sandbox" in injected, sent
+    assert "- pdf: fill a PDF form" in injected, sent
+    # Progressive disclosure holds on the durable path too.
+    assert "UNIQUE-SKILL-BODY" not in injected
+
+
+def test_the_durable_path_does_not_read_the_WORKERS_home(tmp_path: Path):
+    """A run's conventions are the REPOSITORY's — never the machine that happens to execute it.
+
+    A `TaskSpec` is workflow history, and a durable run executes on a worker. If the worker's
+    ``~/.cursor/skills`` or ``~/.codna/rules`` reached the prompt, two workers running the same recorded
+    task would produce two different prompts, and one machine's private conventions would become a
+    repository's guidance. The IDE path — the user's own machine — keeps the user layer ON; this one
+    deliberately does not.
+    """
+    home = tmp_path / "home"
+    (home / ".codna" / "rules").mkdir(parents=True)
+    (home / ".codna" / "rules" / "private.mdc").write_text(
+        "---\nalwaysApply: true\n---\nWORKER PRIVATE RULE\n", encoding="utf-8")
+    (home / ".cursor" / "skills" / "private").mkdir(parents=True)
+    (home / ".cursor" / "skills" / "private" / "SKILL.md").write_text(
+        "---\ndescription: a worker-private skill\n---\nBODY\n", encoding="utf-8")
+
+    repo = fakes.make_repo(tmp_path / "repo")
+    (repo / "AGENTS.md").write_text("# Rules\n- REPOSITORY RULE\n", encoding="utf-8")
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    harness = fakes.build_harness(repo, runs_root)
+
+    # HOME points at the populated directory, so a reader that consulted it WOULD find these.
+    sent = _create_session_spec(harness, _spec(repo), tree=str(repo), env={"HOME": str(home)})
+
+    injected = sent.get("injected_context", "")
+    assert "REPOSITORY RULE" in injected
+    assert "WORKER PRIVATE RULE" not in injected
+    assert "a worker-private skill" not in injected
 
 
 def test_a_task_that_opts_out_sends_no_injected_context(tmp_path: Path):
