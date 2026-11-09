@@ -110,6 +110,10 @@ def task_spec_from_config(config: Mapping[str, Any] | None) -> Any:
         # Absent in a payload recorded before project rules were attached: `False` is what that run
         # MEANT (it sent no guidance), so decoding it as `True` would change its prompts on replay.
         attach_project_rules=bool(raw.get("attach_project_rules", False)),
+        # Absent in a payload recorded before user-defined subagents could be attached: `False` is what
+        # that run MEANT (it sent no roster), so decoding it as the new default would change its
+        # sessions on replay.
+        attach_subagents=bool(raw.get("attach_subagents", False)),
         # Absent before MCP servers could be carried: `()` is exactly what such a run sent, so its
         # replay creates the same sessions it recorded rather than gaining an MCP field.
         mcp_servers=_mcp_servers(raw.get("mcp_servers")),

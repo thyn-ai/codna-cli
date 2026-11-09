@@ -31,7 +31,13 @@ import pytest
 from codna.durable.activities import ActivityRuntime, configure_default_runtime
 from codna.durable.config import DurablePaths
 from codna.durable.ledger import RunLedger
-from codna.durable.sidecar_client import SidecarClientError, SidecarSession, SseEvent, TurnStart
+from codna.durable.sidecar_client import (
+    OMIT_WRITE_SCOPE,
+    SidecarClientError,
+    SidecarSession,
+    SseEvent,
+    TurnStart,
+)
 
 TERMINAL_OK = "session.turn_completed"
 TERMINAL_FAILED = "session.turn_failed"
@@ -108,6 +114,11 @@ class FakeSidecar:
     # it was supposed to replay becomes a second paid turn (`turn_key_rescoped`).
     turn_keys: dict[str, dict[str, str]] = field(default_factory=dict)
     sessions: list[dict[str, Any]] = field(default_factory=list)
+    #: One entry per `start_turn`: the TURN's write scope as it arrived on the wire (`None` = the turn
+    #: named none and keeps the session's). Recorded separately from `sessions` because the scope is a
+    #: per-turn property — a durable task's read-only plan turn and writable implement turn share one
+    #: session, so "was this session created read-only?" cannot answer "may THIS turn write?".
+    turn_write_scopes: list[dict[str, Any]] = field(default_factory=list)
     aborts: list[str] = field(default_factory=list)
     prompts: list[str] = field(default_factory=list)
     closed: int = 0
@@ -170,11 +181,32 @@ class FakeSidecar:
                 resume_from_ignored=resume_from is not None,
             )
 
-    def start_turn(self, session_id: str, prompt: str, *, turn_key: str | None = None) -> TurnStart:
+    def start_turn(
+        self,
+        session_id: str,
+        prompt: str,
+        *,
+        turn_key: str | None = None,
+        allowed_write_paths: Any = OMIT_WRITE_SCOPE,
+    ) -> TurnStart:
         key = turn_key or ""
         with self.lock:
             self._require_live(session_id)
             self.prompts.append(prompt)
+            # The TURN's scope, exactly as it arrived: `OMIT_WRITE_SCOPE` = the caller named none,
+            # `None` = explicit "no additional restriction" (JSON null), a sequence = that scope
+            # (`[]` is read-only). Recorded per turn because a durable task's plan and implement turns
+            # share one session, so the SESSION's scope cannot answer "may THIS turn write?".
+            self.turn_write_scopes.append(
+                {
+                    "session_id": session_id,
+                    "allowed_write_paths": (
+                        "omitted"
+                        if allowed_write_paths is OMIT_WRITE_SCOPE
+                        else allowed_write_paths
+                    ),
+                }
+            )
             session_keys = self.turn_keys.setdefault(session_id, {})
             if key and key in session_keys:
                 # `turn_key` idempotency, exactly as the wire specifies: the SAME turn id, no new
@@ -183,7 +215,9 @@ class FakeSidecar:
                 # this index has never seen is a first call and starts a real turn.
                 return TurnStart(session_id=session_id, turn_id=session_keys[key], replayed=True)
             turn_id = f"turn-{len(self.turns) + 1}"
-            read_only = self.read_only_turn(session_id)
+            read_only = self.read_only_turn(
+                session_id, allowed_write_paths=allowed_write_paths
+            )
             self.turns.append(
                 FakeTurn(
                     turn_id=turn_id,
@@ -259,8 +293,17 @@ class FakeSidecar:
                 return dict(session.get("spec") or {})
         return {}
 
-    def read_only_turn(self, session_id: str) -> bool:
-        """Whether the session was created read-only — the engine's allow-list, not the prompt's ask."""
+    def read_only_turn(self, session_id: str, *, allowed_write_paths: Any = OMIT_WRITE_SCOPE) -> bool:
+        """Whether THIS turn writes nothing — the engine's allow-list, not the prompt's ask.
+
+        The turn's own scope wins whenever the caller named one:
+        ``[]`` = read-only, a list = restricted but writable, ``None`` (JSON null) = explicitly
+        unrestricted, which LIFTS a read-only session. Only a turn that named nothing inherits the
+        session's create spec — and that inheritance is exactly why a durable run's writable
+        ``implement`` turn must send ``None`` rather than omit the field.
+        """
+        if allowed_write_paths is not OMIT_WRITE_SCOPE:
+            return allowed_write_paths is not None and len(allowed_write_paths) == 0
         for session in reversed(self.sessions):
             spec = session.get("spec") or {}
             if spec.get("allowed_write_paths") == []:

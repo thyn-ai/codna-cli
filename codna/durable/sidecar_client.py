@@ -56,6 +56,31 @@ SESSIONS_PATH: Final = "/v1/sessions"
 # handler; kept as a constant so the fallback is explicit rather than a literal in a function.
 LEGACY_SESSIONS_PATH: Final = "/sessions"
 
+
+class _OmitWriteScope:
+    """Sentinel for ``start_turn(allowed_write_paths=...)``: "this turn names no scope".
+
+    A sentinel rather than ``None`` because ``None`` is a MEANINGFUL wire value here (JSON ``null`` =
+    "no additional restriction"), and because the three states must not be confused:
+
+    * omitted (this sentinel) — inherit the session's scope;
+    * ``None`` — explicitly unrestricted for this turn, overriding the session's;
+    * ``[]`` — this turn writes nothing.
+
+    The middle one exists because a durable run creates its session READ-ONLY, so its writable
+    ``implement`` turn has to lift that scope explicitly rather than inherit it.
+
+    ``repr`` is stable so a failed assertion prints something a reader can act on.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "OMIT_WRITE_SCOPE"
+
+
+OMIT_WRITE_SCOPE: Final = _OmitWriteScope()
+
 # Terminal turn events, from `server/http.ts::_SSE_TERMINAL`. The stream is expected to end on one
 # of these; seeing one is what distinguishes "turn finished" from "connection dropped".
 SSE_TERMINAL_TURN_EVENTS: Final[frozenset[str]] = frozenset(
@@ -468,21 +493,46 @@ class SidecarClient:
 
     # -- turns --------------------------------------------------------------------
 
-    def start_turn(self, session_id: str, prompt: str, *, turn_key: str | None = None) -> TurnStart:
+    def start_turn(
+        self,
+        session_id: str,
+        prompt: str,
+        *,
+        turn_key: str | None = None,
+        allowed_write_paths: Sequence[str] | None | _OmitWriteScope = OMIT_WRITE_SCOPE,
+    ) -> TurnStart:
         """Start a turn, or replay one.
 
         ``202`` = a turn started; ``200`` with ``replayed: true`` = the key was already used and
         nothing was started. Any other status is an error carrying the sidecar's own code (``429``
         admission and ``409`` start failures are both expected in production).
+
+        ``allowed_write_paths`` is the TURN's write scope, and all three wire states are expressible
+        because they mean three different things:
+
+        * :data:`OMIT_WRITE_SCOPE` (the default) — the field is not sent; the session's own scope
+          stands. This is what a one-shot caller means.
+        * ``None`` — sent as JSON ``null``: NO additional restriction for this turn, explicitly
+          overriding the session's. Needed because a durable session is CREATED read-only, so its
+          writable ``implement`` turn cannot inherit it.
+        * a sequence — sent as an array; ``[]`` means this turn writes nothing.
+
+        A durable task's plan and implement turns share one session, so the scope cannot live only on
+        the create request — and ``None``/absent/``[]`` must not collapse into each other.
         """
         _validate_session_id(session_id)
         headers = self._headers({"content-type": "application/json"})
         if turn_key:
             headers["x-codna-turn-key"] = turn_key
+        body: dict[str, Any] = {"prompt": prompt}
+        if not isinstance(allowed_write_paths, _OmitWriteScope):
+            body["allowed_write_paths"] = (
+                None if allowed_write_paths is None else list(allowed_write_paths)
+            )
         response = self._client.post(
             f"{self._base_url}{SESSIONS_PATH}/{session_id}/turns",
             headers=headers,
-            content=json.dumps({"prompt": prompt}),
+            content=json.dumps(body),
         )
         self._raise_for(response, what="start_turn")
         if response.status_code not in (200, 202):
