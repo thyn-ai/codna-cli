@@ -31,6 +31,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from .ignore import IgnoreStack
+
 # Ecosystem-wide conventions (not any one repo's): dependency manifests, test configuration, and
 # CI/infra files can affect anything, so changing one selects the full suite. Overridable.
 DEFAULT_BROAD_GLOBS = (
@@ -76,14 +78,35 @@ def _module_key(rel_path: str) -> str | None:
     return ".".join(parts) if parts else None
 
 
-def _iter_py_files(repo_root: Path, ignore) -> list[Path]:
-    ignore_set = set(ignore)
+def _iter_py_files(repo_root: Path, ignore: tuple[str, ...] | None = None) -> list[Path]:
+    """Python files under ``repo_root``, minus the ignore stack (gitignore / Cursor / Codna).
+
+    Decided on the repo-relative path, so a gitignored ``data/`` is not scanned for import edges.
+    An ignore decision that disagreed with the indexer would make CI select tests against a graph
+    the index never built.
+    """
+    stack = IgnoreStack.build(repo_root, extras=tuple(ignore or ()))
+    has_negation = stack.has_negation()
     out: list[Path] = []
     for root, dirs, files in os.walk(repo_root):
-        dirs[:] = [d for d in dirs if d not in ignore_set and not d.startswith(".")]
+        rel_root = os.path.relpath(root, repo_root).replace(os.sep, "/")
+        kept: list[str] = []
+        for name in dirs:
+            rel_dir = name if rel_root == "." else f"{rel_root}/{name}"
+            # A floor-excluded directory can never be re-included, so it is always pruned.
+            if stack.is_floor_ignored_dir(rel_dir):
+                continue
+            if stack.is_ignored_dir(rel_dir) and not has_negation:
+                continue
+            kept.append(name)
+        dirs[:] = kept
         for fn in files:
-            if fn.endswith(".py"):
-                out.append(Path(root) / fn)
+            if not fn.endswith(".py"):
+                continue
+            rel = fn if rel_root == "." else f"{rel_root}/{fn}"
+            if stack.is_ignored(rel):
+                continue
+            out.append(Path(root) / fn)
     return out
 
 

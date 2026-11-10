@@ -1,0 +1,5 @@
+---
+description: No default exports in TSX
+globs: "**/*.tsx"
+---
+TSX: never use a default export; use a named export so refactors stay mechanical.

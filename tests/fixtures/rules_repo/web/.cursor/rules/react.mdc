@@ -1,0 +1,5 @@
+---
+description: React conventions for the web app
+globs: "src/**/*.tsx"
+---
+React: function components only; keep hooks at the top of the component.

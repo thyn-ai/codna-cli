@@ -391,10 +391,23 @@ def _scan_ledger(ledger: Any, turn_key: str) -> tuple[_RecordedTurn | None, Ledg
     The high-water floor is scoped to the recorded turn's SESSION. Event indices are per session, so
     a floor taken across sessions could sit above this turn's real position and silently skip events
     — the one error a resume must never make.
+
+    **The floor steps back below a TERMINAL event, because `?after=` is EXCLUSIVE.** An attempt can
+    append the turn's terminal event and then die before its own bookkeeping (measured: the turn
+    aborted on a model loop, `session.turn_aborted` was ledgered, and the activity raised one line
+    before writing `turn.finished`). A retry then re-attached with ``?after=<that terminal's index>``
+    — asking the sidecar for everything AFTER the event that ends the turn. Nothing more was ever
+    emitted, so the stream followed no live events and blocked until the 60-minute activity ceiling,
+    heartbeating happily: the run looked alive forever and its ledger never grew again.
+    A floor of ``index - 1`` replays exactly that one terminal, which is what lets the retry observe
+    the ending and fail by name instead of hanging.
     """
+    from .sidecar_client import SSE_TERMINAL_TURN_EVENTS
+
     recorded: _RecordedTurn | None = None
     completion: LedgerRecord | None = None
     high_water = 0
+    terminal_index: int | None = None
     for record in ledger.records():
         if recorded is None:
             if record.kind != "turn.started":
@@ -414,10 +427,22 @@ def _scan_ledger(ledger: Any, turn_key: str) -> tuple[_RecordedTurn | None, Ledg
             continue
         if record.session_id == recorded.session_id and record.event_index is not None:
             high_water = max(high_water, record.event_index)
+            if record.kind == "turn.event":
+                event_payload = record.payload
+                if (
+                    isinstance(event_payload, Mapping)
+                    and event_payload.get("event_type") in SSE_TERMINAL_TURN_EVENTS
+                ):
+                    terminal_index = record.event_index
         if record.kind == "turn.finished" and record.payload.get("turn_id") == recorded.turn_id:
             completion = record
     if recorded is None:
         return None, None
+    # Only when the terminal is the LAST thing this turn recorded: then it is the floor, `?after=`
+    # would skip it, and replaying one event is both safe and necessary. A terminal followed by
+    # later events means the stream was already reading past it, so the floor is left alone.
+    if completion is None and terminal_index is not None and terminal_index == high_water:
+        high_water = max(0, high_water - 1)
     return _RecordedTurn(recorded.session_id, recorded.turn_id, high_water), completion
 
 
@@ -804,7 +829,17 @@ def _start_turn(
     session_id = _ensure_session(
         runtime, client, context, state, read_only=read_only, working_tree=working_tree
     )
-    start = client.start_turn(session_id, prompt, turn_key=turn_key)
+    # The TURN carries its own scope, because the plan and implement turns share ONE session and the
+    # session is created READ-ONLY (an unattended run must not be writable by default). So:
+    #   * a read-only turn sends `[]` (write nothing);
+    #   * a writable turn sends `None`, i.e. JSON `null`, which explicitly lifts the session's
+    #     read-only scope. Sending nothing would INHERIT it and leave the implement turn unable to work.
+    start = client.start_turn(
+        session_id,
+        prompt,
+        turn_key=turn_key,
+        allowed_write_paths=[] if read_only else None,
+    )
     ledger.append(
         "turn.started",
         task_id=task_id,

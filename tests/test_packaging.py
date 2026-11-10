@@ -270,6 +270,77 @@ def test_the_policy_reader_module_ships_in_the_wheel():
     )
 
 
+def test_the_rule_engine_and_its_bridge_ship_in_the_wheel():
+    """The rule engine is imported by `project_rules`, `durable.rules` and `codna rules`.
+
+    `codna.rules_bridge` is spawned as `python -m codna.rules_bridge` by the IDE backend
+    (`ide/packages/codna-engine-client/src/projectRules.ts`), which resolves through normal package
+    import — so both have to ship. A missing subpackage would fail only in a PACKAGED install, where
+    the failure is an ImportError at the first turn rather than anything a checkout test would see.
+    """
+    pytest.importorskip("setuptools", reason="setuptools is not installed on this lane")
+    from setuptools import Distribution
+    from setuptools.command.build_py import build_py
+
+    declared = _data()["tool"]["setuptools"]["packages"]
+    dist = Distribution(
+        {"packages": declared, "script_name": "setup.py", "package_dir": {"": str(ROOT / "cli")}}
+    )
+    command = build_py(dist)
+    command.ensure_finalized()
+    shipped = {(package, module) for package, module, _src in command.find_all_modules()}
+
+    assert ("codna", "rules_bridge") in shipped, (
+        "codna/rules_bridge.py would NOT be in the wheel, so the IDE's `python -m codna.rules_bridge` "
+        f"fails for every packaged install. Shipped codna modules: {sorted(shipped)[:12]}"
+    )
+    # The SKILLS bridge is spawned the same way (`python -m codna.skills_bridge`, by
+    # `codna-theia/src/node/codna-skills-server.ts`), so a missing module is the same packaged-only
+    # ImportError — and it would look like "this repository has no skills", which is worse.
+    assert ("codna", "skills_bridge") in shipped, (
+        "codna/skills_bridge.py would NOT be in the wheel, so `/skill-name` and the skill catalogue "
+        f"are empty for every packaged install. Shipped codna modules: {sorted(shipped)[:12]}"
+    )
+    for module in ("model", "globs", "frontmatter", "discovery", "select", "render", "fsutil",
+                   "skill_model", "skills"):
+        assert ("codna.rules", module) in shipped, f"codna/rules/{module}.py must ship"
+
+
+def test_the_rules_subpackage_is_declared_because_it_is_a_package():
+    """An explicit pin: `codna.rules` is a package, so it needs a `packages` entry, not just files."""
+    packages = _data()["tool"]["setuptools"]["packages"]
+    assert "codna.rules" in packages
+
+
+def test_the_mcp_bridge_ships_in_the_wheel():
+    """`codna.mcp_bridge` is spawned as `python -m codna.mcp_bridge` by the IDE chat path.
+
+    It lives in the top-level `codna` package (already declared) and imports `codna.durable.mcp`, so both
+    must be importable from an installed wheel. A missing module would surface only in a PACKAGED install,
+    where the failure is a `ModuleNotFoundError` at the first chat turn — indistinguishable from "MCP is
+    broken" to the user — which is exactly what this assertion prevents.
+    """
+    pytest.importorskip("setuptools", reason="setuptools is not installed on this lane")
+    from setuptools import Distribution
+    from setuptools.command.build_py import build_py
+
+    declared = _data()["tool"]["setuptools"]["packages"]
+    dist = Distribution(
+        {"packages": declared, "script_name": "setup.py", "package_dir": {"": str(ROOT / "cli")}}
+    )
+    command = build_py(dist)
+    command.ensure_finalized()
+    shipped = {(package, module) for package, module, _src in command.find_all_modules()}
+
+    assert ("codna", "mcp_bridge") in shipped, (
+        "codna/mcp_bridge.py would NOT be in the wheel, so the IDE's `python -m codna.mcp_bridge` fails "
+        f"for every packaged install. Shipped codna modules: {sorted(shipped)[:12]}"
+    )
+    # The bridge is a thin adapter over the ONE validator, so the durable package must ship beside it.
+    assert "codna.durable" in declared
+    assert ("codna.durable", "mcp") in shipped, "codna/durable/mcp.py must ship — it IS the validator"
+
+
 
 def test_telys_package_data_is_manifest_scoped():
     package_data = _data()["tool"]["setuptools"]["package-data"]["codna"]
@@ -407,6 +478,26 @@ def test_sidecar_image_publishes_under_current_github_owner():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "ghcr.io/thyn-ai/codna/sidecar" in workflow
     assert "ghcr.io/escrypto-labs/codna/sidecar" not in workflow
+
+
+def test_recall_gate_asserts_on_junit_report_not_text_output():
+    """The recall gate must prove tests RAN from the JUnit report, not from reporter formatting.
+
+    THE REGRESSION. The old guard grepped the pytest TEXT log for `recall happy path` and similar.
+    Under `-q`, those humanised names are printed ONLY by the `pytest-relaxed` plugin, which is a
+    developer-box package and is absent from the CI venv — so on a suite where all ten tests passed
+    the grep matched nothing and the step failed with "the happy path / install-wiring regression did
+    not execute". This asserts the durable shape of the fix, since a plain `grep` is easy to
+    reintroduce: the suite emits a JUnit report and the guard reads it.
+    """
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "--junitxml=\"$RUNNER_TEMP/telys-recall.xml\"" in workflow
+    assert 'scripts/verify_recall_gate_ran.py --junit-report "$RUNNER_TEMP/telys-recall.xml"' in workflow
+    # The name-grepping guard must not come back: it cannot distinguish "ran" from "formatted".
+    assert 'grep -qE "recall happy path|resolved install site dir|declared site dir"' not in workflow
+    # And the gate must still fail on an absent/empty log rather than silently pass.
+    assert "Recall gate produced no log" in workflow
 
 
 def test_public_action_examples_use_current_github_owner():
@@ -553,7 +644,14 @@ def test_cli_publish_workflow_uses_trusted_publishing_and_contract_verification(
     # workflow_dispatch, and again on 0.2.7 when a CDN-stale PyPI read made a release run dispatch a
     # second publish (deployment 5974216490 succeeded, duplicate 5974321714 failed, 0.2.7 live
     # throughout). Asserted so the idempotency cannot be dropped again.
-    assert "python -m twine upload --non-interactive --skip-existing cli/dist/*" in workflow
+    #
+    # `--verbose` is asserted because PyPI puts the reason for a rejection in the response BODY, and
+    # twine prints that body only when verbose: 0.2.114 failed from 2026-11-07 to 2026-11-09 with a
+    # bare `400 Bad Request` (job 129351572504) while PyPI was saying "Project size too large". A
+    # publish that fails with an unactionable message is a defect in its own right.
+    assert (
+        "python -m twine upload --verbose --non-interactive --skip-existing cli/dist/*" in workflow
+    )
     # The OIDC path is asserted STRUCTURALLY, on the parsed step input -- a substring check for
     # "skip-existing: true" is satisfied by the prose comment above those steps, so it could not
     # fail (verified: deleting the real input left a text-only assert green).
@@ -571,6 +669,45 @@ def test_cli_publish_workflow_uses_trusted_publishing_and_contract_verification(
         assert (st.get("with") or {}).get("skip-existing") is True, (
             f"{st.get('name')!r} must pass skip-existing: true so a duplicate upload is a no-op"
         )
+    # The token path must REALLY carry --verbose, asserted on the parsed step rather than as a
+    # substring so the prose comment above it cannot satisfy the check on its own.
+    _token_steps = [
+        st
+        for job in _doc["jobs"].values()
+        for st in job.get("steps", [])
+        if (st.get("env") or {}).get("TWINE_PASSWORD")
+    ]
+    assert _token_steps, "the token publish step vanished"
+    for st in _token_steps:
+        assert "--verbose" in str(st.get("run", "")), (
+            f"{st.get('name')!r} must run twine with --verbose so PyPI's explanation is printed"
+        )
+        assert "--skip-existing" in str(st.get("run", ""))
+    # The size preflight must run in the publish job, on the artifacts it is about to upload, BEFORE
+    # the upload step: an over-limit release then fails naming the overage instead of surfacing as
+    # PyPI's bare 400. It must also run in build-verify, so the failure costs seconds, not the
+    # 90-minute runtime staging and build.
+    _publish_job = _doc["jobs"]["publish"]
+    _publish_names = [str(st.get("name", "")) for st in _publish_job["steps"]]
+    _size_steps = [
+        st for st in _publish_job["steps"] if st.get("name") == "Check PyPI project size headroom"
+    ]
+    assert _size_steps, "the publish job must check PyPI project size headroom"
+    for st in _size_steps:
+        command = str(st.get("run", ""))
+        assert "scripts/check_pypi_project_size.py" in command
+        assert "--project codna" in command
+        # cli/dist/* is the real payload glob, not one known filename.
+        assert "cli/dist/*" in command
+    _upload_index = next(
+        i
+        for i, st in enumerate(_publish_job["steps"])
+        if "twine upload" in str(st.get("run", ""))
+    )
+    assert _publish_names.index("Check PyPI project size headroom") < _upload_index
+    assert "Check PyPI project size headroom" in [
+        str(st.get("name", "")) for st in _doc["jobs"]["build-verify"]["steps"]
+    ]
     assert workflow.count("TWINE_PASSWORD:") == 1  # ONLY the gated token-fallback step, nowhere else
     assert "password:" not in workflow  # the token path must not use the pypa action's password input
     assert "api-token:" not in workflow

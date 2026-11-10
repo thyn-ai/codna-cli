@@ -1261,6 +1261,47 @@ def test_the_session_is_resumed_across_turns(tmp_path: Path):
     assert second.state["session_id"] == harness.session_ids()[0]
 
 
+def test_a_read_only_plan_turn_writes_nothing_while_sharing_the_implement_turn_s_session(tmp_path: Path):
+    """The read-only plan turn must not be writable — and the implement turn must still be.
+
+    A task's turns share ONE session on purpose (the conversation carries over), so the write scope
+    cannot be a property of the session: it is a property of the TURN. The plan turn declares
+    `allowed_write_paths: []` and the implement turn declares nothing, and the engine must read those
+    as "write nothing" and "keep the workspace boundary" respectively.
+
+    This is the regression test for the defect where `[]` meant "no additional restriction", so the
+    plan turn could modify the working tree despite being declared read-only.
+    """
+    from codna.durable.activities import plan_task, run_cline_turn
+    from codna.durable.contracts import TaskContext
+
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    spec = _spec(repo_dir=str(repo), engine="plain")
+    context = TaskContext.from_spec(spec)
+
+    plan = plan_task(context.plan_request(spec.brief, spec.initial_state()))
+    implement = run_cline_turn(context.turn_request("implement it", plan.state))
+
+    # ONE session: the read-only turn and the writable one are the same conversation.
+    assert implement.state["session_id"] == plan.state["session_id"]
+
+    scopes = harness.sidecar.turn_write_scopes
+    assert len(scopes) == 2, scopes
+    # The plan turn says "write nothing" ON THE TURN, not by asking the model nicely.
+    assert scopes[0]["allowed_write_paths"] == []
+    # The implement turn sends JSON `null` — "no additional restriction" — and NOT nothing. The
+    # session was CREATED read-only (an unattended run must not be writable by default), so a turn
+    # that stayed silent would INHERIT that scope and be unable to do its job.
+    assert scopes[1]["allowed_write_paths"] is None
+
+    # The fake models the engine's own rule: a read-only turn cannot change the tree, a writable one
+    # can. This is what makes the assertion above about behaviour rather than about a field.
+    assert [turn.read_only for turn in harness.sidecar.turns] == [True, False]
+
+
 def test_the_report_counts_are_the_real_ones(tmp_path: Path):
     """A meta-test: the harness itself is exercised, so a green suite is not a vacuous one."""
     repo = fakes.make_repo(tmp_path / "repo")
