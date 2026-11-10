@@ -81,6 +81,10 @@ class FakeSidecar:
     # the exact shape `execution.ts` now emits when a tool call was parked for a human. Set as a dict
     # so a test can assert the durable side parks on THAT ask rather than on one it invented.
     ask_on_terminal: dict[str, Any] | None = None
+    # The engine's `abort` block on an ABORTED terminal (`{kind, reason}`), transcribed from
+    # `execution.ts`. When set, every terminal event carries it — so a test can assert the durable side
+    # REPORTS the reason rather than only naming the terminal that ended the turn.
+    abort_on_terminal: dict[str, Any] | None = None
 
     turns: list[FakeTurn] = field(default_factory=list)
     # D7/OVERLAP: one `(task_id, started_at, finished_at)` entry per turn, on the contract CLOCK.
@@ -360,6 +364,7 @@ class FakeSidecar:
                 # Both are on the terminal event (see `execution.ts`), which is what lets the activity
                 # decide synchronously with the turn's end rather than by inspecting later state.
                 **({"finish_reason": "ask", "ask": dict(self.ask_on_terminal)} if self.ask_on_terminal else {}),
+                **({"abort": dict(self.abort_on_terminal)} if self.abort_on_terminal else {}),
             },
         )
         if self.overlap_clock is not None:

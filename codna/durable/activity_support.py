@@ -710,6 +710,12 @@ def _stream(
     terminal: str | None = None
     finish_reason: str = "completed"
     ask: Mapping[str, Any] | None = None
+    # WHY the turn was aborted, when the engine said so on its terminal event: the `abort` block
+    # (`{kind, reason}`) that distinguishes a fail-closed guard refusal (`control_stop`) from a
+    # cancellation (`caller_abort`). Before the engine carried it, the reason a write-scope hook
+    # supplied was computed and then dropped, so an aborted task reached this layer as a bare
+    # terminal name with nothing to report to the user.
+    abort: Mapping[str, Any] | None = None
     last_beat = runtime.clock()
     for event in client.stream_turn(
         session_id,
@@ -749,6 +755,10 @@ def _stream(
             raw_ask = event.payload.get("ask")
             if isinstance(raw_ask, Mapping):
                 ask = dict(raw_ask)
+            # Read at the terminal, like `ask`: the reason exists only for the turn that was stopped,
+            # so carrying it any other way would let one turn's refusal explain another's ending.
+            raw_abort = event.payload.get("abort")
+            abort = dict(raw_abort) if isinstance(raw_abort, Mapping) else None
         now = runtime.clock()
         if now - last_beat >= HEARTBEAT_INTERVAL_S:
             last_beat = now
@@ -772,10 +782,26 @@ def _stream(
             details={"session_id": session_id, "turn_id": turn_id, "event_index": last_index},
         )
     if terminal != "session.turn_completed":
+        # The engine's abort reason belongs on the failure, not only in a log. `terminal` names the
+        # event; `abort.kind` says whether the work was refused on purpose or cancelled, and
+        # `abort.reason` quotes the refusal (e.g. a write-scope violation) so the run's failure is
+        # legible without replaying the stream. `reason` is promoted alongside `abort` because that
+        # is the field every existing ActivityError consumer already reads.
+        abort_reason = abort.get("reason") if abort is not None else None
         raise ActivityError(
             f"turn {turn_id} did not complete: {terminal}",
             code="activity_turn_failed",
-            details={"session_id": session_id, "turn_id": turn_id, "terminal": terminal},
+            details={
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "terminal": terminal,
+                # The whole block is preserved (so a field added to `abort` later is not lost here)…
+                **({"abort": dict(abort)} if abort is not None else {}),
+                # …and `kind`/`reason` are promoted, because those are the two a caller branches on and
+                # `reason` is the field every existing ActivityError consumer already reads.
+                **({"kind": abort["kind"]} if abort is not None and isinstance(abort.get("kind"), str) else {}),
+                **({"reason": abort_reason} if isinstance(abort_reason, str) and abort_reason else {}),
+            },
         )
     ledger.append(
         "turn.finished",

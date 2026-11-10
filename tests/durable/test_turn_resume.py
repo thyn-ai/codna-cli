@@ -19,6 +19,7 @@ Run WITHOUT the durable extra this module SKIPs (it drives the real activity bod
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -522,3 +523,76 @@ def test_the_resume_floor_is_untouched_when_the_terminal_is_not_last(tmp_path: P
     recorded, completion = _scan_ledger(ledger, "run-1:task-1:1")
     assert recorded is not None and completion is None
     assert recorded.high_water == 5, recorded
+
+
+# ── THE ABORTED TURN MUST SAY WHY TO THE DURABLE CALLER ──────────────────────────────────────────
+#
+# The Python client is the last consumer in the chain the defect was measured along. Its terminal
+# branch raised `activity_turn_failed` with only the terminal NAME, so a write-scope guard refusing a
+# write (the fail-closed arm) and a user cancellation produced an identical failure: `terminal:
+# "session.turn_aborted"` and nothing else. The engine now carries `abort: {kind, reason}`; these pin
+# that it reaches the error a durable caller actually receives.
+def test_an_aborted_turn_reports_the_guard_reason_to_the_durable_caller(tmp_path: Path):
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    context, spec = _context(repo)
+
+    harness.sidecar.terminal = fakes.TERMINAL_ABORTED
+    harness.sidecar.abort_on_terminal = {
+        "kind": "control_stop",
+        "reason": "write-scope violation: this turn is read-only, so 'editor' is refused",
+    }
+
+    with pytest.raises(ActivityError) as excinfo:
+        run_cline_turn(context.turn_request("implement it", spec.initial_state()))
+
+    details = excinfo.value.details
+    assert excinfo.value.code == "activity_turn_failed"
+    assert details["terminal"] == "session.turn_aborted"
+    # The refusal is now legible without replaying the stream: kind, quoted rule, and the promoted
+    # `reason` field every ActivityError consumer already reads.
+    assert details["kind"] == "control_stop"
+    assert "write-scope violation" in details["reason"]
+    assert "write-scope violation" in details["abort"]["reason"]
+
+
+def test_a_cancelled_turn_is_not_reported_as_a_policy_refusal(tmp_path: Path):
+    """The distinction the whole fix exists for: a user pressing stop must not read as a guard refusal."""
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    context, spec = _context(repo)
+
+    harness.sidecar.terminal = fakes.TERMINAL_ABORTED
+    harness.sidecar.abort_on_terminal = {"kind": "caller_abort", "reason": "user cancelled"}
+
+    with pytest.raises(ActivityError) as excinfo:
+        run_cline_turn(context.turn_request("implement it", spec.initial_state()))
+
+    details = excinfo.value.details
+    assert details["kind"] == "caller_abort"
+    assert details["reason"] == "user cancelled"
+    assert "control_stop" not in json.dumps(details)
+    assert "write-scope" not in json.dumps(details)
+
+
+def test_an_aborted_turn_with_no_abort_block_still_reports_the_terminal(tmp_path: Path):
+    """An older engine sends no `abort` block. The failure keeps its old shape and gains no keys."""
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    context, spec = _context(repo)
+
+    harness.sidecar.terminal = fakes.TERMINAL_ABORTED
+
+    with pytest.raises(ActivityError) as excinfo:
+        run_cline_turn(context.turn_request("implement it", spec.initial_state()))
+
+    details = excinfo.value.details
+    assert details["terminal"] == "session.turn_aborted"
+    assert "kind" not in details
+    assert "reason" not in details
