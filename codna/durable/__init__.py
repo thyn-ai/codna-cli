@@ -29,6 +29,9 @@ __all__ = [
     "DURABLE_PINS",
     "DURABLE_RANGES",
     "INSTALL_HINT",
+    "PLUGIN_DISTRIBUTION",
+    "PLUGIN_PIN",
+    "PLUGIN_RANGE",
     "DurableStack",
     "DurableUnavailableError",
     "Requirement",
@@ -75,7 +78,7 @@ DURABLE_PINS: Final[tuple[Requirement, ...]] = (
     Requirement(
         distribution="temporalio",
         module="temporalio",
-        pin="1.34.0",
+        pin="1.35.0",
         minimum=(1, 34),
         maximum=(2,),
     ),
@@ -102,10 +105,48 @@ DURABLE_PINS: Final[tuple[Requirement, ...]] = (
     ),
 )
 
-# The plugin itself. It lives inside temporalio (``temporalio[langgraph]``), so it has no separate
-# distribution to pin — but it IS the Public-Preview surface, hence the ``temporalio`` pin above
-# and the explicit import check here.
+# The plugin itself. It IS the Public-Preview surface — the code that decides how a graph node
+# becomes a Temporal activity, and therefore the workflow's history semantics.
+#
+# Up to ``temporalio`` 1.34 the plugin was code INSIDE the ``temporalio`` distribution, so pinning
+# ``temporalio`` pinned it and there was nothing else to check. From 1.35 it is a separately
+# versioned distribution, ``temporalio-langgraph``, so the ``temporalio`` pin no longer constrains
+# it. ``temporalio.contrib.langgraph`` still imports — it forwards to ``temporalio.langgraph``.
 PLUGIN_MODULE: Final = "temporalio.contrib.langgraph"
+PLUGIN_DISTRIBUTION: Final = "temporalio-langgraph"
+
+# The plugin's pin and window, kept OUT of ``DURABLE_PINS`` on purpose. That tuple is the version
+# GATE, and its ``temporalio>=1.34`` window admits 1.34, where ``temporalio-langgraph`` does not
+# exist (the plugin was vendored) — requiring the distribution there would refuse a combination the
+# extra still declares supported. So the plugin is checked separately, and only WHEN PRESENT: on a
+# 1.34 install it is absent and the ``temporalio`` pin above is what guards the plugin. Where it IS
+# present it is the highest-risk surface in the stack, so it is range-checked like the rest.
+#
+# ``>=0.1,<0.2``: a 0.x minor is allowed to break, so moving off 0.1 must be a deliberate, tested
+# bump rather than something a resolver can do unnoticed.
+PLUGIN_PIN: Final = "0.1.0"
+PLUGIN_RANGE: Final = ">=0.1,<0.2"
+PLUGIN_MINIMUM: Final[tuple[int, ...]] = (0, 1)
+PLUGIN_MAXIMUM: Final[tuple[int, ...]] = (0, 2)
+
+
+def _plugin_accepts(version: tuple[tuple[int, ...], bool]) -> bool:
+    """Whether an installed ``temporalio-langgraph`` is inside the supported window.
+
+    Same comparison as :meth:`Requirement.accepts`, written out here because the plugin has no
+    ``Requirement`` of its own — see ``PLUGIN_DISTRIBUTION`` for why it is not in ``DURABLE_PINS``.
+
+    The prerelease flag is unpacked but deliberately not special-cased: a prerelease is in-window
+    iff its release component is, so ``0.1.0b1`` is accepted and ``0.2.0a1`` is not (asserted by
+    the window matrix). Unpacking keeps this structurally identical to ``Requirement.accepts`` and
+    makes a malformed version tuple a ``ValueError`` here rather than a silently wrong comparison.
+    """
+    release, _prerelease = version
+    width = max(len(release), len(PLUGIN_MINIMUM), len(PLUGIN_MAXIMUM))
+    padded = release + (0,) * (width - len(release))
+    minimum = PLUGIN_MINIMUM + (0,) * (width - len(PLUGIN_MINIMUM))
+    maximum = PLUGIN_MAXIMUM + (0,) * (width - len(PLUGIN_MAXIMUM))
+    return minimum <= padded < maximum
 
 # Human-readable ranges, mirroring the pyproject extra. Asserted equal to that extra by the tests.
 DURABLE_RANGES: Final[dict[str, str]] = {
@@ -264,6 +305,38 @@ def require_durable() -> DurableStack:
                 hint=f"pip install {requirement.distribution}=={requirement.pin}",
             )
         versions[requirement.distribution] = installed
+
+    # The LangGraph plugin's own version. Since `temporalio` 1.35 the plugin is a SEPARATE
+    # distribution (`temporalio-langgraph`) with its own release cadence, and it owns the
+    # node→activity mapping — i.e. the history semantics. It is deliberately not in `DURABLE_PINS`
+    # (see `PLUGIN_DISTRIBUTION`), so it would otherwise go unchecked at runtime, which would make
+    # the pin a packaging detail rather than a guard.
+    plugin_version = _installed_version(PLUGIN_DISTRIBUTION)
+    # `None` (not importable as a distribution) and an empty string both mean ABSENT, which is legal
+    # — see `PLUGIN_DISTRIBUTION` for why a 1.34 install has no plugin distribution to report.
+    if plugin_version:
+        try:
+            plugin_parsed = _parse_version(plugin_version)
+        except ValueError as exc:
+            raise DurableUnavailableError(
+                f"cannot interpret the installed {PLUGIN_DISTRIBUTION} version {plugin_version!r}.",
+                code="durable_version_unsupported",
+                details={"distribution": PLUGIN_DISTRIBUTION, "installed": plugin_version},
+            ) from exc
+        if not _plugin_accepts(plugin_parsed):
+            raise DurableUnavailableError(
+                f"{PLUGIN_DISTRIBUTION} {plugin_version} is outside the supported window "
+                f"(pinned {PLUGIN_PIN}).",
+                code="durable_version_unsupported",
+                details={
+                    "distribution": PLUGIN_DISTRIBUTION,
+                    "installed": plugin_version,
+                    "pinned": PLUGIN_PIN,
+                    "range": PLUGIN_RANGE,
+                },
+                hint=f"pip install {PLUGIN_DISTRIBUTION}=={PLUGIN_PIN}",
+            )
+        versions[PLUGIN_DISTRIBUTION] = plugin_version
 
     return DurableStack(
         temporalio=importlib.import_module("temporalio"),
