@@ -171,9 +171,12 @@ def _plan_once(c, *, repo, ref, issue, failing, model, open_pr, gh_token):
     if focus:
         sig["changed_files"] = focus
     # Surface project guidance (AGENTS.md / .codna/rules) so the engine/agent can honor conventions.
+    # Scoped to the issue's focus files when they are known, so a rule whose globs match none of them
+    # costs nothing on this turn. Falls back to the unscoped read when focus is empty, which keeps the
+    # always-apply rules attached.
     if os.path.isdir(local):
-        from .project_rules import read_project_guidance
-        guidance = read_project_guidance(local)
+        from .project_rules import guidance_for_files
+        guidance = guidance_for_files(local, focus or None)
         if guidance:
             sig["project_guidance"] = guidance
     tri = _cli._dump(c.triage_repository(rid, {"snapshot_id": snap["snapshot_id"], "signals": sig}))

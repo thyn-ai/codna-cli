@@ -25,7 +25,7 @@ langchain-core==1.7.0
 
 # OIDC verification is part of the durable Run API, so PyJWT is a direct runtime dependency rather
 # than a test-only install. Keep the implementation we exercise pinned with the rest of the stack.
-pyjwt==2.10.1
+pyjwt==2.15.1
 
 # Not part of the plugin, but the pinned set must also agree on the HTTP client and the Parquet
 # writer the ledger rollup uses, or a fresh install of the extra can resolve a combination we never

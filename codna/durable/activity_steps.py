@@ -836,6 +836,13 @@ def notify(request: NotifyRequest) -> NotifyOutcome:
         # Present only when a person caused this row, so an approval's ledger record names WHO
         # without a second record and without a branch a reader has to know about.
         payload["identity"] = request.actor
+    if request.repo_dir:
+        # THE CHECKOUT THIS RUN WORKS IN, recorded once by the run's opening notification. `GET /runs`
+        # reads it back so a sidebar row names the repository the run belongs to rather than the folder
+        # the reading window happens to have open. Absent for every other notification, so a
+        # message-only row keeps the payload shape it had — a reader needs no branch to tell them apart,
+        # because the ABSENCE of the key is the honest answer for a row that is not about a checkout.
+        payload["repo_dir"] = request.repo_dir
     record = active.ledger(request.run_id).append(
         "note",
         task_id=request.task_id,

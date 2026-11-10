@@ -67,6 +67,7 @@ pytest.importorskip("temporalio", reason="the `durable` extra (temporalio) is no
 
 from codna.durable import run_api as api_module
 from codna.durable import run_api_support as support
+from codna.durable import run_repo
 from codna.durable.config import load_durable_config
 from codna.durable.identity import AUTH_MODE_TOKEN, IdentityConfig, IdentityResolver
 from codna.durable.ledger import RunLedger
@@ -1324,6 +1325,100 @@ def test_get_runs_lists_the_runs_whose_ledgers_exist(server: Running) -> None:
         assert entry["outcome"] == "completed"
 
 
+def test_a_ledger_without_a_repo_reports_null_rather_than_inventing_one(server: Running) -> None:
+    """AN OLD LEDGER HAS NO REPOSITORY ON RECORD, and the route must say exactly that.
+
+    `repo_dir` was added to the ledger after the first runs were written. For those, the honest answer
+    is `None` — a caller that substitutes its own workspace labels the run with a repository it may
+    never have touched, which is the bug this field exists to remove. `null` is a documented value, not
+    a missing key: a client can branch on it without guessing whether the server is old.
+    """
+    ledger = RunLedger.for_run(server.config.paths, "run-old")
+    # The shape every pre-change ledger has: a `run.started` note with no `repo_dir` in its payload.
+    ledger.append("run.started", payload={"event": "notification", "kind": "run.started", "message": "go"})
+    status, body = server.json("GET", "/runs")
+    assert status == 200
+    assert [entry["run_id"] for entry in body["runs"]] == ["run-old"]
+    assert "repo_dir" in body["runs"][0]
+    assert body["runs"][0]["repo_dir"] is None
+
+
+def test_the_run_list_reports_the_repository_the_run_works_in(server: Running, tmp_path: Path) -> None:
+    """A run's row names ITS repository, not the one the reading window happens to have open.
+
+    This is the field the sidebar's project grouping was missing: without it every durable row was
+    stamped with `defaultProjectId` — the open folder's name — so a run from repo A appeared under repo
+    B the moment the window was reopened elsewhere.
+    """
+    repo = git_repo(tmp_path / "repo-a")
+    ledger = RunLedger.for_run(server.config.paths, "run-with-repo")
+    # The shape `notify` writes: a ledger `note` whose payload names the notification. Only a note is a
+    # run-level fact, which is what `run_repo.repo_dir_of` reads.
+    ledger.append(
+        "note",
+        payload={
+            "event": "notification",
+            "kind": "run.started",
+            "message": "run run-with-repo: 1 task(s) to go",
+            "repo_dir": str(repo),
+        },
+    )
+    status, body = server.json("GET", "/runs")
+    assert status == 200
+    entry = body["runs"][0]
+    assert entry["run_id"] == "run-with-repo"
+    # The absolute path the run recorded, not the folder the server was started from.
+    assert entry["repo_dir"] == str(repo.resolve())
+    assert entry["repo_dir"] != str(server.config.runs_root)
+
+
+def test_the_repo_scan_reads_notes_near_the_head_and_ignores_turn_events(server: Running) -> None:
+    """The repository lives on a run-level NOTE, so a turn event's copy of the key is not a candidate.
+
+    A ledger can hold thousands of turn events; scanning all of them to answer "which repository" would
+    make a list read proportional to the largest run on the machine. The scan is a bounded head window —
+    which is also what makes the answer cheap for a run that predates the field.
+    """
+    ledger = RunLedger.for_run(server.config.paths, "run-buried")
+    ledger.append("run.started", payload={"event": "notification", "kind": "run.started"})
+    # Not a `note`, so this is not a run-level fact and must not be reported.
+    ledger.append(
+        "turn.event",
+        session_id="s1",
+        event_index=1,
+        payload={"event_type": "agent.done", "payload": {}, "repo_dir": "/not/a/note"},
+    )
+    ledger.append(
+        "note",
+        payload={"event": "notification", "kind": "note", "message": "later", "repo_dir": "/after/start"},
+    )
+    _, body = server.json("GET", "/runs")
+    assert body["runs"][0]["repo_dir"] == "/after/start"
+
+
+def test_a_repo_beyond_the_head_window_reports_null_rather_than_a_full_scan(server: Running) -> None:
+    """A repo written far past the front is not found, and the route says `null` instead of scanning.
+
+    The field is only ever written by the run's opening notification, so a value that far into the file
+    is not a shape any version of the product produces. Reporting `null` keeps the read bounded; the
+    alternative (walk the whole ledger) would make listing O(all events on disk).
+    """
+    ledger = RunLedger.for_run(server.config.paths, "run-far")
+    ledger.append("run.started", payload={"event": "notification", "kind": "run.started"})
+    for index in range(run_repo._HEAD_SCAN_RECORDS + 4):
+        ledger.append(
+            "turn.event",
+            session_id="s1",
+            event_index=index + 1,
+            payload={"event_type": "agent.done", "payload": {}},
+        )
+    ledger.append(
+        "note", payload={"event": "notification", "kind": "note", "repo_dir": "/too/far/to/be/read"}
+    )
+    _, body = server.json("GET", "/runs")
+    assert body["runs"][0]["repo_dir"] is None
+
+
 def test_the_run_list_reports_no_outcome_for_an_unfinished_run(server: Running) -> None:
     """An open run has no outcome: reporting `completed` for one would be a guess, and a wrong one."""
     ledger = RunLedger.for_run(server.config.paths, "run-open")
@@ -2180,6 +2275,48 @@ def test_the_route_reports_a_terminal_bearing_run_as_ended(server: Any) -> None:
     assert one["outcome"] == "failed"
 
 
+def test_the_detail_carries_the_runs_own_repository(server: Any) -> None:
+    """`GET /runs/:id` reports `ledger.repo_dir`, so a row built from a DETAIL is not labelled by the window.
+
+    THE DEFECT THIS PINS. `GET /runs` has carried ``repo_dir`` since #719, but the DETAIL route did not — and
+    the detail is what a reattach and a cursor write read. A client that labelled rows from the detail therefore
+    fell back to "whichever folder my window has open", which is how repo A's run appeared under repo B.
+
+    Both directions are asserted: a ledger that records a repository reports it, and one written before the
+    field existed reports ``None`` (unknown) rather than borrowing the reader's workspace.
+    """
+    recorded = "run-repo-recorded"
+    ledger = RunLedger.for_run(server.config.paths, recorded)
+    ledger.append(
+        "note",
+        payload={"event": "notification", "kind": "run.started", "repo_dir": "/src/codna-cli"},
+    )
+    _, one = server.json("GET", f"/runs/{recorded}")
+    assert one["ledger"]["repo_dir"] == "/src/codna-cli"
+
+    anonymous = "run-repo-absent"
+    old = RunLedger.for_run(server.config.paths, anonymous)
+    old.append("note", payload={"event": "notification", "kind": "run.started"})
+    _, two = server.json("GET", f"/runs/{anonymous}")
+    # `None`, never a path: a ledger that says nothing about its checkout is UNKNOWN, and the honest rendering of
+    # that is "this run's repository is not recorded", not the reader's own folder.
+    assert two["ledger"]["repo_dir"] is None
+
+
+def test_the_detail_and_the_list_agree_about_the_repository(server: Any) -> None:
+    """One reader, so a run cannot be labelled from its list row and re-labelled from its detail."""
+    run_id = "run-repo-both"
+    ledger = RunLedger.for_run(server.config.paths, run_id)
+    ledger.append(
+        "note",
+        payload={"event": "notification", "kind": "run.started", "repo_dir": "/src/codna-ide"},
+    )
+    _, listing = server.json("GET", "/runs")
+    entry = next(item for item in listing["runs"] if item["run_id"] == run_id)
+    _, detail = server.json("GET", f"/runs/{run_id}")
+    assert entry["repo_dir"] == detail["ledger"]["repo_dir"] == "/src/codna-ide"
+
+
 @pytest.mark.parametrize("run_id", STUCK_RUN_IDS)
 def test_the_committed_fixtures_are_the_real_ledgers(run_id: str) -> None:
     """The fixtures are the reporter's files copied verbatim — proven by sha256, not by chain.
@@ -2539,6 +2676,112 @@ def test_a_durable_server_reports_full_capabilities_over_http(config: Any) -> No
         assert body["capabilities"]["mode"] == "durable"
     finally:
         running.stop()
+
+
+def test_the_stream_ceiling_is_advertised_at_the_number_that_is_enforced(config: Any) -> None:
+    """`max_streams` is a server FACT, and the wire must carry the value the semaphore was built from.
+
+    THE DEFECT THIS PINS. The IDE hardcoded `8` (`durableSwarmFeed.RUN_API_MAX_STREAMS`), reserved one
+    slot for its swarm feed, and then budgeted seven concurrent conversations. Against a server started
+    with `--max-streams 4` that is a lie in the one direction that hurts: the window believes it has
+    room, opens a third conversation, and the server answers 503 with a sentence that reads like a
+    server fault. So the number travels with the mode — on `GET /capabilities` AND on `GET /runs` —
+    and it is not a second copy of the default: this server is started with a ceiling that is NOT the
+    default, so a composer that read `DEFAULT_MAX_STREAMS` instead would fail here.
+    """
+    settings = RunApiSettings(
+        port=0,
+        token_path=config.paths.root / "ceil.token",
+        max_streams=3,
+    )
+    running = RunApiServer(
+        config=config,
+        backend=ScriptedBackend(),
+        settings=settings,
+        identity=IdentityResolver(
+            IdentityConfig(
+                mode=AUTH_MODE_TOKEN,
+                local_token=load_or_create_token(settings.token_path),
+                local_identity=TEST_IDENTITY,
+            )
+        ),
+        siem=NullSiemSink(),
+    ).start()
+    live = Running(running, ScriptedBackend(), config)
+    try:
+        status, body = live.json("GET", "/capabilities")
+        assert status == 200
+        assert body["capabilities"]["max_streams"] == 3
+        # ...and the ENFORCED number is the same one: the details of a real refusal quote it.
+        assert running.api.settings.max_streams == body["capabilities"]["max_streams"]
+
+        # The list route carries the same document, so the IDE's existing poll needs no second call.
+        status, body = live.json("GET", "/runs")
+        assert status == 200
+        assert body["capabilities"]["max_streams"] == 3
+    finally:
+        running.stop()
+
+
+def test_a_default_configured_server_advertises_the_default_it_is_actually_enforcing() -> None:
+    """The advertised ceiling FOLLOWS the configured one, which is what makes it worth reading.
+
+    Two ways this could be a lie, both pinned here: a default that is not what the process enforces, and a
+    `--max-streams` value that never reaches the settings. The default itself is a judgement (see
+    `DEFAULT_MAX_STREAMS` for the measured per-stream cost); that it is HONEST is not.
+    """
+    from codna.durable.run_api import capabilities_payload_for
+    from codna.durable.run_api_backend import durable_capabilities
+    from codna.durable.run_api_support import DEFAULT_MAX_STREAMS
+
+    settings = RunApiSettings(port=0, token_path=Path("/tmp/unused.token"))
+    assert settings.max_streams == DEFAULT_MAX_STREAMS
+    # The composer reads `settings`, so a default this server did not apply cannot be advertised.
+    payload = capabilities_payload_for(settings, durable_capabilities("127.0.0.1:7233"))
+    assert payload["max_streams"] == DEFAULT_MAX_STREAMS
+    # And a raised one is reported as raised — no second copy of the default anywhere on the path.
+    raised = RunApiSettings(port=0, token_path=Path("/tmp/unused.token"), max_streams=3)
+    assert capabilities_payload_for(raised, durable_capabilities("127.0.0.1:7233"))["max_streams"] == 3
+
+
+def test_the_banner_and_the_routes_compose_the_capability_document_the_same_way(
+    config: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One composer, so the banner an operator reads and the JSON a client parses cannot disagree.
+
+    The banner is printed BEFORE the server serves, by `serve_cli.cmd_serve`; `GET /capabilities` is
+    served by the same process afterwards. Both call `RunApi.capabilities_payload()`, which is the only
+    place `max_streams` is added to the backend's payload. A second composition (the banner calling
+    `as_payload()` and hand-adding the field) is exactly how one of the two ends up without it.
+    """
+    source = (Path(__file__).resolve().parents[2] / "codna" / "durable" / "serve_cli.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"capabilities": server.api.capabilities_payload()' in source
+    # The backend's own `as_payload` is still what describes the ROUTES; it is not the wire document.
+    assert "server.api.capabilities_payload()" in source
+    assert "capabilities.as_payload()" not in source
+
+    routes = (Path(__file__).resolve().parents[2] / "codna" / "durable" / "run_api_http.py").read_text(
+        encoding="utf-8"
+    )
+    # BOTH routes report the composed document.
+    assert routes.count("self.api.capabilities_payload()") == 2
+    assert "self.api.backend.capabilities().as_payload()" not in routes
+
+
+def test_a_server_that_does_not_report_the_field_is_not_a_server_that_reports_zero() -> None:
+    """The field is ADDITIVE, and its absence is "this server predates it" — never an inferred ceiling.
+
+    A client that read a missing `max_streams` as `0` would refuse to open a single stream against an
+    older server. This asserts the wire keeps the distinction representable: the composer always adds
+    the key, so "absent" can only mean a build that did not have the composer at all.
+    """
+    from codna.durable.run_api_backend import durable_capabilities
+
+    payload = durable_capabilities("127.0.0.1:7233").as_payload()
+    # The BACKEND's document describes routes and mode; the process fact belongs to the composer.
+    assert "max_streams" not in payload
 
 
 def test_the_capability_sets_partition_the_route_table() -> None:
