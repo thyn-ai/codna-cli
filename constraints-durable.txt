@@ -16,7 +16,20 @@
 # LangGraph's checkpoint package is pinned and explicitly ranged too:
 # `interrupt()`/`Command(resume=...)` semantics live there, and `InMemorySaver` is mandatory inside
 # a workflow (D2.0 spike finding 3).
-temporalio==1.34.0
+temporalio==1.35.0
+# The LangGraph plugin is no longer code INSIDE `temporalio`: 1.35 moved every integration into
+# separately versioned distributions under `temporalio/ai-integrations`, so the `temporalio[langgraph]`
+# extra now installs `temporalio-langgraph` instead of vendoring the plugin. `temporalio.contrib.langgraph`
+# still imports — it forwards to `temporalio.langgraph` — so codna's import path is unchanged, but the code
+# that decides how a node maps to an activity now lives in a 0.x package with its own release cadence.
+# That is exactly the surface this file exists to hold still: left to resolve, a 0.x minor could change the
+# mapping and replay-break an in-flight run. Pinned for the same reason as everything else here.
+#
+# NOT added to `DURABLE_PINS`: that tuple is the version GATE `require_durable()` enforces, and its
+# `temporalio>=1.34` window still admits 1.34, where this distribution does not exist (the plugin was
+# vendored). Requiring it there would refuse a combination the extra still declares as supported. The
+# test suite asserts this pin instead, the same way it asserts `pyjwt`'s.
+temporalio-langgraph==0.1.0
 langgraph==1.2.20
 langgraph-checkpoint==4.3.1
 langgraph-sdk==0.4.9

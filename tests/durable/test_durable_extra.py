@@ -18,7 +18,16 @@ from pathlib import Path
 import pytest
 
 from codna import durable
-from codna.durable import DURABLE_PINS, DURABLE_RANGES, INSTALL_HINT, DurableUnavailableError, require_durable
+from codna.durable import (
+    DURABLE_PINS,
+    DURABLE_RANGES,
+    INSTALL_HINT,
+    PLUGIN_DISTRIBUTION,
+    PLUGIN_PIN,
+    PLUGIN_RANGE,
+    DurableUnavailableError,
+    require_durable,
+)
 
 CLI_DIR = Path(__file__).resolve().parents[2]
 PYPROJECT = CLI_DIR / "pyproject.toml"
@@ -77,6 +86,15 @@ def test_constraints_file_pins_exactly_what_require_durable_expects():
     # consequence of the constraints file — otherwise the assertion would only compare that file
     # with itself.
     assert pinned.get("pyjwt") == "2.15.1", "the OIDC verifier must use the tested PyJWT pin"
+    # The Temporal LangGraph plugin, likewise reviewed rather than derived — and for the extra reason
+    # that it cannot join `DURABLE_PINS` without narrowing that gate's `temporalio>=1.34` window (1.34
+    # has no such distribution; it vendored the plugin). Since `temporalio` 1.35 this is a 0.x package
+    # that owns the node→activity mapping, so an unpinned resolve is the replay-break this file exists
+    # to prevent. Asserted here so removing the pin is a test failure, not a silent drift.
+    assert pinned.get("temporalio-langgraph") == "0.1.0", (
+        "the Temporal LangGraph plugin must stay pinned: it owns the node→activity mapping, and 0.x "
+        "minor releases are allowed to change it"
+    )
 
 
 def test_the_durable_package_is_declared_for_packaging():
@@ -154,6 +172,84 @@ def test_an_out_of_window_version_fails_fast_with_the_pin_in_the_hint(monkeypatc
     # Derived from the code's own pin, not a literal: the hint must name the version this build
     # expects, so a bump cannot leave the assertion passing on a stale string.
     assert f"=={DURABLE_PINS[0].pin}" in excinfo.value.hint
+
+
+def test_the_plugin_distribution_is_enforced_at_runtime_when_it_is_present(monkeypatch):
+    """The plugin owns the node→activity mapping, so its version is a RUNTIME gate, not a pin.
+
+    It is not in `DURABLE_PINS` (see `PLUGIN_DISTRIBUTION`: 1.34 vendored the plugin, so requiring
+    the distribution there would refuse a supported install). That makes this check the only thing
+    standing between a stray `temporalio-langgraph` and a silent replay break, so each branch of it
+    is asserted rather than assumed.
+    """
+    monkeypatch.setattr(durable, "_missing_modules", lambda requirements: [])
+    monkeypatch.setattr(durable.importlib, "import_module", _stub_import)
+
+    def versions(name: str) -> str | None:
+        installed = {requirement.distribution: requirement.pin for requirement in DURABLE_PINS}
+        installed[PLUGIN_DISTRIBUTION] = "0.2.0"  # outside `>=0.1,<0.2`
+        # `.get`, not `[name]`: the real `_installed_version` returns None for an uninstalled
+        # distribution, and a KeyError here would surface as an unexpected exception instead of
+        # the `DurableUnavailableError` this test is about.
+        return installed.get(name)
+
+    monkeypatch.setattr(durable, "_installed_version", versions)
+    with pytest.raises(DurableUnavailableError) as excinfo:
+        require_durable()
+    assert excinfo.value.code == "durable_version_unsupported"
+    assert excinfo.value.details["distribution"] == PLUGIN_DISTRIBUTION
+    assert excinfo.value.details["installed"] == "0.2.0"
+    assert excinfo.value.details["range"] == PLUGIN_RANGE
+    assert f"=={PLUGIN_PIN}" in excinfo.value.hint
+
+
+def test_the_plugin_absence_is_not_an_error_so_1_34_keeps_working(monkeypatch):
+    """A 1.34 install has no `temporalio-langgraph`; the `temporalio` pin is what guards it there.
+
+    Refusing an absent plugin would break the window the extra still declares (`temporalio>=1.34`),
+    so absence must stay legal — this is the branch that keeps that true.
+    """
+    monkeypatch.setattr(durable, "_missing_modules", lambda requirements: [])
+    monkeypatch.setattr(durable.importlib, "import_module", _stub_import)
+
+    def versions(name: str) -> str:
+        installed = {requirement.distribution: requirement.pin for requirement in DURABLE_PINS}
+        return installed.get(name, "")  # plugin -> "", i.e. not installed
+
+    monkeypatch.setattr(durable, "_installed_version", versions)
+    stack = require_durable()
+    assert PLUGIN_DISTRIBUTION not in stack.versions
+
+
+def test_an_installed_plugin_is_reported_in_the_stack_versions(monkeypatch):
+    """A caller can see which plugin build it got, which is what makes a support report actionable."""
+    monkeypatch.setattr(durable, "_missing_modules", lambda requirements: [])
+    monkeypatch.setattr(durable.importlib, "import_module", _stub_import)
+
+    def versions(name: str) -> str | None:
+        installed = {requirement.distribution: requirement.pin for requirement in DURABLE_PINS}
+        installed[PLUGIN_DISTRIBUTION] = PLUGIN_PIN
+        return installed.get(name)
+
+    monkeypatch.setattr(durable, "_installed_version", versions)
+    stack = require_durable()
+    assert stack.versions[PLUGIN_DISTRIBUTION] == PLUGIN_PIN
+
+
+@pytest.mark.parametrize(
+    "raw,accepted",
+    [
+        ("0.1.0", True),
+        ("0.1.9", True),
+        ("0.1.0b1", True),
+        ("0.0.9", False),
+        ("0.2.0", False),
+        ("0.2.0a1", False),
+        ("1.0.0", False),
+    ],
+)
+def test_the_plugin_window_is_the_declared_range(raw, accepted):
+    assert durable._plugin_accepts(durable._parse_version(raw)) is accepted
 
 
 def test_a_newer_major_is_refused_so_a_preview_bump_cannot_slip_in(monkeypatch):
