@@ -448,3 +448,77 @@ def test_the_detector_still_fires_for_a_genuinely_rescoped_key() -> None:
     ]
     findings = sr.check_duplicate_turn_key(rescoped)
     assert [finding.code for finding in findings] == [sr.TURN_KEY_RESCOPED]
+
+
+def test_the_resume_floor_steps_below_a_trailing_terminal_event(tmp_path: Path):
+    """`?after=` is EXCLUSIVE, so a floor sitting ON the terminal would skip the ending forever.
+
+    MEASURED failure this pins: an implement turn appended `session.turn_aborted` (its terminal) and
+    then died one line before writing `turn.finished`. The retry re-attached with
+    `?after=<terminal index>` — asking for everything AFTER the event that ends the turn. The sidecar
+    had nothing more to send, so the stream replayed nothing, followed no live events, and blocked
+    until the 60-minute activity ceiling while heartbeating happily: the run looked alive forever and
+    its ledger never grew.
+
+    A floor of `index - 1` replays exactly that one terminal, so `_stream` sees the ending and the
+    retry fails by name instead of hanging.
+    """
+    from codna.durable.activity_support import _scan_ledger
+
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    ledger = harness.ledger()
+
+    ledger.append(
+        "turn.started",
+        task_id="task-1",
+        payload={"turn_id": "turn-a", "turn_key": "run-1:task-1:1", "session_id": "session-a"},
+    )
+    ledger.append_events(
+        [
+            {"event_index": 3, "event_type": "agent.text", "payload": {}},
+            {"event_index": 4, "event_type": "session.turn_aborted", "payload": {}},
+        ],
+        task_id="task-1",
+        session_id="session-a",
+    )
+
+    recorded, completion = _scan_ledger(ledger, "run-1:task-1:1")
+    assert recorded is not None
+    # No `turn.finished`: this is the crash window, not a completed turn.
+    assert completion is None
+    assert recorded.high_water == 3, (
+        "the floor must sit BELOW the trailing terminal (4) so the replay can deliver it; "
+        f"got {recorded.high_water}"
+    )
+
+
+def test_the_resume_floor_is_untouched_when_the_terminal_is_not_last(tmp_path: Path):
+    """A terminal with later events is not the floor: the stream was already reading past it."""
+    from codna.durable.activity_support import _scan_ledger
+
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    ledger = harness.ledger()
+
+    ledger.append(
+        "turn.started",
+        task_id="task-1",
+        payload={"turn_id": "turn-a", "turn_key": "run-1:task-1:1", "session_id": "session-a"},
+    )
+    ledger.append_events(
+        [
+            {"event_index": 4, "event_type": "session.turn_aborted", "payload": {}},
+            {"event_index": 5, "event_type": "status", "payload": {}},
+        ],
+        task_id="task-1",
+        session_id="session-a",
+    )
+
+    recorded, completion = _scan_ledger(ledger, "run-1:task-1:1")
+    assert recorded is not None and completion is None
+    assert recorded.high_water == 5, recorded

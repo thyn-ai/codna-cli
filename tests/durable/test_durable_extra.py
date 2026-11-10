@@ -71,7 +71,12 @@ def test_constraints_file_pins_exactly_what_require_durable_expects():
             f"{requirement.distribution}: constraints pin {pinned[requirement.distribution]!r} "
             f"!= code pin {requirement.pin!r}"
         )
-    assert pinned.get("pyjwt") == "2.10.1", "the OIDC verifier must use the tested PyJWT pin"
+    # PyJWT is deliberately NOT in `DURABLE_PINS` (it has no module in `DurableStack`), so this
+    # literal cannot be derived from the code the way the four stack pins are. It is the REVIEWED
+    # value: a pyjwt bump has to be restated here, which is what makes it a decision rather than a
+    # consequence of the constraints file — otherwise the assertion would only compare that file
+    # with itself.
+    assert pinned.get("pyjwt") == "2.15.1", "the OIDC verifier must use the tested PyJWT pin"
 
 
 def test_the_durable_package_is_declared_for_packaging():
@@ -146,7 +151,9 @@ def test_an_out_of_window_version_fails_fast_with_the_pin_in_the_hint(monkeypatc
         require_durable()
     assert excinfo.value.code == "durable_version_unsupported"
     assert excinfo.value.details["installed"] == "0.99.0"
-    assert "==1.34.0" in excinfo.value.hint or "==1.2.17" in excinfo.value.hint
+    # Derived from the code's own pin, not a literal: the hint must name the version this build
+    # expects, so a bump cannot leave the assertion passing on a stale string.
+    assert f"=={DURABLE_PINS[0].pin}" in excinfo.value.hint
 
 
 def test_a_newer_major_is_refused_so_a_preview_bump_cannot_slip_in(monkeypatch):
@@ -154,8 +161,11 @@ def test_a_newer_major_is_refused_so_a_preview_bump_cannot_slip_in(monkeypatch):
     monkeypatch.setattr(durable.importlib, "import_module", _stub_import)
 
     def versions(name: str) -> str:
-        return {"temporalio": "2.0.0", "langgraph": "1.2.17", "langchain-core": "1.7.0",
-                "langgraph-checkpoint": "4.3.0"}[name]
+        # Every OTHER pin is the code's own, so only `temporalio`'s major is under test: a literal
+        # here would let a bump leave this test asserting yesterday's stack.
+        installed = {requirement.distribution: requirement.pin for requirement in DURABLE_PINS}
+        installed["temporalio"] = "2.0.0"
+        return installed[name]
 
     monkeypatch.setattr(durable, "_installed_version", versions)
     with pytest.raises(DurableUnavailableError) as excinfo:
@@ -289,12 +299,10 @@ def test_an_out_of_window_checkpoint_version_reports_its_supported_range(monkeyp
     monkeypatch.setattr(durable.importlib, "import_module", _stub_import)
 
     def versions(name: str) -> str:
-        return {
-            "temporalio": "1.34.0",
-            "langgraph": "1.2.17",
-            "langchain-core": "1.7.0",
-            "langgraph-checkpoint": "5.0.0",
-        }[name]
+        # As above, in reverse: only the CHECKPOINT pin is out of window here.
+        installed = {requirement.distribution: requirement.pin for requirement in DURABLE_PINS}
+        installed["langgraph-checkpoint"] = "5.0.0"
+        return installed[name]
 
     monkeypatch.setattr(durable, "_installed_version", versions)
     with pytest.raises(DurableUnavailableError) as excinfo:

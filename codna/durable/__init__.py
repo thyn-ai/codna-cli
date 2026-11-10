@@ -96,7 +96,7 @@ DURABLE_PINS: Final[tuple[Requirement, ...]] = (
     Requirement(
         distribution="langgraph-checkpoint",
         module="langgraph.checkpoint",
-        pin="4.3.0",
+        pin="4.3.1",
         minimum=(4,),
         maximum=(5,),
     ),

@@ -142,7 +142,16 @@ class RunWorkflow:
         self._goal_reason = progress.goal_reason
 
         remaining = remaining_tasks(spec, self._completed)
-        await self._notify("run.started", f"run {spec.run_id}: {len(remaining)} task(s) to go")
+        # THE OPENING NOTIFICATION CARRIES THE CHECKOUT. It is the one row guaranteed to exist for a run
+        # that got far enough to be listed, so `GET /runs` reads the repository from here — see
+        # `repo_dir_of` in `run_repo`. Attached to THIS call rather than a new activity: a run's
+        # history replays its command sequence, so an extra activity would make every existing history
+        # diverge.
+        await self._notify(
+            "run.started",
+            f"run {spec.run_id}: {len(remaining)} task(s) to go",
+            repo_dir=spec.repo_dir,
+        )
         await self._report_capabilities(spec)
 
         try:
@@ -491,14 +500,16 @@ class RunWorkflow:
         await self._notify("note", f"run {self._spec.run_id if self._spec else '?'} paused")
         await workflow.wait_condition(lambda: not self._paused or self._stopped)
 
-    async def _notify(self, kind: str, message: str) -> None:
+    async def _notify(self, kind: str, message: str, *, repo_dir: str = "") -> None:
         spec = self._spec
         if spec is None:  # pragma: no cover
             return
         try:
             await workflow_activity(
                 NAME_NOTIFY,
-                NotifyRequest(run_id=spec.run_id, task_id=None, kind=kind, message=message),
+                NotifyRequest(
+                    run_id=spec.run_id, task_id=None, kind=kind, message=message, repo_dir=repo_dir
+                ),
             )
         except Exception:  # noqa: BLE001 - a notification must never fail a run
             workflow.logger.warning("run %s: notify(%s) failed", spec.run_id, kind)

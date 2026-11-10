@@ -346,6 +346,19 @@ class TaskSpec:
     # tree it is about to edit. ``True`` is the default because a run that ignores a repository's
     # written conventions is the bug this closes.
     attach_project_rules: bool = True
+    # Whether this task's turns are given the repository's USER-DEFINED SUBAGENTS
+    # (`.cursor/agents/**/*.md`, plus the `.claude`/`.codex` compat locations).
+    #
+    # The POLICY travels, like `attach_project_rules`; the ROSTER does not, because it is file contents
+    # (a delegated agent's system prompt is the markdown body). Read from the TREE THE TURN EDITS and
+    # with the USER layer OFF: a run executes on a worker, and one machine's `~/.cursor/agents` is not
+    # the repository's roster (see `durable/subagents.py`).
+    #
+    # ``True`` is the default for the same reason ``attach_project_rules`` is: a repository that wrote
+    # down its agents and had them ignored is the bug this closes. It has no effect unless
+    # ``enable_spawn_agent`` is set — a roster the engine would refuse to delegate from is not attached,
+    # and `subagent_attachment_state` says so.
+    attach_subagents: bool = True
     # D5/MCP: the MCP servers this task's turns are given, as validated CONFIGURATION (see
     # `mcp.normalize_mcp_servers`): a name, a transport, and — for a stdio server — `env` entries that
     # are REFERENCES (`{"from_env": "NAME"}`), never secret values. A `TaskSpec` is workflow history and
@@ -484,6 +497,12 @@ class TaskSpec:
                 "attach_project_rules must be a boolean",
                 code="contract_invalid",
                 details={"field": "attach_project_rules", "value": repr(self.attach_project_rules)},
+            )
+        if not isinstance(self.attach_subagents, bool):
+            raise ContractError(
+                "attach_subagents must be a boolean",
+                code="contract_invalid",
+                details={"field": "attach_subagents", "value": repr(self.attach_subagents)},
             )
         # Normalized through the SAME function the decode path uses, so a spec built in Python and a
         # spec decoded from a payload cannot disagree about what a valid MCP config is. That call
@@ -660,6 +679,7 @@ class TaskSpec:
             "goal_context": self.goal_context,
             "worktree_task_id": self.worktree_task_id,
             "attach_project_rules": self.attach_project_rules,
+            "attach_subagents": self.attach_subagents,
             "mcp_servers": _mcp_servers_json(self.mcp_servers),
             "enable_spawn_agent": self.enable_spawn_agent,
             "enable_agent_teams": self.enable_agent_teams,
