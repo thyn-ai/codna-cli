@@ -31,4 +31,4 @@ pyjwt==2.15.1
 # writer the ledger rollup uses, or a fresh install of the extra can resolve a combination we never
 # tested. `httpx` is a base dependency for the same client the sidecar surface uses.
 httpx==0.28.1
-pyarrow==26.0.0
+pyarrow==26.0.1
