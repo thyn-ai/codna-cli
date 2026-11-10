@@ -82,7 +82,7 @@ DURABLE_PINS: Final[tuple[Requirement, ...]] = (
     Requirement(
         distribution="langgraph",
         module="langgraph",
-        pin="1.2.17",
+        pin="1.2.20",
         minimum=(1,),
         maximum=(2,),
     ),
