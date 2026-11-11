@@ -56,6 +56,44 @@ class FakeTurn:
     prompt: str
     session_id: str
     read_only: bool = False
+    #: The tool names the ENGINE advertises to the model for this turn — the approval profile's list,
+    #: minus the tools a read-only turn's scope withholds.
+    #:
+    #: Why the harness models this at all: the defect was neither in the workflow (which declared
+    #: `allowed_write_paths: []` correctly) nor in the guard (which refused `editor` correctly), but in
+    #: the JOIN between the scope a turn declares and the tool list its profile advertises. A harness
+    #: that recorded only the wire field went green while every real run died, so the advertised list
+    #: has to be modelled (and asserted) here for this suite to be able to fail.
+    offered_tools: tuple[str, ...] = ()
+
+    @property
+    def write_tools_offered(self) -> tuple[str, ...]:
+        return tuple(tool for tool in self.offered_tools if tool in ENGINE_WRITE_TOOLS)
+
+
+#: The tools the engine refuses when a turn's effective write scope is empty, transcribed from
+#: `WRITE_TOOLS`/`SHELL_TOOLS` in `agent-core/vendor/cline/algenta/write-scope.ts`. The test
+#: `test_the_harness_write_tools_are_the_engine_s` PARSES that file, so this copy cannot drift into a
+#: comfortable fiction: the harness fails if the engine's set changes.
+ENGINE_WRITE_TOOLS: frozenset[str] = frozenset(
+    {"editor", "apply_patch", "write_to_file", "new_file", "run_commands"}
+)
+
+#: What `repository_fix_gated` — the profile a durable run's session is created under — advertises.
+#: `test_the_harness_profile_tools_are_the_engine_s` parses `contracts.ts`, so a profile that gains or
+#: loses a tool is a RED HARNESS rather than a silently stale default.
+PROFILE_FIX_GATED_TOOLS: tuple[str, ...] = (
+    "read_files",
+    "search_codebase",
+    "fetch_web_content",
+    "editor",
+    "apply_patch",
+    "skills",
+    "localize",
+    "graph_query",
+    "simulate_patch",
+    "spawn_agent",
+)
 
 
 @dataclass
@@ -229,6 +267,7 @@ class FakeSidecar:
                     prompt=prompt,
                     session_id=session_id,
                     read_only=read_only,
+                    offered_tools=self._offered_tools(read_only=read_only),
                 )
             )
             if key:
@@ -314,6 +353,22 @@ class FakeSidecar:
                 return True
             break
         return False
+
+    def _offered_tools(self, *, read_only: bool) -> tuple[str, ...]:
+        """The tool list the ENGINE advertises to the model for this turn.
+
+        Two independent facts, modelled separately on purpose:
+
+        * the approval profile decides WHICH tools the session HAS (a property of the session);
+        * a turn whose effective write scope is empty WITHHOLDS the ones that scope forbids
+          (`writeScopeHooksForAllowedPaths.beforeModel`).
+
+        Keeping them separate is the point: deriving one from the other is exactly the bug, because
+        the real engine derived them from different places and nobody compared the answers.
+        """
+        if not read_only:
+            return PROFILE_FIX_GATED_TOOLS
+        return tuple(tool for tool in PROFILE_FIX_GATED_TOOLS if tool not in ENGINE_WRITE_TOOLS)
 
     def _edit_checkout(self, session_id: str, turn_id: str) -> None:
         """A turn changes the tree. Without this every checkpoint would anchor at the same commit."""
