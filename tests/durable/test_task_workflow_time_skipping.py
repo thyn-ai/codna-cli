@@ -1302,6 +1302,186 @@ def test_a_read_only_plan_turn_writes_nothing_while_sharing_the_implement_turn_s
     assert [turn.read_only for turn in harness.sidecar.turns] == [True, False]
 
 
+# ---------------------------------------------------------------------------------------
+# THE JOIN: a turn's write scope and the tools the model is OFFERED must agree.
+#
+# WHY THIS SECTION EXISTS, and why the test above could not catch the defect it covers.
+#
+# `test_a_read_only_plan_turn_writes_nothing_…` asserts the WIRE FIELD
+# (`scopes[0]["allowed_write_paths"] == []`) and the fake's own consequence of that field. Both were
+# correct the entire time the product was broken. Two independently-merged fixes met badly:
+# `#730` made `[]` mean "nothing writable" (so the guard correctly refused `editor`), while the
+# turn's TOOL LIST still came from the approval profile, which advertises `editor` unconditionally.
+# The model was therefore offered a tool its turn could not use, called it, and the guard ended the
+# turn. Measured on a real ledger (~/.codna/runs/run-20261111T031216Z/ledger.ndjson, index 268):
+#
+#   "session.turn_aborted": {"abort": {"kind": "control_stop",
+#      "reason": "write-scope violation: this turn is read-only, so 'editor' is refused"}}
+#
+# Every audited live run ended `tasks_done: 0` on it. So the assertions below are deliberately at two
+# levels the wire-field test cannot reach: what the model is ADVERTISED, and whether the run
+# COMPLETES — the latter being the only thing a user experiences.
+# ---------------------------------------------------------------------------------------
+
+# `tests/durable/<this file>` -> the repository root, four levels up: durable, tests, cli, <root>.
+ENGINE_DIR = Path(__file__).resolve().parents[3] / "agent-core" / "vendor" / "cline" / "algenta"
+
+
+def test_the_harness_write_tools_are_the_engine_s():
+    """The harness's notion of "a tool a read-only turn cannot use" is read OFF the engine.
+
+    A harness that hard-coded its own list would keep passing after the engine refused a new tool,
+    which is the failure mode `#730` was. So the source is parsed: `WRITE_TOOLS` and `SHELL_TOOLS` in
+    `write-scope.ts` are the two sets the guard refuses, and the harness must name exactly their union.
+    """
+    import re
+
+    source = (ENGINE_DIR / "write-scope.ts").read_text(encoding="utf-8")
+
+    def members(name: str) -> set[str]:
+        match = re.search(rf"const {name} = new Set\(\[([^\]]*)\]\)", source)
+        assert match, f"{name} is not declared as a Set literal in write-scope.ts"
+        return set(re.findall(r'"([^"]+)"', match.group(1)))
+
+    engine = members("WRITE_TOOLS") | members("SHELL_TOOLS")
+    assert engine == set(fakes.ENGINE_WRITE_TOOLS), (
+        "the harness's ENGINE_WRITE_TOOLS disagrees with write-scope.ts: "
+        f"engine={sorted(engine)} harness={sorted(fakes.ENGINE_WRITE_TOOLS)}"
+    )
+
+
+def test_the_harness_profile_tools_are_the_engine_s():
+    """The profile a durable run uses is read off the engine's own table.
+
+    `repository_fix_gated` is the profile `swarm.DURABLE_APPROVAL_PROFILE` names, and its
+    `allowedTools` is what the engine advertises. Parsing `contracts.ts` keeps the harness honest: a
+    profile that gains or loses a tool is a RED harness, not a silently stale default.
+    """
+    import re
+
+    source = (ENGINE_DIR / "server" / "contracts.ts").read_text(encoding="utf-8")
+    match = re.search(
+        r"repository_fix_gated:\s*\{\s*allowedTools:\s*\[(.*?)\]", source, re.DOTALL
+    )
+    assert match, "repository_fix_gated.allowedTools is not a literal array in contracts.ts"
+    engine = set(re.findall(r'"([^"]+)"', match.group(1)))
+    # `...TEAM_TOOL_NAMES` is a spread, so the literal array covers only the named tools; the
+    # assertions below are about the WRITE tools, which are always spelled out by hand.
+    harness = set(fakes.PROFILE_FIX_GATED_TOOLS)
+    assert harness <= engine, f"the harness names tools the profile does not grant: {sorted(harness - engine)}"
+    assert {"editor", "apply_patch"} <= engine, "the profile stopped advertising the write tools"
+    # The whole point: the profile DOES advertise them, which is why a read-only turn had to withhold
+    # them. A future profile that stopped advertising them would make this section vacuous, so it is
+    # pinned rather than assumed.
+    assert {"editor", "apply_patch"} <= harness
+
+
+def test_a_read_only_plan_turn_is_not_offered_a_write_tool_and_the_run_completes(tmp_path: Path):
+    """THE JOIN, on the level that actually broke: what the model sees, and whether the run finishes.
+
+    Two assertions, both of which the wire-field test above cannot make:
+
+    * the plan turn is NOT ADVERTISED `editor`/`apply_patch`/`run_commands` (the model cannot call what
+      it is not offered, so the guard is never asked the question it could only answer by aborting);
+    * the SAME task reaches `completed` with a recorded outcome, rather than dying on
+      `session.turn_aborted`.
+
+    The run-level half is the important one: the wire field was right for the entire life of the
+    defect, so a test that stops at the field is a test that cannot fail.
+    """
+    from codna.durable.activities import plan_task, run_cline_turn
+    from codna.durable.contracts import TaskContext
+    from codna.durable.state import TaskState
+
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    spec = _spec(repo_dir=str(repo), engine="plain")
+    context = TaskContext.from_spec(spec)
+
+    plan = plan_task(context.plan_request(spec.brief, spec.initial_state()))
+    implement = run_cline_turn(context.turn_request("implement it", plan.state))
+
+    turns = harness.sidecar.turns
+    assert [turn.read_only for turn in turns] == [True, False]
+    # 1. THE ADVERTISED LIST. A read-only turn must not be offered a tool whose only effect it cannot
+    #    perform; the writable turn on the same session must be, or implementation silently breaks.
+    assert turns[0].write_tools_offered == (), (
+        "the read-only plan turn was offered a write tool: "
+        f"{turns[0].write_tools_offered} — the model will call it and the guard will abort the turn"
+    )
+    assert "editor" in turns[1].offered_tools, (
+        "the implement turn was NOT offered the editor, so it cannot do its job: "
+        f"{turns[1].offered_tools}"
+    )
+
+    # 2. THE RUN'S OUTCOME — both turns completed, and the task recorded a plan and a change. This is
+    #    what a user experiences, and what every audited live run failed.
+    terminals = [
+        str(record.payload.get("event_type"))
+        for record in _ledger_turn_terminals(harness)
+    ]
+    assert terminals == ["session.turn_completed", "session.turn_completed"], terminals
+    final = TaskState.from_payload(implement.state)
+    assert final.plan_ref is not None, "the task recorded no plan"
+    assert final.checkpoint_ref is not None or final.turn_seq == 2, implement.state
+
+
+def _ledger_turn_terminals(harness: Any) -> list[Any]:
+    """Every terminal TURN event the run's ledger recorded, in order.
+
+    Read from the ledger rather than from the state, because the ledger is what an operator audits and
+    it is the artifact the defect was measured in.
+    """
+    return [
+        record
+        for record in harness.ledger().records()
+        if record.kind == "turn.event"
+        and str((record.payload or {}).get("event_type", "")).startswith("session.turn_")
+    ]
+
+
+def test_the_run_outcome_is_the_one_a_user_sees(tmp_path: Path):
+    """A meta-test on the JOIN above: the assertion really does fail when the engine aborts.
+
+    The first version of this section asserted only on `offered_tools`, which is a property of the
+    harness. If the harness's model of the engine is wrong, that assertion is a tautology. So here the
+    fake sidecar is made to do what the BROKEN engine did — report `control_stop` on the read-only
+    turn — and the run-level expectation must fail, proving the second assertion has teeth.
+    """
+    import pytest
+
+    from codna.durable.activities import plan_task
+    from codna.durable.activity_support import ActivityError
+    from codna.durable.contracts import TaskContext
+
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    # The engine's own abort, verbatim from the audit.
+    harness.sidecar.terminal = fakes.TERMINAL_ABORTED
+    harness.sidecar.abort_on_terminal = {
+        "kind": "control_stop",
+        "reason": (
+            "write-scope violation: this turn is read-only, so 'editor' is refused "
+            "(read-only means no file edits and no state-changing shell commands)"
+        ),
+    }
+    spec = _spec(repo_dir=str(repo), engine="plain")
+    context = TaskContext.from_spec(spec)
+
+    with pytest.raises(ActivityError) as caught:
+        plan_task(context.plan_request(spec.brief, spec.initial_state()))
+    # The failure names the refusal, so the reason survives the activity boundary — which is what makes
+    # the defect legible in a ledger rather than a bare "did not complete".
+    assert caught.value.code == "activity_turn_failed"
+    assert caught.value.details["terminal"] == "session.turn_aborted"
+    assert caught.value.details["abort"]["kind"] == "control_stop"
+    assert "write-scope violation" in caught.value.details["reason"]
+
+
 def test_the_report_counts_are_the_real_ones(tmp_path: Path):
     """A meta-test: the harness itself is exercised, so a green suite is not a vacuous one."""
     repo = fakes.make_repo(tmp_path / "repo")
