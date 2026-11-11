@@ -854,16 +854,333 @@ def test_cli_version_fails_closed_when_the_pyproject_has_none(tmp_path: Path):
 
 
 def test_build_id_falls_back_to_the_commit_and_never_to_a_placeholder(monkeypatch):
+    """The live checkout is never a `dev` placeholder, and the override still wins.
+
+    Asserted as an INVARIANT rather than against a specific value: a developer running this suite has
+    uncommitted work most of the time, and a test that demanded a bare SHA would fail for the honest
+    reason the fix exists. The commit-or-its-dirty-form is exactly the promise; a placeholder is not.
+    """
     tool = _load_release_builder()
     monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
-    assert tool.sidecar_build_id() == subprocess.run(
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    commit = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
         text=True,
         capture_output=True,
         check=True,
     ).stdout.strip()
+
+    assert tool.sidecar_build_id() in {commit, f"{commit}{tool.DIRTY_SUFFIX}"}
     monkeypatch.setenv("CODNA_SIDECAR_BUILD_ID", "explicit-id")
     assert tool.sidecar_build_id() == "explicit-id"
+
+
+# --------------------------------------------------------------------------------------------------
+# THE BUILD ID MUST NOT NAME A COMMIT THE BYTES DO NOT CONTAIN
+#
+# Measured 2026-11-11: `/Applications/Codna.app` 0.1.47 shipped a frontend that contained `ProseAccumulator`
+# (added in `a283d261`) while its stamp said `bd427d6b` — the PARENT. `sidecar_build_id` ran `git rev-parse
+# HEAD` and never asked whether the tree was dirty, so any build from uncommitted bytes stamped its clean
+# parent. A SHA that is not what was compiled is a placeholder wearing a SHA's clothes.
+#
+# These tests run `sidecar_build_id` against a REAL temporary repository rather than mocking `subprocess`:
+# the defect was the absent interaction between git's answer and the tree state, so a test that stubs git
+# could pass while the function still stamps a lying id.
+# --------------------------------------------------------------------------------------------------
+
+def _git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True, check=True)
+    return completed.stdout.strip()
+
+
+def _init_sidecar_source_repo(repo: Path) -> str:
+    """A repo shaped like the real one: the sidecar sources, the frontend, and the publish-swapped engine.
+
+    `ide/` is present because the packaged artifact carries that frontend beside the binary, and
+    `cli/memengine/` because the publish workflow replaces it from the signed bundle immediately before
+    this compile — those are the two paths whose counting behaviour differs, so both are fixtures.
+    """
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "packaging-test@example.com")
+    _git(repo, "config", "user.name", "Codna Packaging Test")
+    (repo / "agent-core").mkdir()
+    (repo / "agent-core" / "run-server.mjs").write_text("// entrypoint\n", encoding="utf-8")
+    (repo / "ide" / "packages" / "codna-engine-client" / "src").mkdir(parents=True)
+    (repo / "ide" / "packages" / "codna-engine-client" / "src" / "normalizer.ts").write_text(
+        "export const normalize = () => 1;\n", encoding="utf-8"
+    )
+    (repo / "cli" / "memengine").mkdir(parents=True)
+    (repo / "cli" / "memengine" / "vectorcore.py").write_text("# engine\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "initial")
+    return _git(repo, "rev-parse", "--short", "HEAD")
+
+
+def test_build_id_on_a_clean_tree_is_the_commit(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    commit = _init_sidecar_source_repo(repo)
+
+    assert tool.sidecar_build_id(root=repo) == commit
+
+
+def test_build_id_on_a_dirty_compiled_input_uses_gits_own_dirty_marker(tmp_path: Path, monkeypatch):
+    """The exact defect: uncommitted bytes compiled in, so the id must not be the clean commit alone."""
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    commit = _init_sidecar_source_repo(repo)
+    (repo / "agent-core" / "run-server.mjs").write_text("// entrypoint\n// uncommitted edit\n", encoding="utf-8")
+
+    # `-dirty` is git's own suffix (`git describe --dirty`) rather than an invented marker, so the value
+    # stays legible to anyone who already reads git output, and a regex pinning a bare SHA will not match it.
+    assert tool.sidecar_build_id(root=repo) == f"{commit}{tool.DIRTY_SUFFIX}"
+
+
+def test_build_id_counts_a_dirty_frontend(tmp_path: Path, monkeypatch):
+    """The measured 0.1.47 shape: `app.asar` was built from `ide/**` while the stamp named its parent.
+
+    A dirty test narrowed to the files the bun compile imports would call this tree clean and stamp a
+    later commit's frontend as the parent all over again.
+    """
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    commit = _init_sidecar_source_repo(repo)
+    (repo / "ide" / "packages" / "codna-engine-client" / "src" / "normalizer.ts").write_text(
+        "export const normalize = () => 1;\nexport class ProseAccumulator {}\n", encoding="utf-8"
+    )
+
+    assert tool.sidecar_build_id(root=repo) == f"{commit}{tool.DIRTY_SUFFIX}"
+
+
+def test_build_id_ignores_an_untracked_file(tmp_path: Path, monkeypatch):
+    """`git describe --dirty` does not consider untracked files dirty, and neither does this.
+
+    A scratch file (`notes.txt`, a captured log) must not relabel a build; the artifact contains only
+    what was committed and compiled.
+    """
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    commit = _init_sidecar_source_repo(repo)
+    (repo / "scratch-notes.txt").write_text("local scratch\n", encoding="utf-8")
+
+    assert tool.sidecar_build_id(root=repo) == commit
+
+
+def test_build_id_ignores_the_publish_workflows_memengine_swap(tmp_path: Path, monkeypatch):
+    """`publish-cli.yml` replaces `cli/memengine` from the signed bundle just before this compile.
+
+    That package is the Python engine; it is not in the sidecar binary. Counting it would stamp every
+    release `-dirty`, and a marker that fires on every build is one readers learn to ignore.
+    """
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    commit = _init_sidecar_source_repo(repo)
+    (repo / "cli" / "memengine" / "vectorcore.py").write_text("# staged engine\n", encoding="utf-8")
+
+    assert tool.sidecar_build_id(root=repo) == commit
+
+
+def test_build_id_counts_a_dirty_path_the_sidecar_compile_never_reads(tmp_path: Path, monkeypatch):
+    """The broad scope is deliberate, and this pins it.
+
+    A test or doc edit under `cli/tests/` is not in the binary. It still marks the build `-dirty`, because
+    the alternative — a narrower pathspec — is the shape that called 0.1.47's tree clean while its artifact
+    carried a later commit's frontend. The trade is stated in the code, and asserted here so a future
+    "optimization" to the pathspec has to change a test that says why it is the way it is.
+    """
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    _init_sidecar_source_repo(repo)
+    (repo / "cli" / "tests").mkdir()
+    (repo / "cli" / "tests" / "test_unrelated.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
+    _git(repo, "add", "cli/tests/test_unrelated.py")
+    _git(repo, "commit", "-m", "add test")
+    head = _git(repo, "rev-parse", "--short", "HEAD")
+    (repo / "cli" / "tests" / "test_unrelated.py").write_text("def test_x():\n    assert True\n", encoding="utf-8")
+
+    assert tool.sidecar_build_id(root=repo) == f"{head}{tool.DIRTY_SUFFIX}"
+
+
+def test_ci_refusal_names_the_modified_paths(tmp_path: Path, monkeypatch):
+    """A refusal must say WHAT it found, or a broken exclusion looks like a spurious release failure.
+
+    The exclusion is a pathspec, and a pathspec that silently stopped applying would make every release
+    refuse. Listing the paths is what turns that into a two-minute diagnosis: `cli/memengine` in the
+    message names the cause directly.
+    """
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    monkeypatch.setenv("CI", "true")
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    _init_sidecar_source_repo(repo)
+    (repo / "agent-core" / "run-server.mjs").write_text("// entrypoint\n// uncommitted edit\n", encoding="utf-8")
+
+    with pytest.raises(tool.ReleaseDistError) as excinfo:
+        tool.sidecar_build_id(root=repo)
+    message = str(excinfo.value)
+    assert "agent-core/run-server.mjs" in message, "the refusal must name the path it found"
+    assert "cli/memengine" not in message, "the excluded path must never appear as a reason"
+
+
+def test_the_memengine_exclusion_is_actually_honoured(tmp_path: Path, monkeypatch):
+    """Asserted directly, because the exclusion failing open is the failure mode worth catching.
+
+    `_modified_paths` is the single place the pathspec is built; a test that only checked the boolean
+    would pass even if `:(exclude)` stopped being interpreted and the path were silently counted.
+    """
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    _init_sidecar_source_repo(repo)
+    (repo / "cli" / "memengine" / "vectorcore.py").write_text("# staged engine\n", encoding="utf-8")
+    (repo / "agent-core" / "run-server.mjs").write_text("// entrypoint\n// edit\n", encoding="utf-8")
+
+    modified = tool._modified_paths(repo)
+
+    assert any("agent-core/run-server.mjs" in path for path in modified)
+    assert not any("memengine" in path for path in modified)
+
+
+def test_modified_paths_are_bare_paths_without_the_porcelain_status(tmp_path: Path):
+    """`git status --porcelain` prefixes `XY `; the returned paths must not carry it.
+
+    The refusal message is the consumer, and `Modified: M ide/…` reads as a mangled filename. Asserted
+    by equality rather than substring so the prefix cannot creep back in under a passing test.
+    """
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    _init_sidecar_source_repo(repo)
+    (repo / "agent-core" / "run-server.mjs").write_text("// entrypoint\n// edit\n", encoding="utf-8")
+
+    assert tool._modified_paths(repo) == ("agent-core/run-server.mjs",)
+
+
+def test_porcelain_parsing_consumes_a_source_field_only_from_the_index_column():
+    """The source-field skip is keyed on the INDEX status column, and here is why it is not a substring.
+
+    A rename's source path is a separate NUL field, but only an index-column `R`/`C` produces one:
+    `git status` reports an UNSTAGED rename as ` D` + `??` (no rename entry at all) and an index rename
+    that is also modified as `RM` — measured, both still emit the source field. Keying on the index
+    column is what keeps this from swallowing the next legitimate entry if a future git were to report a
+    worktree-only `R`, which carries no source field. Driven from literals so the rule is pinned
+    independently of what the local git happens to emit.
+    """
+    tool = _load_release_builder()
+
+    # Index rename: source field consumed, so one entry — not the next path eaten.
+    assert tool._porcelain_paths("R  new.ts\0old.ts\0 M other.ts\0") == ("new.ts", "other.ts")
+    # Index rename + worktree modify: same shape.
+    assert tool._porcelain_paths("RM new.ts\0old.ts\0") == ("new.ts",)
+    # A worktree-only `R` carries NO source field: the following path must survive.
+    assert tool._porcelain_paths(" R new.ts\0 M other.ts\0") == ("new.ts", "other.ts")
+    # Copy behaves like rename in the index column only.
+    assert tool._porcelain_paths("C  copy.ts\0source.ts\0") == ("copy.ts",)
+    assert tool._porcelain_paths(" C copy.ts\0 M other.ts\0") == ("copy.ts", "other.ts")
+    # Empty output, and the trailing NUL every `-z` response ends with.
+    assert tool._porcelain_paths("") == ()
+    assert tool._porcelain_paths(" M a.ts\0") == ("a.ts",)
+
+
+def test_modified_paths_survive_a_name_with_spaces_and_a_rename(tmp_path: Path):
+    """The two cases the newline form would mangle: quoting, and a rename's second NUL field."""
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    _init_sidecar_source_repo(repo)
+    spaced = repo / "agent-core" / "a file with spaces.ts"
+    spaced.write_text("export const x = 1;\n", encoding="utf-8")
+    _git(repo, "add", str(spaced))
+    _git(repo, "commit", "-m", "add spaced")
+    (repo / "agent-core" / "renamed.ts").write_text("export const x = 1;\n", encoding="utf-8")
+    _git(repo, "add", "agent-core/renamed.ts")
+    _git(repo, "commit", "-m", "pre-rename")
+    _git(repo, "mv", "agent-core/renamed.ts", "agent-core/renamed-again.ts")
+    spaced.write_text("export const x = 2;\n", encoding="utf-8")
+
+    modified = tool._modified_paths(repo)
+
+    # The spaced path is raw, not `"agent-core/a file with spaces.ts"`.
+    assert "agent-core/a file with spaces.ts" in modified
+    # The rename contributes ONE entry (its new path), not its source path as a second "change".
+    assert "agent-core/renamed-again.ts" in modified
+    assert "agent-core/renamed.ts" not in modified
+    assert len(modified) == 2
+
+
+def test_build_id_refuses_a_dirty_tree_in_ci(tmp_path: Path, monkeypatch):
+    """A published `-dirty` id names no checkout and carries no diff, so CI must not produce one."""
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    monkeypatch.setenv("CI", "true")
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    commit = _init_sidecar_source_repo(repo)
+    (repo / "agent-core" / "run-server.mjs").write_text("// entrypoint\n// uncommitted edit\n", encoding="utf-8")
+
+    with pytest.raises(tool.ReleaseDistError) as excinfo:
+        tool.sidecar_build_id(root=repo)
+    message = str(excinfo.value)
+    # The refusal must name the offending commit and both ways out.
+    assert commit in message
+    assert "CODNA_SIDECAR_BUILD_ID" in message
+    assert f"{commit}{tool.DIRTY_SUFFIX}" in message
+
+
+def test_build_id_still_allows_a_clean_tree_in_ci(tmp_path: Path, monkeypatch):
+    """The CI refusal is about DIRT, not about CI — a clean release build must keep working."""
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    monkeypatch.setenv("CI", "true")
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    commit = _init_sidecar_source_repo(repo)
+
+    assert tool.sidecar_build_id(root=repo) == commit
+
+
+def test_build_id_override_wins_verbatim_even_over_a_dirty_tree_in_ci(tmp_path: Path, monkeypatch):
+    """The escape hatch: an authoritative id must not be blocked by a tree state it does not depend on.
+
+    If the override could still fail, the release would be unbuildable exactly when someone had already
+    stated what to stamp — which is how a team ends up deleting the guard instead of using it.
+    """
+    monkeypatch.setenv("CI", "true")
+    tool = _load_release_builder()
+    repo = tmp_path / "repo"
+    _init_sidecar_source_repo(repo)
+    (repo / "agent-core" / "run-server.mjs").write_text("// entrypoint\n// uncommitted edit\n", encoding="utf-8")
+    monkeypatch.setenv("CODNA_SIDECAR_BUILD_ID", "  release-2026-11-11.4  ")
+
+    assert tool.sidecar_build_id(root=repo) == "release-2026-11-11.4"
+
+
+def test_build_id_fails_closed_outside_a_git_checkout(tmp_path: Path, monkeypatch):
+    """No checkout and no override is an error, never a `dev` placeholder — the existing promise."""
+    monkeypatch.delenv("CODNA_SIDECAR_BUILD_ID", raising=False)
+    tool = _load_release_builder()
+    not_a_repo = tmp_path / "plain-dir"
+    not_a_repo.mkdir()
+
+    with pytest.raises(tool.ReleaseDistError) as excinfo:
+        tool.sidecar_build_id(root=not_a_repo)
+    assert "not a git checkout and CODNA_SIDECAR_BUILD_ID is unset" in str(excinfo.value)
+
 
 
 def test_write_sidecar_stamp_binds_the_digest_of_the_bytes_on_disk(tmp_path: Path):
@@ -960,5 +1277,20 @@ def test_prepare_agent_core_bundle_writes_the_stamp_as_a_postcondition():
     compile_section = builder[builder.index("def prepare_agent_core_bundle(") : builder.index("def verify_staged_runtime(")]
     assert "write_sidecar_stamp(" in compile_section, "the compile must emit the stamp"
     assert "cli_version(cli_source)" in compile_section, "the stamp version must come from cli/pyproject.toml"
-    assert "sidecar_build_id()" in compile_section
+    assert "build_id=build_id," in compile_section, "the stamp must use the id resolved before the compile"
     assert compile_section.index("_assert_sidecar_binary_clean(binary)") < compile_section.index("write_sidecar_stamp(")
+
+
+def test_prepare_agent_core_bundle_resolves_the_build_id_before_it_compiles():
+    """A build id that cannot be determined must fail in the first second, not after `bun install`.
+
+    Measured: the CI refusal returns in 0s at the seam because `sidecar_build_id()` is resolved before the
+    first subprocess. Resolving it only at the `write_sidecar_stamp` call would spend the whole compile —
+    `bun install`, `build:sdk`, the sanitized bundle and `bun build --compile` — before refusing, which is
+    how a guard becomes something people work around instead of read.
+    """
+    builder = RELEASE_BUILDER.read_text(encoding="utf-8")
+    compile_section = builder[builder.index("def prepare_agent_core_bundle(") : builder.index("def verify_staged_runtime(")]
+    resolution = compile_section.index("build_id = sidecar_build_id()")
+    assert resolution < compile_section.index('"install"'), "resolve the id before the first build step"
+    assert resolution < compile_section.index("_assert_sidecar_binary_clean(binary)")
