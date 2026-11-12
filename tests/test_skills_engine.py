@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import unlistable_directory
+
 from codna.rules import (
     Skill,
     SkillMode,
@@ -201,6 +203,54 @@ def test_a_symlinked_skill_file_outside_the_repository_is_skipped(tmp_path):
         warning.code in ("skill_file_outside_repository", "skill_file_unreadable")
         for warning in discovery.warnings
     )
+
+
+def test_an_unreadable_skill_directory_is_reported_not_silently_empty(tmp_path):
+    """A layer the process may not LIST must be named, not dropped.
+
+    MEASURED on 0.1.49: `~/.codex` is a symlink into iCloud Drive, and a process without the terminal's
+    TCC grant cannot list it. `os.walk` swallows that `OSError` by default, so the catalogue came back
+    with 8 skills instead of 9 and NO warning — indistinguishable from a user who has no codex skills.
+    The same request answered 9 when the app was launched from a terminal and 8 when launched by
+    LaunchServices, which is the defect this test pins.
+
+    The permission is removed with `chmod 000` rather than by mocking `os.walk`, so the failure is the
+    real one: an `OSError` raised by the kernel, swallowed by the standard library. `unlistable_directory`
+    PROVES the mode took effect (and skips with the reason when it cannot, e.g. as root) so the assertion
+    below can never pass vacuously.
+    """
+    home = tmp_path / "home"
+    write(home, ".agents/skills/visible/SKILL.md", skill_md(description="reachable"))
+    write(home, ".codex/skills/sealed/SKILL.md", skill_md(description="unreachable"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sealed = home / ".codex" / "skills"
+    # PROVEN, not assumed: the helper only proceeds when `listdir` actually raises, and skips with the reason
+    # otherwise (root, or a filesystem without POSIX mode bits). The assertion below therefore can never pass
+    # vacuously and can never fail for a reason unrelated to the reader.
+    with unlistable_directory(sealed):
+        discovery = discover_skills(str(repo), home=str(home))
+
+    # The reachable layer is still read: an unreadable sibling must not take the catalogue down.
+    assert names(discovery.skills) == ["visible"]
+    unreadable = [warning for warning in discovery.warnings if warning.code == "skills_dir_unreadable"]
+    assert len(unreadable) == 1, [warning.code for warning in discovery.warnings]
+    # The warning names the directory, so a user can see WHICH layer is missing rather than only that one is.
+    assert ".codex/skills" in unreadable[0].source_path
+    assert "Operation not permitted" in unreadable[0].message or "Permission denied" in unreadable[0].message
+
+
+def test_a_readable_skill_directory_produces_no_unreadable_warning(tmp_path):
+    """The negative half: the warning must be evidence of a failure, not a line every run carries."""
+    home = tmp_path / "home"
+    write(home, ".codex/skills/fine/SKILL.md", skill_md(description="readable"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    discovery = discover_skills(str(repo), home=str(home))
+
+    assert names(discovery.skills) == ["fine"]
+    assert [warning.code for warning in discovery.warnings] == []
 
 
 def test_a_bad_frontmatter_value_is_reported_and_the_skill_is_kept(tmp_path):

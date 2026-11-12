@@ -14,6 +14,7 @@ imported inside `cmd_serve`.
 """
 from __future__ import annotations
 
+import os
 import sys
 from typing import Any
 
@@ -165,7 +166,32 @@ def cmd_serve(args: Any) -> int:
         pass
     finally:
         server.stop()
+    # THE STOP IS STATED, not implied. A long-lived server that ends must say so in its own output:
+    # the failure this line exists for was a log that stopped at the banner with no traceback, no
+    # "shutdown", and nothing to distinguish "stopped" from "was killed" — which is why the SIGHUP
+    # death behind it could not be diagnosed from the evidence the process left behind.
+    #
+    # BEST-EFFORT, deliberately. When the stopping signal was a HANGUP on a terminal that is already
+    # gone, this write cannot land — and CPython turns an unflushable `sys.stdout` at interpreter
+    # exit into status 120, which would report a clean, requested stop as a failure. Reporting is
+    # worth attempting; it is never worth changing the exit status of a successful shutdown.
+    _print_stop(server.stop_reason)
     return 0
+
+
+def _print_stop(reason: str | None) -> None:
+    """Say why the loop ended, and keep a dead stdout from turning a clean stop into exit 120."""
+    try:
+        _cli_module()._print({"run_api": {"stopped": True, "reason": reason}})
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        # The terminal (or pipe) this process was started with is gone. There is nowhere to report
+        # to, and that is a property of the caller's setup, not a failure of this server — so the
+        # buffered bytes are dropped and the exit status stays 0.
+        try:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        except OSError:  # pragma: no cover - /dev/null is always openable
+            pass
 
 
 def identity_config_for(args: Any, *, token: str) -> Any:

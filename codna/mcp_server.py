@@ -283,6 +283,196 @@ def fix_json(
         return f"codna_fix error: {exc}"
 
 
+def _browser_tools_enabled() -> bool:
+    """Whether ``CODNA_BROWSER_TOOL`` is on. A bad value is off for REGISTRATION, and said so.
+
+    Registration must not raise: `codna mcp` failing to list its own tools because of a typo in one
+    optional switch turns a browser setting into a broken server. The typo is reported instead — by
+    ``codna mcp browser``, by the ``codna://capabilities`` resource, and by every browser tool body when
+    called. Off is the correct answer for "this tool must not exist yet".
+    """
+    from .browser_tool import BrowserToolConfigError, browser_tool_enabled
+
+    try:
+        return browser_tool_enabled()
+    except BrowserToolConfigError:
+        return False
+
+
+def _browser_capability_state() -> dict:
+    """The honest browser-tool state for the capabilities resource (never raises)."""
+    from .browser_tool import browser_tool_state
+
+    return browser_tool_state()
+
+
+def _browser_image(content_factory) -> list:
+    """Run a browser body that returns ``(text, images)`` and build MCP content, image included.
+
+    The result is a LIST of content blocks rather than a string, because a screenshot that arrived as a
+    base64 string in a text block is a screenshot the model cannot see. A failure still answers with text —
+    the tool body already rendered it.
+    """
+    from mcp.types import ImageContent, TextContent
+
+    text, images = content_factory()
+    blocks: list = [TextContent(type="text", text=text)]
+    for image in images:
+        blocks.append(ImageContent(
+            type="image", data=image["data"],
+            mimeType=image.get("mime_type") or "image/png",
+        ))
+    return blocks
+
+
+def _register_browser_tools(server) -> None:
+    """Register the ``codna_browser_*`` tools, but ONLY when the switch is on.
+
+    Gated at REGISTRATION rather than at call time so an agent never sees a browser tool it cannot use: a
+    tool listed and then refusing every call is a worse contract than a tool that is absent, and the
+    absence is explained by ``codna mcp browser`` and by the ``codna://capabilities`` resource.
+
+    Each body is the module-level function in ``browser_bridge`` — the same code the smoke test and the
+    durable path use — so there is one implementation behind the registration, not two.
+    """
+    from . import browser_bridge
+
+    if not _browser_tools_enabled():
+        return
+
+    from mcp.types import ToolAnnotations
+
+    @server.tool(annotations=ToolAnnotations(
+        title="Open a URL in a browser and read the page",
+        readOnlyHint=False,
+        # Same URL twice opens the same page, but the session is stateful (cookies, history).
+        idempotentHint=False,
+        # A browser loads whatever the network serves. This is the tool whose whole job is open-world.
+        openWorldHint=True,
+    ))
+    def codna_browser_navigate(url: str = "") -> str:
+        """Navigate the browser to `url` and return the page's accessible text.
+
+        Requires `CODNA_BROWSER_TOOL=1` in the server's environment (default off) and Node.js 18+ on PATH:
+        Codna drives Playwright's own MCP server and does not bundle Node. No `codna login` is needed —
+        browsing is local.
+
+        url: an absolute http(s) URL, a `data:` URL, or a `file:` URL (the last needs
+          `CODNA_BROWSER_FILE_ACCESS=unrestricted`).
+        Returns the page's accessible tree as text (the same snapshot `codna_browser_snapshot` reads), or
+          `codna_browser_navigate error: ...` — the tool never raises.
+        """
+        return browser_bridge.browser_navigate_json(url)
+
+    @server.tool(annotations=ToolAnnotations(
+        title="Read the current page as accessible text",
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ))
+    def codna_browser_snapshot(depth: float = 0) -> str:
+        """Read the current page's accessibility tree — the readable form of what is on screen.
+
+        This is the assertion primitive: after navigating, read the snapshot and check that the text,
+        heading or button you expected is present. It runs no page JavaScript.
+
+        depth: limit the tree depth; 0 (default) means the whole tree.
+        Returns the snapshot as text, or `codna_browser_snapshot error: ...`.
+        """
+        return browser_bridge.browser_snapshot_json(depth)
+
+    @server.tool(annotations=ToolAnnotations(
+        title="Click an element",
+        readOnlyHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ))
+    def codna_browser_click(target: str = "", element: str = "") -> str:
+        """Click an element on the current page.
+
+        target: the element reference from `codna_browser_snapshot` (e.g. `e3`), a CSS selector (e.g.
+          `#submit`), or another Playwright locator.
+        element: optional human-readable description of the element, used by the browser's permission
+          prompt.
+        Returns the page snapshot after the click, or `codna_browser_click error: ...`.
+        """
+        return browser_bridge.browser_click_json(target, element)
+
+    @server.tool(annotations=ToolAnnotations(
+        title="Type into an element",
+        readOnlyHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ))
+    def codna_browser_type(target: str = "", text: str = "", element: str = "",
+                           submit: bool = False) -> str:
+        """Type text into an editable element (an input, a textarea, a contenteditable).
+
+        target: the element reference from `codna_browser_snapshot`, or a CSS selector.
+        text: what to type.
+        element: optional human-readable element description.
+        submit: press Enter after typing (default false).
+        Returns the page snapshot after typing, or `codna_browser_type error: ...`.
+        """
+        return browser_bridge.browser_type_json(target, text, element, submit)
+
+    @server.tool(annotations=ToolAnnotations(
+        title="Screenshot the page",
+        readOnlyHint=False,
+        # Writes a new image file each call; two calls are two files.
+        idempotentHint=False,
+        openWorldHint=False,
+    ))
+    async def codna_browser_screenshot(filename: str = "", full_page: bool = False):
+        """Screenshot the page and return the IMAGE, plus where it was written.
+
+        The image is returned as real image content, not as a path in text, so the model actually sees it.
+
+        filename: a name relative to the browser output directory (`$CODNA_RUNTIME_ROOT/browser`); an
+          absolute path or `..` is refused. Default: a timestamped `page-<time>.png`.
+        full_page: capture the whole scrollable page instead of the viewport (default false).
+        Returns the image content plus a JSON block with the path, size and Playwright's own output, or
+          `codna_browser_screenshot error: ...`.
+        """
+        return await asyncio.to_thread(
+            _browser_image,
+            lambda: browser_bridge.browser_screenshot_content(filename, full_page),
+        )
+
+    @server.tool(annotations=ToolAnnotations(
+        title="Wait for text, or for a pause",
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ))
+    def codna_browser_wait(text: str = "", text_gone: str = "", time_s: float = 0.0) -> str:
+        """Wait until text appears (or disappears), or until a number of seconds have passed.
+
+        Use this instead of guessing: a page that fetches data after load needs the text to be waited for
+        before its snapshot is asserted.
+
+        text: wait for this text to appear.
+        textGone: wait for this text to disappear.
+        time_s: seconds to wait, at most 30. With `text`/`text_gone` it is their timeout instead.
+        Returns the page snapshot after the wait, or `codna_browser_wait error: ...`.
+        """
+        return browser_bridge.browser_wait_json(text, text_gone, time_s)
+
+    @server.tool(annotations=ToolAnnotations(
+        title="Close the browser session",
+        readOnlyHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ))
+    def codna_browser_close() -> str:
+        """Close the browser session and its browser process.
+
+        The session is reused across calls, so close it when a verification is done rather than leaving
+        Chromium resident. The next browser call starts a fresh session.
+        """
+        return browser_bridge.browser_close_json()
+
+
 def _build_server():
     from mcp.server.fastmcp import FastMCP
     from mcp.types import ToolAnnotations
@@ -576,6 +766,8 @@ def _build_server():
     @server.resource("codna://capabilities")
     def capabilities() -> str:
         """codna's MCP capabilities — @-mentionable so the client knows what codna offers."""
+        from .browser_tool import BROWSER_TOOL_ENV
+
         return json.dumps({
             "product": "codna",
             "tools": {
@@ -588,7 +780,24 @@ def _build_server():
                                       "rules the prompt only catalogues)",
                 "codna_load_skill": "pull one skill's full instructions by name (the skills the prompt "
                                     "only catalogues), including the files it ships",
+                **(
+                    {
+                        "codna_browser_navigate": "open a URL and read the page (needs "
+                                                  f"{BROWSER_TOOL_ENV}=1)",
+                        "codna_browser_snapshot": "read the current page as accessible text",
+                        "codna_browser_click": "click an element on the page",
+                        "codna_browser_type": "type into an editable element",
+                        "codna_browser_screenshot": "screenshot the page (returns the image)",
+                        "codna_browser_wait": "wait for text to appear/disappear, or a pause",
+                        "codna_browser_close": "close the browser session",
+                    }
+                    if _browser_tools_enabled()
+                    else {}
+                ),
             },
+            # Reported even when OFF: the switch is the one thing a user needs to know about this tool,
+            # and "which export turns it on" is not discoverable from its absence.
+            "browser": _browser_capability_state(),
             "default_repo": os.environ.get("CODNA_MCP_DEFAULT_REPO", "."),
         }, indent=2)
 
@@ -598,6 +807,10 @@ def _build_server():
         return (f"Use the codna tools to fix this in repo `{repo}`:\n\n{issue}\n\n"
                 "First call codna_triage to locate the relevant code, then codna_fix with the issue and model when specified. "
                 "Report the root cause, the patch reference, and codna's confidence.")
+
+    # Registered LAST so the eight core tools keep their order in `tools/list`, and only when the browser
+    # switch is on: an agent must never see a browser tool the server would refuse to run.
+    _register_browser_tools(server)
 
     return server
 
