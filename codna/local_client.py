@@ -237,13 +237,13 @@ def _insert_import_path(path: Path) -> None:
         _INSERTED_DECISION_ENGINE_IMPORT_PATHS.add(text)
 
 
-def _decision_engine_import_paths(config: RuntimeConfig) -> list[Path]:
-    engine_dir = config.engine_dir.expanduser().resolve()
+def _decision_engine_import_paths(engine_dir: Path) -> list[Path]:
+    resolved = engine_dir.expanduser().resolve()
     return [
-        engine_dir,
-        engine_dir / "packages" / "algenta-core",
-        engine_dir / "packages" / "python-sdk",
-        *_compatible_engine_site_packages(engine_dir),
+        resolved,
+        resolved / "packages" / "algenta-core",
+        resolved / "packages" / "python-sdk",
+        *_compatible_engine_site_packages(resolved),
     ]
 
 
@@ -257,7 +257,11 @@ def _path_is_relative_to(path: Path, parent: Path) -> bool:
 
 def _remove_inserted_decision_engine_import_paths(config: RuntimeConfig) -> None:
     removed_paths: list[Path] = []
-    for path in _decision_engine_import_paths(config):
+    engine_dir = config.engine_dir
+    if engine_dir is None:
+        # Nothing was ever inserted for an unset engine dir, so there is nothing to unwind.
+        return
+    for path in _decision_engine_import_paths(engine_dir):
         text = str(path)
         if text not in _INSERTED_DECISION_ENGINE_IMPORT_PATHS:
             continue
@@ -306,9 +310,16 @@ def _install_local_privacy_stub() -> None:
 
 
 def _ensure_decision_engine_imports(config: RuntimeConfig) -> None:
+    engine_dir = config.engine_dir
+    if engine_dir is None:
+        # No checkout was named. This is NOT a refusal: the in-process repository path has a real fallback
+        # (the packaged backend, see `_repository_modules_or_packaged`), so the import below is allowed to
+        # fail and be handled there. Inserting a guessed path here is what used to import a stranger's
+        # `apps.*` package from `~/Developer/decision-engine`.
+        return
     if _explicit_algenta_engine_dir_configured():
         expected_core = (
-            config.engine_dir.expanduser().resolve()
+            engine_dir.expanduser().resolve()
             / "apps"
             / "api_server"
             / "services"
@@ -319,7 +330,7 @@ def _ensure_decision_engine_imports(config: RuntimeConfig) -> None:
                 "local_repository_import_failed",
                 "Explicit ALGENTA_ENGINE_DIR does not contain the local Algenta repository-intelligence SDK/core modules.",
                 {
-                    "engine_dir": str(config.engine_dir),
+                    "engine_dir": str(engine_dir),
                     "reason": f"missing expected module: {expected_core}",
                     "required_backend": "packaged Algenta local repository-intelligence backend",
                     "development_override": "Unset ALGENTA_ENGINE_DIR to use the installed local SDK/package fallback.",
@@ -330,7 +341,7 @@ def _ensure_decision_engine_imports(config: RuntimeConfig) -> None:
                     ],
                 },
             )
-    for path in _decision_engine_import_paths(config):
+    for path in _decision_engine_import_paths(engine_dir):
         _insert_import_path(path)
     _install_local_privacy_stub()
 
@@ -350,7 +361,7 @@ def _import_repository_modules(config: RuntimeConfig) -> _RepositoryModules:
             "local_repository_import_failed",
             "Codna could not import the local Algenta repository-intelligence SDK/core modules.",
             {
-                "engine_dir": str(config.engine_dir),
+                "engine_dir": str(config.engine_dir) if config.engine_dir is not None else None,
                 "reason": f"{type(exc).__name__}: {exc}",
                 "required_backend": "packaged Algenta local repository-intelligence backend",
                 "development_override": "Set ALGENTA_ENGINE_DIR only for local development checkouts.",

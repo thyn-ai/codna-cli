@@ -66,6 +66,7 @@ import os
 import sys
 from typing import Any, Final, Mapping
 
+from .browser_tool import BrowserToolConfigError, with_browser_tool
 from .durable.mcp import McpConfigError, normalize_mcp_servers
 
 __all__ = ["handle", "main", "SOURCE_KINDS"]
@@ -330,6 +331,17 @@ def handle(request: object) -> dict[str, Any]:
         servers = normalize_mcp_servers(merged)
     except McpConfigError as exc:
         return {"ok": False, "error": {"code": exc.code, "message": str(exc), "details": exc.details}}
+
+    # Codna's own browser server, when CODNA_BROWSER_TOOL=1. Added AFTER the config merge so a user's own
+    # `browser` server always wins — replacing a server somebody configured is a worse failure than a
+    # built-in tool that is not the one in use. Re-validated here, so enabling the tool can never push the
+    # list past the cap: an over-cap list is the validator's refusal, never a dropped server.
+    try:
+        servers = with_browser_tool(servers, os.environ)
+    except McpConfigError as exc:
+        return {"ok": False, "error": {"code": exc.code, "message": str(exc), "details": exc.details}}
+    except BrowserToolConfigError as exc:
+        return {"ok": False, "error": exc.as_dict()["error"]}
 
     return {
         "ok": True,

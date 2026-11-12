@@ -25,6 +25,12 @@ STOP_FORCE_TIMEOUT_S = 5.0
 STOP_GRACE_TIMEOUT_S = 10.0
 
 ENGINE_URL_KEYS = ("CODNA_ENGINE_URL", "ALGENTA_ENGINE_URL", "ALGENTA_BASE_URL")
+# The ONLY way an engine checkout is named. There is deliberately no default and no home-directory guess:
+# `~/Developer/decision-engine` was the implicit default, which on a user's machine either does not exist
+# (silent degradation) or is an unrelated project that happens to own that name — it is what activated the
+# legacy Mojo pool daemon from a probe. A path that genuinely needs the checkout refuses with
+# `engine_dir_unset` and names this variable (see `require_engine_dir`).
+ENGINE_DIR_ENV_VAR = "ALGENTA_ENGINE_DIR"
 API_KEY_KEYS = ("CODNA_API_KEY", "ALGENTA_API_KEY", "DE_API_KEY")
 LOCAL_DATABASE_ENV_KEYS = ("DATABASE_URL", "ASYNC_DATABASE_URL")
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
@@ -75,7 +81,10 @@ class RuntimeConfig:
     ignored_engine_url: ConfigValue | None
     engine_url_override: ConfigValue | None
     paths: RuntimePaths
-    engine_dir: Path
+    # ``None`` unless ALGENTA_ENGINE_DIR names a checkout. Everything that only needs the sidecar or a
+    # remote engine works with ``None``; the few paths that genuinely need the local engine call
+    # ``require_engine_dir`` and fail with a coded refusal naming the variable rather than guessing.
+    engine_dir: Path | None
     engine_python: str
     engine_env_file: Path
     sidecar_dir: Path
@@ -222,6 +231,47 @@ def local_engine_defaults() -> dict[str, str]:
     }
 
 
+def _engine_dir_from_env(resolved_env: Mapping[str, str]) -> Path | None:
+    """The engine checkout the environment names, or ``None``.
+
+    NO DEFAULT, deliberately. The previous implementation fell back to ``Path.home()/Developer/decision-engine``;
+    that guess is the defect: on a user's machine the directory either does not exist (so the failure surfaced
+    far from its cause) or exists as an unrelated project with that name (so Codna imported a stranger's
+    ``apps.*`` package and started a Mojo daemon against it). Absence is now a first-class state, and the paths
+    that cannot proceed without a checkout call :func:`require_engine_dir`, which names the variable to set.
+    """
+    raw = (resolved_env.get(ENGINE_DIR_ENV_VAR) or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def engine_dir_unset_error(*, consumer: str, details: dict | None = None) -> RuntimeConfigError:
+    """The structured refusal for a path that genuinely needs an engine checkout."""
+    return RuntimeConfigError(
+        f"{consumer} needs a local Algenta engine checkout, and {ENGINE_DIR_ENV_VAR} is not set.",
+        code="engine_dir_unset",
+        details={
+            "required_env": ENGINE_DIR_ENV_VAR,
+            "consumer": consumer,
+            "expected_contents": "a checkout containing apps/api_server/main.py",
+            **dict(details or {}),
+        },
+    )
+
+
+def require_engine_dir(config: RuntimeConfig, *, consumer: str, details: dict | None = None) -> Path:
+    """The resolved engine directory, or a coded refusal that names what to set.
+
+    Every path that reads files out of the checkout (the FastAPI engine spawn, the in-process import path, the
+    Mojo pool, the worker-state report) goes through here so the refusal is one shape everywhere. Callers must
+    NOT substitute a default: a guessed path is what this function exists to remove.
+    """
+    if config.engine_dir is None:
+        raise engine_dir_unset_error(consumer=consumer, details=details)
+    return config.engine_dir
+
+
 def _agent_core_root_from_override(raw: str) -> Path:
     path = Path(raw).expanduser()
     if (path / "run-server.mjs").is_file():
@@ -349,14 +399,20 @@ def resolve_runtime_config(
     engine_url = f"http://127.0.0.1:{engine_port}"
     sidecar_url = f"http://127.0.0.1:{sidecar_port}"
     codna_home = _codna_home()
-    engine_dir = Path(
-        resolved_env.get("ALGENTA_ENGINE_DIR") or (Path.home() / "Developer" / "decision-engine")
-    ).expanduser()
-    engine_python = resolved_env.get("ALGENTA_ENGINE_PYTHON") or str(engine_dir / ".venv" / "bin" / "python")
+    paths = build_runtime_paths()
+    # NO DEFAULT. `None` means "no checkout was named", which is a valid configuration for every path that
+    # only needs the sidecar or a remote engine. The paths that read the checkout call `require_engine_dir`.
+    engine_dir = _engine_dir_from_env(resolved_env)
+    engine_python = resolved_env.get("ALGENTA_ENGINE_PYTHON") or (
+        str(engine_dir / ".venv" / "bin" / "python") if engine_dir is not None else sys.executable
+    )
     if not Path(engine_python).exists():
         engine_python = sys.executable
+    # With no checkout there is no checkout `.env` to read; the owned runtime root is the only place left that
+    # Codna itself controls, and `load_env_file` treats a missing file as empty.
     engine_env_file = Path(
-        resolved_env.get("ALGENTA_ENGINE_ENV_FILE") or (engine_dir / ".env")
+        resolved_env.get("ALGENTA_ENGINE_ENV_FILE")
+        or ((engine_dir / ".env") if engine_dir is not None else (paths.root / "engine.env"))
     ).expanduser()
     sidecar_override = resolved_env.get("CODNA_SIDECAR_DIR") or resolved_env.get("CODNA_AGENT_CORE_DIR")
     sidecar_dir = (
@@ -371,13 +427,20 @@ def resolve_runtime_config(
         sidecar_binary: Path | None = None
     else:
         sidecar_binary = _default_sidecar_binary()
-    paths = build_runtime_paths()
     cline_data_dir = Path(
         resolved_env.get("CLINE_DATA_DIR")
         or (paths.root / "sidecar-state" / "cline-data")
     ).expanduser()
-    engine_build_path = engine_dir / "apps" / "api_server" / "main.py"
-    engine_build_id = _file_fingerprint(engine_build_path) if engine_build_path.exists() else _file_fingerprint(engine_dir)
+    # The engine build id is a fingerprint of the checkout. With no checkout there is nothing to fingerprint,
+    # so it is the empty-string sentinel rather than a hash of a path that does not exist — a hash of a
+    # guessed path is exactly the "looks configured" state this change removes.
+    if engine_dir is None:
+        engine_build_id = ""
+    else:
+        engine_build_path = engine_dir / "apps" / "api_server" / "main.py"
+        engine_build_id = (
+            _file_fingerprint(engine_build_path) if engine_build_path.exists() else _file_fingerprint(engine_dir)
+        )
     _sidecar_fingerprint_targets: list[tuple[Path, str, tuple[str, ...] | None]] = []
     if sidecar_binary is not None:
         _sidecar_fingerprint_targets.append((sidecar_binary, "sidecar-binary", None))
@@ -399,7 +462,9 @@ def resolve_runtime_config(
     config_hash = _runtime_config_hash(
         {
             "port_base": port_base,
-            "engine_dir": str(engine_dir),
+            # `None` and a real path must hash differently, and the string "None" must not collide with a
+            # directory literally named `None`; the sentinel makes the unset state explicit in the hash.
+            "engine_dir": str(engine_dir) if engine_dir is not None else None,
             "engine_python": engine_python,
             "engine_env_file": str(engine_env_file),
             "sidecar_dir": str(sidecar_dir),

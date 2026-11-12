@@ -101,6 +101,47 @@ def test_core_install_uses_public_dependencies_only():
     assert not any("algenta-sdk" in dep or "decision-engine" in dep for dep in deps)
 
 
+def test_no_dependency_resolves_from_a_sibling_repo_checkout():
+    """`telys` is a VERSIONED dependency; it must not be overridden with a path source.
+
+    THE DEFECT THIS PINS. `[tool.uv.sources]` used to hold
+    `telys = { path = "../../memory-engine/packages/telys-sdk", editable = true }`, which pinned this package
+    to a SIBLING REPO CHECKOUT. `uv sync` then resolved whatever version that checkout was at — measured at
+    0.1.4, three releases below the `telys.runtime.TEXT_COLUMN` floor in `dependencies` — and the desktop
+    bundler copied the same stale tree into the payload, where it failed `vector_tier_unreachable`.
+
+    A versioned requirement resolves from the index (or a release wheelhouse) and cannot go stale, so the
+    rule is general: NO path source for ANY dependency, not just for `telys`.
+    """
+    data = _data()
+    sources = data.get("tool", {}).get("uv", {}).get("sources", {})
+    assert sources == {}, (
+        "tool.uv.sources must stay empty: a path source resolves a dependency from a sibling checkout "
+        f"instead of the index, which is how a stale SDK shipped. Found: {sources}"
+    )
+    # The floor itself must survive — removing the path source must not silently drop the declaration.
+    joined = " ".join(data["project"]["dependencies"])
+    assert "telys>=0.1.11" in joined
+
+
+def test_telys_floor_is_the_release_that_exports_text_column():
+    """The floor is a SYMBOL contract, not a version preference.
+
+    `cli/memengine/native_runtime.py` line 26 is `from telys.runtime import TEXT_COLUMN as _TEXT_COLUMN` at
+    MODULE SCOPE, so an SDK below the floor cannot be imported at all. MEASURED: 0.1.0b1 … 0.1.10 do not
+    export it, 0.1.11 is the first that does. The declaration must therefore still floor at or above 0.1.11
+    — and must not be an exact pin, so a newer release that keeps the symbol resolves normally.
+    """
+    deps = _data()["project"]["dependencies"]
+    telys_decl = [dep for dep in deps if dep.startswith("telys")]
+    assert len(telys_decl) == 1, f"expected exactly one telys declaration, found {telys_decl}"
+    declaration = telys_decl[0]
+    assert declaration == "telys>=0.1.11", declaration
+    assert "==" not in declaration, "an exact pin would refuse a newer release that keeps the symbol"
+    lower_bound = declaration.split(">=")[1].split(",")[0]
+    assert tuple(int(part) for part in lower_bound.split(".")) >= (0, 1, 11)
+
+
 def test_package_declares_local_readme_metadata():
     data = _data()["project"]
     assert data["readme"] == "README.md"

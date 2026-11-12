@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from codna.local_client import LocalCodnaRuntimeClient
-from codna.runtime.config import ConfigValue
+from codna.runtime.config import ConfigValue, RuntimeConfigError
 import codna.local_client as local_client_module
 import codna.local_mojo_daemon as mojo_daemon_module
 import codna.local_mojo_pool as mojo_pool_module
@@ -806,6 +806,37 @@ def test_local_mojo_pool_size_rejects_invalid_values(monkeypatch) -> None:
         mojo_pool_module.local_mojo_pool_size()
 
     assert excinfo.value.code == "invalid_local_mojo_pool_config"
+
+
+def test_local_mojo_backend_available_is_false_without_a_named_checkout(tmp_path, monkeypatch) -> None:
+    """No checkout ⇒ no Mojo backend. A CAPABILITY probe, so `False` rather than a refusal.
+
+    The governance hook and the daemon both branch on this, and they must keep FAILING OPEN: an absent
+    checkout has to read as "do not start the pool", never as a startup hard requirement.
+    """
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.delenv("ALGENTA_ENGINE_DIR", raising=False)
+
+    config = local_client_module.resolve_runtime_config()
+
+    assert config.engine_dir is None
+    assert mojo_pool_module.local_mojo_backend_available(config) is False
+
+
+def test_ensure_decision_engine_imports_refuses_without_a_named_checkout(tmp_path, monkeypatch) -> None:
+    """The pool's import path genuinely needs the checkout, so its refusal names what to set."""
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.delenv("ALGENTA_ENGINE_DIR", raising=False)
+    config = local_client_module.resolve_runtime_config()
+    inserted: list[object] = []
+    monkeypatch.setattr(mojo_pool_module, "insert_import_path", inserted.append)
+
+    with pytest.raises(RuntimeConfigError) as excinfo:
+        mojo_pool_module.ensure_decision_engine_imports(config)
+
+    assert excinfo.value.code == "engine_dir_unset"
+    assert excinfo.value.details["required_env"] == "ALGENTA_ENGINE_DIR"
+    assert inserted == [], "no import path may be inserted for a checkout that was never named"
 
 
 def test_verified_plan_uses_sidecar_not_loopback_engine_and_scopes_keys(tmp_path, monkeypatch) -> None:
