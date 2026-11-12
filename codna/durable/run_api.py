@@ -498,6 +498,22 @@ class RunApiServer:
         )
         self._httpd: ThreadingRunApiServer | None = None
         self._thread: threading.Thread | None = None
+        # WHICH STOP SIGNAL ENDED THE FOREGROUND LOOP, or None while it is still running. `serve` prints
+        # this after `serve_forever()` returns, so a long-lived server never disappears from its log with
+        # no statement of why — the exact silence that made the SIGHUP death below undiagnosable.
+        #
+        # Written under a lock, first writer wins. Two threads can race for it — the signal handler,
+        # and `stop()`/the `finally` in `serve_forever` — and "whichever ran last" would make the
+        # recorded reason depend on scheduling. The FIRST cause is the true one: a SIGTERM that
+        # starts the shutdown is the reason it ended, whatever a concurrent `stop()` was doing.
+        self._stop_reason_lock = threading.Lock()
+        self.stop_reason: str | None = None
+
+    def _record_stop_reason(self, reason: str) -> None:
+        """Set ``stop_reason`` once. The first cause wins, so the answer is deterministic."""
+        with self._stop_reason_lock:
+            if self.stop_reason is None:
+                self.stop_reason = reason
 
     def bind(self) -> "RunApiServer":
         """Bind the socket without serving. Raises rather than retrying a port somebody owns."""
@@ -541,6 +557,10 @@ class RunApiServer:
         signals to the main thread), and ``shutdown()`` must NOT be called from the thread running
         it — so a signal sets ``stopping`` (which drains the streams) and hands ``shutdown`` to a
         helper thread. Doing the obvious thing instead deadlocks the shutdown.
+
+        A hangup (``SIGHUP``) deliberately does NOT end this loop — see ``_install_signal_handlers``.
+        When the loop DOES end, ``stop_reason`` says which signal ended it, so a caller can report
+        the stop rather than exit in silence.
         """
         self.bind()
         assert self._httpd is not None  # narrowed by `bind`
@@ -553,12 +573,50 @@ class RunApiServer:
         finally:
             for signal_number, handler in previous.items():
                 signal.signal(signal_number, handler)
+            # ONE decision, taken under the lock. Reading `stop_reason` first and then calling the
+            # setter would be an unlocked read that a signal could invalidate between the two — the
+            # setter's own first-write-wins check would still produce the right value, but the
+            # arrangement would advertise a guarantee only the inner check actually makes.
+            self._record_default_stop_reason()
+
+    def _record_default_stop_reason(self) -> None:
+        """Name the stop when no signal did, in the SAME critical section as the check.
+
+        A signal handler sets the reason for its own cause, so this only runs when none did:
+        ``stop()`` from another thread (or an embedder) sets ``stopping`` without a signal, and
+        ``serve_forever`` returning on its own means ``shutdown()`` was called. Determined and
+        written atomically, so "first cause wins" is the property of the code, not of the timing.
+        """
+        with self._stop_reason_lock:
+            if self.stop_reason is not None:
+                return
+            self.stop_reason = "stop" if self.api.stopping.is_set() else "shutdown"
 
     def _install_signal_handlers(self, httpd: ThreadingRunApiServer) -> dict[int, Any]:
-        """SIGINT/SIGTERM -> drain the streams, then stop the server. Returns the old handlers."""
+        """SIGINT/SIGTERM stop the server; SIGHUP does NOT. Returns the previous handlers.
+
+        THE THREE SIGNALS MEAN DIFFERENT THINGS TO A LONG-LIVED SERVER, and conflating them is a
+        product defect, not a detail:
+
+        * ``SIGINT``/``SIGTERM`` are a request to STOP — the person pressed Ctrl-C, or a supervisor is
+          bringing the stack down. Drain the streams, then stop.
+        * ``SIGHUP`` is a HANGUP: the controlling terminal went away. For a foreground server an
+          operator started in a terminal, that is "the window closed", and the generous reading is
+          for the server to carry on serving the IDE that is still talking to it. An IGNORED
+          disposition also survives the double-fork and ``nohup``-style starts a person reaches for
+          when they want it out of their terminal — which is exactly how this surface is meant to be
+          run. Linux's default (terminate) and macOS's default (terminate) both turn a closed harness
+          or a finished shell into a silent, traceless exit; this is the fix for that.
+
+        ``SIG_IGN`` rather than a no-op Python handler, deliberately: a handler would keep the
+        process interruptible by a hangup the operator did not ask for, while ``SIG_IGN`` is
+        INHERITED by any child and is the disposition `nohup` itself installs — one statement, and
+        the behaviour matches what a person running `nohup codna serve` already gets.
+        """
         previous: dict[int, Any] = {}
 
         def handle(signal_number: int, _frame: Any) -> None:
+            self._record_stop_reason(signal.Signals(signal_number).name)
             self.api.stopping.set()
             threading.Thread(
                 target=httpd.shutdown, name="codna-run-api-shutdown", daemon=True
@@ -570,6 +628,13 @@ class RunApiServer:
                 signal.signal(signal_number, handle)
             except (ValueError, OSError):  # pragma: no cover - a non-main thread, or Windows
                 previous.pop(signal_number, None)
+        # SIGHUP is POSIX-only and means nothing on Windows, where installing it raises.
+        if hasattr(signal, "SIGHUP"):
+            try:
+                previous[signal.SIGHUP] = signal.getsignal(signal.SIGHUP)
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            except (ValueError, OSError):  # pragma: no cover - a non-main thread
+                previous.pop(signal.SIGHUP, None)
         return previous
 
     @property
