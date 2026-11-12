@@ -868,8 +868,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw.set_defaults(func=cmd_webhook, action="serve")
 
     pm = sub.add_parser("mcp", help="Run codna as an MCP server, or install it into a client (Cursor / Claude).")
-    pm.add_argument("action", nargs="?", choices=["start", "install"], default="start",
-                    help="start the MCP server (default), or install it into a client config")
+    pm.add_argument("action", nargs="?", choices=["start", "install", "browser"], default="start",
+                    help="start the MCP server (default), install it into a client config, or print the "
+                         "browser tool's status (`browser`)")
     pm.add_argument("--repo", help="default repo for MCP tools that accept one (local path or git URL)")
     pm.add_argument("--client", choices=["cursor", "claude"], help="for `install`: which MCP client to configure")
     pm.add_argument("--project", action="store_true",

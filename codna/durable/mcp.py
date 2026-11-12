@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Final, Mapping
+from typing import Any, Callable, Final, Mapping
 
 __all__ = [
     "MAX_MCP_SERVERS",
@@ -407,12 +407,60 @@ def session_mcp_servers(
 
     Lives here rather than in `activity_support` because both halves are MCP's own rule (what is
     representable, and where a credential comes from); the activity only decides to CALL it.
+
+    **Codna's own browser server is added LAST, when ``CODNA_BROWSER_TOOL=1``.** It is added here rather
+    than in a caller because every durable turn reaches its servers through this function, and a browser
+    that existed on one durable path and not another is the "built but never joined" defect this
+    repository keeps finding. The entry goes through the SAME ``expand_mcp_servers`` as every declared
+    server, so the returned list is one shape rather than a mix; it carries no credentials today, so
+    that expansion resolves nothing, and a run with the switch off is byte-identical to before.
+
+    **Two error families, one per source.** A fault in the RUN's declared servers is a `McpConfigError`
+    (unchanged). A fault in the BUILT-IN browser entry is a `BrowserToolError`, because it is the browser
+    tool's own switch/config that produced it and a caller catching that family must not be handed a
+    foreign type. Without the distinction, expanding the built-in entry was the one path where an
+    operator's browser setting could surface as an MCP-config error.
     """
+    from ..browser_tool import browser_mcp_servers
+
     declared = getattr(context, "mcp_servers", ())
     servers = declared or mcp_servers_from_env(env)
-    if not servers:
+    resolved = expand_mcp_servers(servers, env) if servers else []
+    builtin = _expanded_builtin_browser_servers(browser_mcp_servers, env)
+    if not builtin:
+        return resolved
+    named = {str(server.get("name")) for server in resolved}
+    return [*resolved, *(server for server in builtin if server["name"] not in named)]
+
+
+def _expanded_builtin_browser_servers(
+    browser_mcp_servers: Callable[[Mapping[str, str] | None], tuple[dict[str, Any], ...]],
+    env: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """The built-in browser entry, expanded, with any fault kept in the BROWSER error family.
+
+    EXPANDED rather than appended in its normalized shape: the list this feeds is one shape, and an entry
+    that skipped the expander would be the one place a future ``from_env`` reference could reach a
+    create-session body unsubstituted.
+
+    ``expand_mcp_servers`` raises `McpConfigError`; for THIS entry that type would be wrong, because the
+    reference came from Codna's own browser config rather than from the run's declared servers. The code
+    and details are carried across unchanged, so the message still names the variable — only the family
+    a caller switches on is corrected.
+    """
+    from ..browser_bridge import BrowserToolError
+
+    entries = browser_mcp_servers(env)
+    if not entries:
         return []
-    return expand_mcp_servers(servers, env)
+    try:
+        return expand_mcp_servers(entries, env)
+    except McpConfigError as exc:
+        raise BrowserToolError(
+            f"the built-in browser server could not be resolved: {exc}",
+            code=exc.code,
+            details=dict(exc.details),
+        ) from exc
 
 
 def mcp_session_spec(
