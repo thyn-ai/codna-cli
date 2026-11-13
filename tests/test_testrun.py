@@ -547,3 +547,100 @@ def test_cli_prints_the_environment_gap_with_its_own_code():
     payload = _structured_error(testrun.TestEnvironmentUnavailable("x.", details={"tail": "t"}))
     assert payload["error"]["code"] == "test_environment_unavailable"
     assert payload["error"]["details"] == {"tail": "t"}
+
+
+# -- a plain JS/TS repository: the measured defect ------------------------------------------
+#
+# MEASURED: run `run-20261112T230312Z` failed verification on a repository whose suite was a working
+# `node --test` (it passed manually, 2 tests). The run's error was the bare
+# `activity_verify_undetectable`, and the only way through was to hand-write `codna.yaml`.
+
+
+def test_detect_node_test_names_the_repositorys_own_test_files(tmp_path):
+    """`node --test <files>` — a runtime builtin, so it needs no install and no network."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "calc.test.js").write_text("// test\n", encoding="utf-8")
+    (tmp_path / "app.js").write_text("// app\n", encoding="utf-8")
+
+    command, source = testrun.detect_test_command(str(tmp_path))
+
+    assert command == "node --test tests/calc.test.js"
+    assert source == "test files"
+
+
+def test_detect_node_test_covers_the_spec_suffixes_and_ts(tmp_path):
+    """A `.ts` test file is still named: an unloadable file is an honest verify FAILURE, not a skip."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "sum.spec.ts").write_text("// t\n", encoding="utf-8")
+    (tmp_path / "src" / "sum.test.mjs").write_text("// t\n", encoding="utf-8")
+
+    command, _ = testrun.detect_test_command(str(tmp_path))
+
+    assert command == "node --test src/sum.spec.ts src/sum.test.mjs"
+
+
+def test_detect_node_test_skips_dependency_and_build_directories(tmp_path):
+    """A test file inside `node_modules` is a DEPENDENCY's test, not this repository's."""
+    (tmp_path / "node_modules" / "left-pad").mkdir(parents=True)
+    (tmp_path / "node_modules" / "left-pad" / "x.test.js").write_text("// dep\n", encoding="utf-8")
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "y.test.js").write_text("// built\n", encoding="utf-8")
+
+    assert testrun.detect_test_command(str(tmp_path)) is None
+
+
+def test_detect_node_test_never_runs_a_package_json_script(tmp_path):
+    """`npm test` is repository-supplied shell needing an install: reported, never DETECTED."""
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"test": "jest --ci"}}\n', encoding="utf-8"
+    )
+    (tmp_path / "no-tests-here.txt").write_text("", encoding="utf-8")
+
+    assert testrun.detect_test_command(str(tmp_path)) is None
+    # …but a surface is told what the repository declares, so it can OFFER it for a person to confirm.
+    hints = testrun.verification_hints(str(tmp_path))
+    assert hints["suggested"] == ["jest --ci"]
+    assert hints["hints"]["package_json_test_script"] == "jest --ci"
+
+
+def test_pixi_beats_node_test_so_a_repo_with_both_keeps_its_declared_runner(tmp_path):
+    """Precedence is unchanged: a runner the repository's own tooling DECLARES wins over a convention."""
+    (tmp_path / "pixi.toml").write_text('[tasks]\ntest = "bash scripts/test_all.sh"\n', encoding="utf-8")
+    (tmp_path / "a.test.js").write_text("// t\n", encoding="utf-8")
+
+    assert testrun.detect_test_command(str(tmp_path)) == ("pixi run test", "pixi.toml")
+
+
+def test_verification_hints_lists_the_checks_that_were_actually_performed(tmp_path):
+    """The surface says WHAT was looked for, so `undetectable` is never an unexplained verdict."""
+    hints = testrun.verification_hints(str(tmp_path))
+
+    assert hints["detected"] is None
+    assert hints["suggested"] == []
+    # Every entry names one of the signals `detect_test_command` really consults.
+    assert any("pixi" in entry for entry in hints["checked"])
+    assert any("uv.lock" in entry for entry in hints["checked"])
+    assert any("node --test" in entry for entry in hints["checked"])
+    assert any("fix.test_command" in entry for entry in hints["checked"])
+
+
+def test_verification_hints_offers_both_candidates_when_a_repo_has_both(tmp_path):
+    """A person gets every plausible command, so the override is a confirmation rather than research."""
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "bun test"}}\n', encoding="utf-8")
+    (tmp_path / "a.test.js").write_text("// t\n", encoding="utf-8")
+
+    hints = testrun.verification_hints(str(tmp_path))
+
+    assert hints["suggested"] == ["node --test a.test.js", "bun test"]
+    assert hints["detected"] == ("node --test a.test.js", "test files")
+
+
+def test_an_unreadable_package_json_is_not_a_detection_failure(tmp_path):
+    """Detection is a hint; a manifest it cannot parse must not fail a run that would verify."""
+    (tmp_path / "package.json").write_text("{not json", encoding="utf-8")
+    (tmp_path / "a.test.js").write_text("// t\n", encoding="utf-8")
+
+    assert testrun.verification_hints(str(tmp_path))["detected"] == (
+        "node --test a.test.js",
+        "test files",
+    )

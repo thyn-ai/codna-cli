@@ -26,6 +26,7 @@ from temporalio import workflow
 from .contracts import (
     ACTIVITY_HEARTBEAT_TIMEOUT_S,
     NAME_CHECKPOINT,
+    NAME_DELEGATION_POLICY,
     NAME_EPISODE,
     NAME_NOTIFY,
     NAME_OPEN_PR,
@@ -118,9 +119,11 @@ def result_type(name: str) -> type:
         NotifyOutcome,
         PullRequestOutcome,
     )
-    from .contracts import WorktreeCleanupOutcome
+    from .contracts import DelegationPolicyOutcome, WorktreeCleanupOutcome
     from .goal_contracts import RecallOutcome, WatchCiOutcome
 
+    if name == NAME_DELEGATION_POLICY:
+        return DelegationPolicyOutcome
     if name == NAME_CHECKPOINT:
         return CheckpointOutcome
     if name == NAME_OPEN_PR:

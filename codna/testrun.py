@@ -230,19 +230,95 @@ def _pixi_tasks(repo_dir: str) -> tuple[dict, str] | None:
     return None
 
 
+def _package_json_scripts(repo_dir: str) -> dict:
+    """The ``scripts`` block of the repository's own ``package.json``, or ``{}``.
+
+    Bounded and total: a missing file, invalid JSON or a non-object ``scripts`` is ``{}`` rather than
+    an exception. Detection is a HINT (``resolve_test_command`` reports an explicit command as
+    trusted and a detected one as a guess), so a package.json it cannot read must not be able to fail
+    a run that would otherwise verify.
+    """
+    import json
+
+    path = os.path.join(repo_dir, "package.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    return scripts if isinstance(scripts, dict) else {}
+
+
+def _node_test_files(repo_dir: str, *, limit: int = 200) -> list[str]:
+    """Repository-relative ``*.test.js``/``*.test.ts``-style files, sorted and bounded.
+
+    The signal ``node --test`` needs: the runner takes explicit paths, and a bare ``node --test``
+    discovers by convention (``test/``, ``*.test.js``). Naming the files explicitly is what makes the
+    detected command run the suite the repository actually has rather than whatever the runtime's
+    default glob happens to find.
+
+    Skips the directories a repository never means as sources, and stops at ``limit`` so a huge tree
+    cannot turn detection into a full walk.
+    """
+    skip = {
+        "node_modules", ".git", ".hg", ".svn", "dist", "build", "target", "vendor",
+        ".venv", "venv", "__pycache__", ".next", "coverage",
+    }
+    suffixes = (
+        ".test.js", ".test.mjs", ".test.cjs", ".test.ts", ".test.mts", ".test.cts",
+        ".spec.js", ".spec.mjs", ".spec.cjs", ".spec.ts", ".spec.mts", ".spec.cts",
+    )
+    found: list[str] = []
+    for root, dirs, files in os.walk(repo_dir):
+        dirs[:] = sorted(name for name in dirs if name not in skip and not name.startswith("."))
+        for name in sorted(files):
+            if name.endswith(suffixes):
+                relative = os.path.relpath(os.path.join(root, name), repo_dir)
+                found.append(relative.replace(os.sep, "/"))
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+def _detect_node_test(repo_dir: str) -> tuple[str, str] | None:
+    """``node --test`` for a plain JS/TS repo that names its tests by FILE, or ``None``.
+
+    WHY THIS IS SAFE WITHOUT A PACKAGE MANIFEST OR ``node_modules``. ``node --test <paths>`` is a
+    runtime builtin: it needs no install, no lockfile and no network, so the network-denied verification
+    sandbox can run it. That is the property `package.json` scripts (``npm test``) do NOT have — they
+    need a dependency install first, which is exactly what the sandbox forbids.
+
+    A TypeScript test file is deliberately still ``node --test``: naming a ``.ts`` file the runtime
+    cannot load is a FAILURE AT VERIFY that says so in its log, which is honest; silently skipping the
+    repository's tests would not be. ``package.json``'s own ``test`` script is never run here because a
+    script is an arbitrary shell command the repository supplies — ``resolve_test_command`` honours it
+    only when a PERSON wrote it (``fix.test_command``), which is the trust boundary this module keeps.
+    """
+    files = _node_test_files(repo_dir)
+    if not files:
+        return None
+    return "node --test " + " ".join(files), "test files"
+
+
 def detect_test_command(repo_dir: str) -> tuple[str, str] | None:
     """``(command, source_file)`` when the repository's own tooling declares how its tests run.
 
     Only signals that name BOTH the runner and the test entrypoint count -- a guess that runs the
-    wrong thing is worse than the pytest default:
+    wrong thing is worse than a bad default:
 
     * pixi: a ``test`` task in ``pixi.toml`` (or ``[tool.pixi.tasks]``) -> ``pixi run test``. The
       task carries the env the suite needs (toolchain, PYTHONPATH, oracles) that bare pytest lacks.
     * uv: a ``uv.lock`` that locks pytest, next to pytest config -> ``uv run pytest``.
+    * node: ``*.test.js``/``*.spec.ts``-style files -> ``node --test <those files>``. See
+      :func:`_detect_node_test` for why a runtime builtin is detectable while ``npm test`` is not.
 
-    JavaScript runners (``pnpm test`` and friends) are deliberately not detected: they never produce
-    the JUnit report that separates "tests failed" from "node_modules missing", and the install step
-    they need is exactly what the network-denied sandbox forbids.
+    ``package.json``'s ``test`` script (``npm test``, ``bun test``, ``jest`` …) is NOT detected as a
+    command: it is an arbitrary script requiring an install the network-denied sandbox forbids, and
+    running it from a hint would be trusting repository-supplied shell. It IS read for one purpose —
+    :func:`verification_hints` reports it so a surface can OFFER it as an override a person confirms.
     """
     pixi = _pixi_tasks(repo_dir)
     if pixi is not None and "test" in pixi[0]:
@@ -256,7 +332,52 @@ def detect_test_command(repo_dir: str) -> tuple[str, str] | None:
             locked = ""
         if re.search(r'^name = "pytest"$', locked, re.M):
             return "uv run pytest", "uv.lock"
+    node = _detect_node_test(repo_dir)
+    if node is not None:
+        return node
     return None
+
+
+def verification_hints(repo_dir: str) -> dict:
+    """What verification saw, in the shape a SURFACE can show when detection finds nothing.
+
+    The measured failure this answers: a run whose repository had a working ``node --test`` suite
+    failed with ``activity_verify_undetectable`` and a bare sentence, so the only way forward was for
+    someone to hand-write ``codna.yaml``. Nothing in the product said WHAT had been looked for.
+
+    ``checked`` is the closed list of signals :func:`detect_test_command` actually consults, so a
+    surface can print it rather than inventing an explanation; it is derived from the same constants
+    the detection uses so the two cannot drift. ``suggested`` are commands a person may CONFIRM as
+    the override — never applied automatically, because each is repository-supplied or needs an
+    install the sandbox forbids, which is precisely why it is not detected.
+    """
+    scripts = _package_json_scripts(repo_dir)
+    node_files = _node_test_files(repo_dir)
+    checked = [
+        "pixi.toml or pyproject.toml [tool.pixi.tasks] with a `test` task",
+        "uv.lock locking pytest, next to pytest config (pytest.ini, tests/, setup.cfg)",
+        "a *.test.js / *.spec.ts test file (for `node --test`)",
+        "codna.yaml `fix.test_command`",
+    ]
+    suggested: list[str] = []
+    if node_files:
+        suggested.append("node --test " + " ".join(node_files[:20]))
+    script = scripts.get("test")
+    if isinstance(script, str) and script.strip():
+        # A person confirms this; it is reported VERBATIM so nobody has to guess what the repository
+        # declares. Running it needs the repository's own installed dependencies.
+        suggested.append(script.strip())
+    return {
+        "detected": detect_test_command(repo_dir),
+        "checked": checked,
+        "suggested": suggested,
+        "hints": {
+            "package_json_test_script": script.strip()
+            if isinstance(script, str) and script.strip()
+            else None,
+            "node_test_files": node_files[:20],
+        },
+    }
 
 
 def resolve_test_command(repo_dir: str, test_cmd: str | None = None) -> tuple[str, str, bool] | None:

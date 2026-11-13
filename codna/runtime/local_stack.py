@@ -11,14 +11,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import child_env
 from .config import (
     ENGINE_READY_TIMEOUT_S,
-    ENGINE_URL_KEYS,
     HEALTH_TIMEOUT_S,
     LOCK_TIMEOUT_S,
     LOG_ROTATE_BYTES,
     LOG_ROTATE_FILES,
-    LOCAL_DATABASE_ENV_KEYS,
     READY_TIMEOUT_S,
     RUNTIME_OWNER,
     SCHEMA_VERSION,
@@ -30,6 +29,7 @@ from .config import (
     RuntimeConfigError,
     local_engine_defaults,
     load_env_file,
+    require_engine_dir,
     resolve_runtime_config,
 )
 from .health import (
@@ -103,58 +103,11 @@ def _runtime_env(config: RuntimeConfig, runtime_id: str) -> dict[str, str]:
     }
 
 
-CHILD_ENV_KEY_ALLOWLIST = frozenset(
-    {
-        "ANTHROPIC_API_KEY",
-        "CODNA_API_KEY",
-        "CURSOR_API_KEY",
-        "DE_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "GROQ_API_KEY",
-        "MISTRAL_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "TELYS_KERNEL",
-        "XAI_API_KEY",
-    }
-)
-PROVIDER_CHILD_ENV_KEYS = frozenset(
-    key for key in CHILD_ENV_KEY_ALLOWLIST if key.endswith("_API_KEY")
-)
-
-
-def _child_env_from_keys(
-    keys: Mapping[str, ConfigValue] | None,
-) -> dict[str, str]:
-    if not keys:
-        return {}
-    blocked = set(ENGINE_URL_KEYS)
-    output: dict[str, str] = {}
-    for key, config_value in keys.items():
-        if key in blocked or key not in CHILD_ENV_KEY_ALLOWLIST:
-            continue
-        value = config_value.value.strip()
-        if value:
-            output[key] = value
-    return output
-
-
-def _merged_child_env_from_keys(
-    keys: Mapping[str, ConfigValue] | None,
-) -> dict[str, str]:
-    env = dict(os.environ)
-    for key, value in _child_env_from_keys(keys).items():
-        if key in PROVIDER_CHILD_ENV_KEYS and os.environ.get(key):
-            continue
-        env[key] = value
-    return env
-
-
-def _remove_local_database_env(env: dict[str, str]) -> dict[str, str]:
-    for key in LOCAL_DATABASE_ENV_KEYS:
-        env.pop(key, None)
-    return env
+CHILD_ENV_KEY_ALLOWLIST = child_env.CHILD_ENV_KEY_ALLOWLIST
+PROVIDER_CHILD_ENV_KEYS = child_env.PROVIDER_CHILD_ENV_KEYS
+_child_env_from_keys = child_env.child_env_from_keys
+_merged_child_env_from_keys = child_env.merged_child_env_from_keys
+_remove_local_database_env = child_env.remove_local_database_env
 
 
 def _algenta_local_paths(config: RuntimeConfig) -> dict[str, Path]:
@@ -186,19 +139,29 @@ def _apply_owned_sidecar_runtime_env(env: dict[str, str], config: RuntimeConfig)
     env["BUN_INSTALL_CACHE_DIR"] = str(paths["bun_cache_dir"])
 
 
+def _require_engine_dir_for_runtime(config: RuntimeConfig, consumer: str) -> Path:
+    """``require_engine_dir`` in this module's error shape, so callers need no second exception type."""
+    try:
+        return require_engine_dir(config, consumer=consumer)
+    except RuntimeConfigError as exc:
+        raise LocalRuntimeError(exc.code, str(exc), exc.details) from exc
+
+
 def _engine_spawn(
     config: RuntimeConfig,
     runtime_id: str,
     *,
     keys: Mapping[str, ConfigValue] | None = None,
 ) -> tuple[list[str], Path, dict[str, str]]:
-    engine_entrypoint = config.engine_dir / "apps" / "api_server" / "main.py"
+    # The one path that cannot run without a checkout: it executes `apps.api_server.main:app` out of it.
+    engine_dir = _require_engine_dir_for_runtime(config, "the local FastAPI engine runtime")
+    engine_entrypoint = engine_dir / "apps" / "api_server" / "main.py"
     if not engine_entrypoint.is_file():
         raise LocalRuntimeError(
             "local_engine_runtime_not_installed",
             "Codna local engine runtime is not installed.",
             {
-                "engine_dir": str(config.engine_dir),
+                "engine_dir": str(engine_dir),
                 "expected_entrypoint": str(engine_entrypoint),
                 "hint": "Set ALGENTA_ENGINE_DIR to a checkout containing apps/api_server/main.py, "
                 "or use the in-process local SDK path for repository intelligence.",
@@ -234,7 +197,7 @@ def _engine_spawn(
         "--port",
         str(config.engine_port),
     ]
-    return command, config.engine_dir, env
+    return command, engine_dir, env
 
 
 def _sidecar_spawn(
@@ -792,6 +755,8 @@ def _start_runtime(
     keys: Mapping[str, ConfigValue] | None = None,
 ) -> RuntimeEndpoint:
     algenta_paths = _algenta_local_paths(config)
+    # Before ANY spawn: a missing checkout can never become healthy, so refusing late would leave a sidecar.
+    _require_engine_dir_for_runtime(config, "the local FastAPI engine runtime")
     ensure_directories(config.paths.runtime_dir, config.paths.logs_dir, config.cline_data_dir)
     ensure_directories(*algenta_paths.values())
     _migrate_legacy_dynamic_state(config)
@@ -883,6 +848,8 @@ def ensure_running(
             port_base=None,
             runtime_id=None,
         )
+    # `ensure_running` starts the FastAPI engine, so a checkout is required; `_start_runtime` refuses with the
+    # coded `engine_dir_unset` (naming ALGENTA_ENGINE_DIR) before the lock is ever taken.
     try:
         with runtime_lock(config.paths.lock_path, timeout_s=LOCK_TIMEOUT_S):
             inspection = inspect_runtime(keys=keys)

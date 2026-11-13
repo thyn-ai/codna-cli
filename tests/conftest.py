@@ -3,6 +3,7 @@
 `codna.sarif` / `codna.findings` are pure-stdlib, so importing the package does not pull
 in the engine client — the offline SARIF suite runs without installing the full CLI.
 """
+import contextlib
 import pathlib
 import sys
 
@@ -28,6 +29,48 @@ def pytest_ignore_collect(collection_path, config):  # noqa: ARG001 - pytest hoo
     except ValueError:
         return False
     return True
+
+
+@contextlib.contextmanager
+def unlistable_directory(path):
+    """``path`` made unlistable, or a SKIP when this machine cannot make it so.
+
+    WHY THIS IS A HELPER AND A SKIP RATHER THAN A BARE ``chmod(0o000)`` IN EACH TEST. Two tests need a real
+    unreadable directory: the skill-discovery warning and the bridge that carries it to the host. A bare
+    ``chmod`` is a silent assumption with two failure modes, and BOTH make a test dishonest:
+
+      * running as **root** ignores the mode entirely (``CAP_DAC_OVERRIDE``), so nothing raises and an assertion
+        on the warning fails for a reason that has nothing to do with the code;
+      * a filesystem that does not carry POSIX mode bits would do the same.
+
+    So the mode is APPLIED and then PROVEN by attempting the very operation the code under test performs
+    (``os.listdir``). When it does not raise, there is nothing to test and the callers skip with the reason
+    instead of asserting on a precondition that never held. The yielded path is always restored, so a failing
+    assertion cannot leave an unlistable directory behind.
+    """
+    import errno
+    import os
+
+    original = os.stat(path).st_mode
+    os.chmod(path, 0o000)
+    try:
+        try:
+            os.listdir(path)
+        except OSError as denied:
+            if denied.errno not in (errno.EACCES, errno.EPERM):
+                raise
+            yield path
+        else:
+            reason = (
+                "running as root" if hasattr(os, "geteuid") and os.geteuid() == 0
+                else "the filesystem does not enforce POSIX mode bits"
+            )
+            pytest.skip(
+                f"cannot make a directory unlistable ({reason}); a chmod-based unreadable-directory test "
+                "would assert on a precondition this environment does not provide"
+            )
+    finally:
+        os.chmod(path, original)
 
 
 @pytest.fixture(autouse=True)

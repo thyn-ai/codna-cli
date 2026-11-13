@@ -15,7 +15,7 @@ from types import ModuleType
 from typing import Any
 
 from .python_import_paths import compatible_engine_site_packages
-from .runtime.config import RuntimeConfig
+from .runtime.config import RuntimeConfig, require_engine_dir
 
 LOCAL_MOJO_WARMUP_PAYLOAD = {
     "engine_type": "monte_carlo",
@@ -191,11 +191,14 @@ def install_local_privacy_stub() -> None:
 
 
 def ensure_decision_engine_imports(config: RuntimeConfig) -> None:
-    engine_dir = config.engine_dir.expanduser().resolve()
-    insert_import_path(engine_dir)
-    insert_import_path(engine_dir / "packages" / "algenta-core")
-    insert_import_path(engine_dir / "packages" / "python-sdk")
-    for site_packages in compatible_engine_site_packages(engine_dir):
+    # The Mojo pool imports `apps.api_server.compute.mojo_pool` out of the checkout, so this path genuinely
+    # needs one. Refuse with the coded error naming ALGENTA_ENGINE_DIR rather than resolving a guessed path.
+    engine_dir = require_engine_dir(config, consumer="the local Mojo worker pool")
+    resolved = engine_dir.expanduser().resolve()
+    insert_import_path(resolved)
+    insert_import_path(resolved / "packages" / "algenta-core")
+    insert_import_path(resolved / "packages" / "python-sdk")
+    for site_packages in compatible_engine_site_packages(resolved):
         insert_import_path(site_packages)
     install_local_privacy_stub()
 
@@ -528,8 +531,13 @@ def missing_local_mojo_backend(exc: BaseException) -> bool:
 
 
 def local_mojo_backend_available(config: RuntimeConfig) -> bool:
-    engine_dir = config.engine_dir.expanduser()
-    if not (engine_dir / "apps" / "api_server" / "compute" / "mojo_pool.py").is_file():
+    # No checkout ⇒ no Mojo backend. This is a CAPABILITY probe, not a refusal site: the daemon treats
+    # "unavailable" as "do not start it" and only escalates when CODNA_REQUIRE_LOCAL_MOJO_POOL=1, which is
+    # what keeps the governance hook failing open.
+    engine_dir = config.engine_dir
+    if engine_dir is None:
+        return False
+    if not (engine_dir.expanduser() / "apps" / "api_server" / "compute" / "mojo_pool.py").is_file():
         return False
     try:
         current_mojo_pool_module(config)
@@ -594,7 +602,9 @@ def local_mojo_pool_unavailable_error(
     *,
     reason: str | None = None,
 ) -> LocalMojoPoolError:
-    details: dict[str, Any] = {"engine_dir": str(config.engine_dir)}
+    details: dict[str, Any] = {
+        "engine_dir": str(config.engine_dir) if config.engine_dir is not None else None
+    }
     if reason:
         details["reason"] = reason
     return LocalMojoPoolError("local_mojo_pool_unavailable", message, details)

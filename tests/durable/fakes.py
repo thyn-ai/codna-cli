@@ -123,6 +123,12 @@ class FakeSidecar:
     # `execution.ts`. When set, every terminal event carries it — so a test can assert the durable side
     # REPORTS the reason rather than only naming the terminal that ended the turn.
     abort_on_terminal: dict[str, Any] | None = None
+    #: Scripted mid-turn events, emitted after the progress events and before the terminal, as
+    #: ``(event_type, payload)`` pairs. This is how a test replays a MEASURED event shape (a tool
+    #: call that failed, and the same one repeated) through the real activity body: the durable side's
+    #: handling of a turn's own stream is what is under test, so the stream has to be drivable
+    #: without a paid engine. Empty for every ordinary test, which keeps them byte-identical.
+    scripted_events: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
     turns: list[FakeTurn] = field(default_factory=list)
     # D7/OVERLAP: one `(task_id, started_at, finished_at)` entry per turn, on the contract CLOCK.
@@ -407,11 +413,18 @@ class FakeSidecar:
                 # cancellation check reachable: it sees the next event was never delivered.
                 if self.cancel_probe is not None and self.cancel_probe():
                     return
+        # The SCRIPTED events, in order, continuing the session's index. Placed before the terminal
+        # because that is where they sit on the real wire: a tool call resolves mid-turn, the
+        # terminal is appended last.
+        next_index = start + 3
+        for offset, (event_type, payload) in enumerate(self.scripted_events, start=1):
+            next_index = start + 3 + offset
+            yield self._event(turn, next_index, event_type, dict(payload))
         # A duplicated TERMINAL is impossible on the real wire; a test that wants a repeat should not
         # get it by accident.
         yield self._event(
             turn,
-            start + 4,
+            next_index + 1,
             self.terminal,
             {
                 "usage": self.cumulative_usage(),

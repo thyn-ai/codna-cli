@@ -118,6 +118,7 @@ from .contracts import (
     ACTIVITY_VERIFY_TIMEOUT_S,
     HEARTBEAT_INTERVAL_S,
     NAME_CHECKPOINT,
+    NAME_DELEGATION_POLICY,
     NAME_EPISODE,
     NAME_NOTIFY,
     NAME_OPEN_PR,
@@ -228,6 +229,10 @@ STEP_TIMEOUT_S: Final[dict[str, int]] = {
     # every recorded cassette) is unchanged.
     NAME_RECALL: ACTIVITY_TIMEOUT_S,
     NAME_WATCH_CI: ACTIVITY_TIMEOUT_S,
+    # One policy read: `policy_verdict` parses a small committed YAML file. The ordinary ceiling is
+    # generous; it is NOT a graph node, so the node sequence (and every recorded cassette) is
+    # unchanged.
+    NAME_DELEGATION_POLICY: ACTIVITY_TIMEOUT_S,
 }
 
 def _plugin_activity_options() -> dict[str, Any]:

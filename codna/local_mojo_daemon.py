@@ -127,9 +127,12 @@ def should_use_local_mojo_backend(config: RuntimeConfig) -> bool:
             "local_mojo_backend_unavailable",
             "Codna local Mojo backend is required but the packaged install does not include the import-backed apps API.",
             {
-                "engine_dir": str(config.engine_dir),
+                "engine_dir": str(config.engine_dir) if config.engine_dir is not None else None,
                 "required_env": "CODNA_REQUIRE_LOCAL_MOJO_POOL",
                 "expected_import": "apps.api_server.compute.mojo_pool",
+                # The operator asked for a hard requirement, so name the OTHER variable too: with no checkout
+                # there is nothing to import from, and `CODNA_REQUIRE_LOCAL_MOJO_POOL` alone cannot fix it.
+                "required_checkout_env": "ALGENTA_ENGINE_DIR",
             },
         )
     return False

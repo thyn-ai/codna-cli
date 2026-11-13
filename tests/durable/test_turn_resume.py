@@ -431,6 +431,83 @@ def test_the_resume_floor_is_scoped_to_the_recorded_session(tmp_path: Path):
     assert recorded.high_water == 3, recorded
 
 
+def test_the_loop_verdict_is_reported_from_the_single_scan(tmp_path: Path):
+    """The verdict the retry reports is the one `_scan_ledger` carried out of its own pass.
+
+    Asserts the CONTRACT directly, so a future refactor that reintroduces a second scan cannot
+    silently drop the verdict: the fields a caller branches on survive the fold into one traversal.
+    """
+    from codna.durable.activity_support import _scan_ledger
+    from codna.durable.turn_guard import TOOL_LOOP_EVENT
+
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    ledger = harness.ledger()
+
+    ledger.append(
+        "turn.started",
+        task_id="task-1",
+        payload={"turn_id": "turn-a", "turn_key": "run-1:task-1:1", "session_id": "session-a"},
+    )
+    ledger.append_events(
+        [{"event_index": 3, "event_type": "agent.text", "payload": {}}],
+        task_id="task-1",
+        session_id="session-a",
+    )
+    # Another turn's verdict must not be adopted: only this turn's is reported.
+    ledger.append(
+        "note",
+        task_id="task-1",
+        payload={"event": TOOL_LOOP_EVENT, "turn_id": "turn-other", "tool": "other", "count": 9},
+    )
+    ledger.append(
+        "note",
+        task_id="task-1",
+        payload={
+            "event": TOOL_LOOP_EVENT,
+            "turn_id": "turn-a",
+            "tool": "editor",
+            "error": "old_text required",
+            "count": 7,
+        },
+    )
+
+    recorded, completion = _scan_ledger(ledger, "run-1:task-1:1")
+    assert recorded is not None and completion is None
+    assert recorded.loop_failure is not None, "the verdict must survive the single pass"
+    assert recorded.loop_failure["tool"] == "editor", recorded.loop_failure
+    assert recorded.loop_failure["count"] == 7, recorded.loop_failure
+
+
+def test_a_turn_with_no_verdict_reports_none(tmp_path: Path):
+    """The common case: a recorded turn that was never judged is not given a fabricated verdict."""
+    from codna.durable.activity_support import _scan_ledger
+    from codna.durable.turn_guard import TOOL_LOOP_EVENT
+
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = repo / "runs"
+    runs_root.mkdir(exist_ok=True)
+    harness = fakes.build_harness(repo, runs_root)
+    ledger = harness.ledger()
+
+    ledger.append(
+        "turn.started",
+        task_id="task-1",
+        payload={"turn_id": "turn-a", "turn_key": "run-1:task-1:1", "session_id": "session-a"},
+    )
+    ledger.append(
+        "note",
+        task_id="task-1",
+        payload={"event": TOOL_LOOP_EVENT, "turn_id": "turn-other", "tool": "editor", "count": 7},
+    )
+
+    recorded, _ = _scan_ledger(ledger, "run-1:task-1:1")
+    assert recorded is not None
+    assert recorded.loop_failure is None, recorded.loop_failure
+
+
 def test_the_detector_still_fires_for_a_genuinely_rescoped_key() -> None:
     """The healthy retry is exempt; a different session with a new turn id is NOT.
 

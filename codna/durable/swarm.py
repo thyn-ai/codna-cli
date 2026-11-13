@@ -33,10 +33,12 @@ from typing import Any, Final
 
 __all__ = [
     "PROFILE_SWARM_PERMISSIONS",
+    "PROMPT_NAMED_TEAM_TOOLS",
     "SWARM_FIELDS",
     "SwarmAttachment",
     "SwarmConfigError",
     "normalize_swarm",
+    "policy_stripped_team_tools",
     "swarm_attachment_state",
     "swarm_session_spec",
 ]
@@ -231,6 +233,61 @@ def swarm_attachment_state(context: Any = None) -> SwarmAttachment:
         spawn=raw_spawn,
         teams=raw_teams,
     )
+
+
+#: The team tools the delegation PROMPT names (see `algenta/adapter.ts`: `TEAM_MAILBOX_TOOLS` +
+#: `TEAM_CRITIQUE_TOOLS`). A policy that does not name them cannot run a swarm, so the run reports it
+#: instead of the operator discovering it from an `unavailable tool` failure mid-turn.
+PROMPT_NAMED_TEAM_TOOLS: Final[tuple[str, ...]] = (
+    "team_send_message",
+    "team_broadcast",
+    "team_status",
+    "team_await_runs",
+    "team_mission_log",
+    "team_review_outcome_fragment",
+    "team_run_task",
+)
+
+
+def policy_stripped_team_tools(repo_dir: Any, *, enable_agent_teams: bool) -> tuple[str, ...]:
+    """The prompt-named team tools this repository's POLICY removes from the toolset.
+
+    Returns an empty tuple when delegation is not requested, when the repository has no policy (the
+    approval profile then decides alone — and every profile the durable path can resolve grants all
+    of them), when the policy names all seven, or when the document yields no permissions at all (a
+    policy that cannot be evaluated, or permits no tool, is a REFUSAL at create; reporting it as
+    "delegation stripped" would describe a run that never starts).
+
+    ``repo_dir`` is the run's repository, which is the file the operator wrote and the one the spec
+    was validated against. A task working in its own worktree is governed by that branch's copy — this
+    reads the run's, and the note names the path it read so the two cannot be confused.
+
+    WHY THIS EXISTS. `enable_agent_teams` is a GATE, not a GRANT, and the grant is narrowed TWICE: by
+    the approval profile's `allowedTools` and, again, by `.codna/policy.yaml` at session create
+    (`run-server.ts` → `applyPolicyToToolPolicies` → `narrowToolPolicies`). A policy written for a
+    single-agent run — `tools.allow: [read_files, editor, run_commands]` is the obvious one — leaves
+    the profile intact and still sets `enabled: false` on every `team_*` name, which the engine's
+    `filterAvailableTools` then drops. Measured on `run-20261112T223954Z`: the ledger's own note said
+    `delegation is attached — enable_spawn_agent, enable_agent_teams`, the session snapshot said
+    `enableTeams: true`, and the model's `team_run_task` call died with
+    `unavailable tool 'team_run_task'` across 898 records and ZERO subagent sessions.
+
+    A POLICY CANNOT GRANT (only the profile + the tool list do), so this reports rather than repairs:
+    a run whose policy excludes the tools cannot delegate, and the operator needs to know that the
+    fix is in their policy file rather than in the delegation flags they already set correctly.
+    """
+    if not enable_agent_teams:
+        return ()
+    # Imported HERE, not at module scope: `policy_document` pulls in the YAML reader and the findings
+    # digest, and a spec-validation-only caller of this module should not pay for either.
+    from ..policy_document import policy_path_for, policy_verdict
+
+    path = policy_path_for(repo_dir)
+    verdict = policy_verdict(path, required=False)
+    if verdict.mode == "absent" or not verdict.permissions:
+        return ()
+    permitted = set(verdict.permissions.effective_tools())
+    return tuple(name for name in PROMPT_NAMED_TEAM_TOOLS if name not in permitted)
 
 
 # -- the CLI surface -----------------------------------------------------------------------
