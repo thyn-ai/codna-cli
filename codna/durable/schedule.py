@@ -330,17 +330,31 @@ async def describe_schedule(client: Any, schedule_id: str) -> dict[str, Any]:
     described = await handle.describe()
     schedule = described.schedule
     spec = schedule.spec
+    # `paused` LIVES ON THE SCHEDULE, NOT ON ITS DESCRIPTION. `ScheduleDescription` in temporalio 1.35 is
+    # `(id, schedule, info, typed_search_attributes, search_attributes, data_converter, raw_description)` —
+    # there is no `state`, and `Schedule` is `(action, spec, policy, state)`. Reading `described.state.paused`
+    # raised `AttributeError: 'ScheduleDescription' object has no attribute 'state'` on the FIRST schedule
+    # ever listed, so `codna run schedule --list` crashed with a traceback instead of a schedule list and the
+    # IDE's Skills & Automations panel rendered "could not list schedules". It was invisible until a schedule
+    # existed, because an EMPTY namespace never reaches this line. `getattr` on the nested `state` keeps a
+    # server that omits it from turning a listing into a crash: an absent state is not a paused schedule.
+    state = getattr(schedule, "state", None)
     return {
         "schedule_id": schedule_id,
-        "paused": bool(getattr(described, "schedule", None) and described.state.paused),
+        "paused": bool(getattr(state, "paused", False)),
         "every_seconds": (
             int(spec.intervals[0].every.total_seconds()) if spec.intervals else None
         ),
         "cron": spec.cron_expressions[0] if spec.cron_expressions else None,
         "workflow_id_template": schedule.action.id,
         "task_queue": schedule.action.task_queue,
+        # `next_action_times` IS A SEQUENCE OF `datetime`, NOT OF OBJECTS. `ScheduleInfo` declares it
+        # `Sequence[datetime]` ("Next 10 scheduled action times"), so the old `info.scheduled_at` read raises
+        # `AttributeError: 'datetime.datetime' object has no attribute 'scheduled_at'` — the SECOND crash on
+        # this same listing line, found only after a schedule existed because the loop body never ran before.
+        # The values are already aware datetimes, so `isoformat()` is the whole conversion.
         "next_action_times": [
-            info.scheduled_at.isoformat() for info in (described.info.next_action_times or [])
+            moment.isoformat() for moment in (described.info.next_action_times or [])
         ][:5],
         "num_actions": int(described.info.num_actions),
     }
