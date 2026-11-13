@@ -229,6 +229,117 @@ def test_listing_awaits_the_client_coroutine_before_iterating():
     assert "async for description in client.list_schedules():" not in source
 
 
+def test_describing_a_schedule_reads_paused_from_the_SCHEDULE_not_the_description():
+    """The second bug on the same listing path: ``described.state`` is not an attribute.
+
+    MEASURED against temporalio 1.35.0 (the version the payload ships): ``ScheduleDescription`` is
+    ``(id, schedule, info, typed_search_attributes, search_attributes, data_converter, raw_description)`` and
+    ``Schedule`` is ``(action, spec, policy, state)``. So ``described.state.paused`` raises
+    ``AttributeError: 'ScheduleDescription' object has no attribute 'state'``.
+
+    WHY IT SURVIVED: the failure needs a schedule to EXIST. With an empty namespace the loop body never runs, so
+    ``codna run schedule --list`` answered ``{"schedules": []}`` on every payload and every test — and the first
+    real schedule then turned the IDE's Skills & Automations panel into
+    ``The Codna CLI could not list schedules (exit 1): Traceback … AttributeError``. That is why this test
+    builds a REAL description object from the installed SDK instead of asserting on the source text.
+    """
+    from temporalio.client import ScheduleState
+
+    from codna.durable.schedule import describe_schedule
+
+    schedule = _schedule_with_state(ScheduleState(paused=True))
+
+    class FakeHandle:
+        async def describe(self) -> Any:
+            return _description_of(schedule)
+
+    class FakeClient:
+        def get_schedule_handle(self, schedule_id: str) -> Any:
+            return FakeHandle()
+
+    described = asyncio.run(describe_schedule(FakeClient(), "codna-schedule-x"))
+    # THE ASSERTION THAT WAS AN AttributeError: the paused flag is read, and it is the REAL one.
+    assert described["paused"] is True
+    assert described["schedule_id"] == "codna-schedule-x"
+    # …and the NEXT FIRE TIMES, which was the SECOND AttributeError on this line:
+    # `ScheduleInfo.next_action_times` is `Sequence[datetime]`, so `info.scheduled_at` raised
+    # "'datetime.datetime' object has no attribute 'scheduled_at'". Both bugs were unreachable until a
+    # schedule existed, which is why this asserts the real value rather than that a list is present.
+    assert described["next_action_times"] == ["2026-01-01T00:00:00+00:00"]
+    # The rest of the row a UI draws: the cadence and the identity it acts on.
+    assert described["every_seconds"] == 3600
+    assert described["workflow_id_template"] == "run:demo:{{.ScheduledTime}}"
+    assert described["task_queue"] == "q"
+
+    # …and a description whose schedule carries NO state is not a crash: an absent state is not a paused run.
+    unpaused = asyncio.run(describe_schedule(_client_for(_schedule_with_state(None)), "codna-schedule-y"))
+    assert unpaused["paused"] is False
+
+
+def _schedule_with_state(state: Any) -> Any:
+    """A real ``temporalio.client.Schedule`` carrying ``state``, built with the SDK's own classes."""
+    from temporalio.client import (
+        Schedule,
+        ScheduleActionStartWorkflow,
+        ScheduleIntervalSpec,
+        ScheduleSpec,
+    )
+
+    return Schedule(
+        action=ScheduleActionStartWorkflow("TaskWorkflow", {}, id="run:demo:{{.ScheduledTime}}", task_queue="q"),
+        # A real interval, so `every_seconds` is read from the same shape a server returns.
+        spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(seconds=3600))]),
+        **({"state": state} if state is not None else {}),
+    )
+
+
+def _description_of(schedule: Any) -> Any:
+    """A real ``ScheduleDescription``, constructed from the SDK's own dataclasses.
+
+    WHY THE FIELD LIST IS SPELLED OUT. The point of this test is the ATTRIBUTE SET of the object a real
+    ``describe()`` returns, so the fixture must be that class rather than a duck-typed stub. ``ScheduleInfo``
+    grows positional fields (8 in temporalio 1.34/1.35), and naming them here is deliberate: if an SDK bump
+    changes the shape, this fixture fails loudly and points at the upgrade instead of letting
+    ``describe_schedule`` read a field that moved.
+    """
+    from datetime import datetime, timezone
+
+    from temporalio.client import ScheduleDescription, ScheduleInfo
+
+    return ScheduleDescription(
+        id="codna-schedule-x",
+        schedule=schedule,
+        info=ScheduleInfo(
+            num_actions=0,
+            num_actions_missed_catchup_window=0,
+            num_actions_skipped_overlap=0,
+            running_actions=[],
+            recent_actions=[],
+            # ONE REAL `datetime`, because the type is what made the second bug possible. `scheduled_at` on a
+            # datetime is an AttributeError, so a fixture of `None` or `[]` would pass and prove nothing.
+            next_action_times=[datetime(2026, 1, 1, tzinfo=timezone.utc)],
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            last_updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+        typed_search_attributes=None,
+        search_attributes=None,
+        data_converter=None,
+        raw_description=None,
+    )
+
+
+def _client_for(schedule: Any) -> Any:
+    class FakeHandle:
+        async def describe(self) -> Any:
+            return _description_of(schedule)
+
+    class FakeClient:
+        def get_schedule_handle(self, schedule_id: str) -> Any:
+            return FakeHandle()
+
+    return FakeClient()
+
+
 def test_the_schedule_command_refuses_both_triggers_and_neither():
     from codna import cli as top_cli
 
