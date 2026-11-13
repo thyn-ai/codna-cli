@@ -73,12 +73,14 @@ from .contracts import (
     WorktreeCleanupOutcome,
     WorktreeCleanupRequest,
 )
+from .delegation_policy import delegation_policy as _read_delegation_policy
 from .ledger import RunLedger
 from .state import AskRef, CheckpointRef, TaskState, TaskStateError, VerifyRef
 from .worktree import remove_run_worktrees
 
 __all__ = [
     "checkpoint_turn",
+    "delegation_policy",
     "notify",
     "open_pr",
     "plan_task",
@@ -468,15 +470,30 @@ def _verify_plan(request: VerifyRequest, runtime: ActivityRuntime, *, tree: str)
         return VerifyPlan(("injected",), _digest_commands(("injected",)))
     if request.commands:
         return VerifyPlan(request.commands, _digest_commands(request.commands))
-    from ..testrun import resolve_test_command
+    from ..testrun import resolve_test_command, verification_hints
 
     resolved = resolve_test_command(tree)
     command = resolved[0] if resolved else None
     if not command:
+        # THE REPORTS SAY WHAT WAS LOOKED FOR, and offers what a person could supply. Measured: a run
+        # failed here on a repository that had a working `node --test` suite, and the only way forward
+        # was a hand-written `codna.yaml` — nothing in the product said what detection had tried or
+        # what could be typed instead. `verification_hints` is derived from the SAME detection code, so
+        # this sentence cannot describe checks that are not the ones performed.
+        hints = verification_hints(tree)
         raise ActivityError(
-            "no verification command was supplied and none could be detected for this repository",
+            "no verification command was supplied and none could be detected for this repository: "
+            "checked " + "; ".join(hints["checked"]) + ". Supply one with the run's verify command "
+            "(the New task sheet's Verify command field, or `codna run --verify CMD`), or add "
+            "`fix.test_command` to the repository's codna.yaml."
+            + (
+                " Candidate commands from this repository (confirm one to use it): "
+                + " | ".join(hints["suggested"])
+                if hints["suggested"]
+                else ""
+            ),
             code="activity_verify_undetectable",
-            details={"repo_dir": tree},
+            details={"repo_dir": tree, **hints},
         )
     return VerifyPlan((command,), _digest_commands((command,)))
 
@@ -812,6 +829,14 @@ def _note_cleanup(
     if failed is not None:
         payload["failed"] = failed
     runtime.ledger(request.run_id).append("note", task_id=None, payload=payload)
+
+
+# The activity's BODY lives in `delegation_policy`, a module that imports no workflow runtime: the read
+# is a function of its request plus one file, so asserting its answer (and the sentence built from it)
+# must not require the OPTIONAL `durable` extra. Re-exported as the SAME object rather than wrapped, on
+# the rule `activities.py` follows for every step: the registered activity, the graph's direct call and
+# a test's call are one function, not three lookalikes.
+delegation_policy = _read_delegation_policy
 
 
 def notify(request: NotifyRequest) -> NotifyOutcome:

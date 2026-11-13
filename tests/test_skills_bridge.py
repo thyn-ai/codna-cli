@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import unlistable_directory
+
 from codna import skills_bridge
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "skills_repo"
@@ -167,6 +169,32 @@ def test_a_missing_repository_is_reported_rather_than_looking_empty(tmp_path):
     assert response["ok"] is True
     assert response["skills"] == []
     assert any(w["code"] == "skills_root_missing" for w in response["warnings"])
+
+
+def test_an_unreadable_user_layer_travels_to_the_host_with_its_errno(tmp_path):
+    """The bridge's half of the defect: a layer it could not LIST must be named in the answer.
+
+    MEASURED on 0.1.49: two launch shapes produced "8 skills" and "9 skills" for the same workspace and the
+    same bridge, because `~/.codex` is a symlink into iCloud Drive and the LaunchServices-launched process had
+    no TCC grant to list it. The answer carried NO warning, so the panel could not say which layer was short.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    write(home, ".agents/skills/visible/SKILL.md", skill_md(description="reachable"))
+    write(home, ".codex/skills/sealed/SKILL.md", skill_md(description="unreachable"))
+    sealed = home / ".codex" / "skills"
+    # PROVEN, not assumed: skips with the reason when the mode is not enforced (root, or a filesystem without
+    # POSIX mode bits), so this can never pass vacuously or fail for a reason unrelated to the bridge.
+    with unlistable_directory(sealed):
+        response = skills_bridge.handle({"repo": str(repo), "home": str(home)})
+
+    assert response["ok"] is True
+    assert [skill["name"] for skill in response["skills"]] == ["visible"]
+    unreadable = [w for w in response["warnings"] if w["code"] == "skills_dir_unreadable"]
+    assert len(unreadable) == 1, [w["code"] for w in response["warnings"]]
+    assert ".codex/skills" in unreadable[0]["source_path"]
+    assert unreadable[0]["message"]
 
 
 # ---------------------------------------------------------------------------------------------

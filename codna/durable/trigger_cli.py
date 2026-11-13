@@ -168,7 +168,13 @@ def cmd_schedule_list(args: Any) -> int:
 
         client = await _cli._connect(config)
         rows: list[dict[str, Any]] = []
-        async for description in client.list_schedules():
+        # `Client.list_schedules` is a COROUTINE that RESOLVES TO AN ASYNC ITERATOR
+        # (`async def list_schedules(...) -> ScheduleAsyncIterator`). Iterating the coroutine directly raises
+        # `TypeError: 'async for' requires an object with __aiter__ method, got coroutine`, so listing was
+        # broken for every caller — the `/automations` channel included, which is why it is fixed here rather
+        # than around: one await, and the iterator is what the loop was always written for.
+        listing = await client.list_schedules()
+        async for description in listing:
             schedule_id = getattr(getattr(description, "id", None), "id", None) or getattr(
                 description, "id", None
             )
@@ -289,6 +295,23 @@ def add_schedule_flags(schedule: Any) -> None:
     schedule.add_argument(
         "--jitter", type=int, default=0, metavar="SECONDS",
         help="deterministic spread applied to each fire (default: 0, no spread)",
+    )
+    # `--json` IS ACCEPTED HERE BECAUSE THE ONLY OUTPUT IS JSON, and the scheduler always sends it.
+    #
+    # MEASURED: `ide/extensions/codna-theia/src/common/codna-durable-commands.ts` builds
+    # `… --worktree --json` (`scheduleArgv`) and `codna-durable-scheduler.ts` lists with
+    # `… --list --repo <dir> --json`. Neither flag existed on this parser, so BOTH first-class calls died in
+    # argparse with `error: unrecognized arguments: --json` before the command ran — `/loop`, `/autopilot` and
+    # the Skills & Automations panel's listing were all unreachable, and the scheduler reports that as a
+    # coded refusal whose text is an argparse usage line.
+    #
+    # It is a no-op rather than a mode switch because `_print` in `durable/cli.py` ALWAYS emits JSON. Adding a
+    # second, human-formatted branch to make the flag "meaningful" would be a new output contract invented to
+    # justify a flag, and two renderings of one payload is how the CLI's answer and the scheduler's parse drift
+    # apart. So the flag is accepted for compatibility and documented as what it is.
+    schedule.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="emit the answer as JSON (this command's only format; accepted for scripted callers)",
     )
 
 

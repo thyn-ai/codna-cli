@@ -179,6 +179,56 @@ def test_the_schedule_command_exists_on_both_surfaces_and_requires_a_trigger():
         assert parsed.cron is None
 
 
+def test_the_schedule_command_accepts_the_argv_the_ide_actually_sends():
+    """`--json` is on BOTH callers' argv, and it was missing from this parser.
+
+    MEASURED: `ide/extensions/codna-theia/src/common/codna-durable-commands.ts` builds
+    ``run schedule … --worktree --json`` (``scheduleArgv``) and ``codna-durable-scheduler.ts`` lists with
+    ``run schedule --list --repo <dir> --json``. Neither flag existed here, so BOTH first-class IDE calls died in
+    argparse with ``error: unrecognized arguments: --json`` before the command ran: ``/loop``, ``/autopilot`` and
+    the Skills & Automations panel's listing were all unreachable, and the surface reported the argparse usage
+    line as the refusal.
+
+    ``--json`` is a NO-OP and that is correct: ``_print`` in ``durable/cli.py`` always emits JSON, so a second
+    human-formatted branch would be a new output contract invented to justify the flag.
+    """
+    from codna import cli as top_cli
+
+    parser = top_cli.build_parser()
+    listing = parser.parse_args(["run", "schedule", "--list", "--repo", "/repo", "--json"])
+    assert listing.list_schedules is True
+    assert listing.as_json is True
+    assert getattr(listing.func, "__name__", "") == "_cmd_schedule_entry"
+
+    registering = parser.parse_args(
+        ["run", "schedule", "--repo", "/repo", "--brief", "b", "--name", "n", "--every", "1800",
+         "--worktree", "--json"]
+    )
+    assert registering.worktree is True
+    assert registering.as_json is True
+    assert getattr(registering.func, "__name__", "") == "_cmd_schedule_entry"
+
+
+def test_listing_awaits_the_client_coroutine_before_iterating():
+    """``Client.list_schedules`` is a COROUTINE that RESOLVES TO an async iterator.
+
+    MEASURED against temporalio: the signature is ``async def list_schedules(...) -> ScheduleAsyncIterator``, so
+    ``async for description in client.list_schedules()`` raises
+    ``TypeError: 'async for' requires an object with __aiter__ method, got coroutine``. Listing was therefore
+    broken for EVERY caller — the CLI's own ``--list`` and the IDE's automations channel — which is why the
+    source is asserted here: the bug is one missing ``await``, and a behavioural test needs a live namespace to
+    reach the same line.
+    """
+    import inspect
+
+    from codna.durable import trigger_cli
+
+    source = inspect.getsource(trigger_cli.cmd_schedule_list)
+    assert "await client.list_schedules()" in source
+    # The broken spelling must not come back: iterating the coroutine never worked.
+    assert "async for description in client.list_schedules():" not in source
+
+
 def test_the_schedule_command_refuses_both_triggers_and_neither():
     from codna import cli as top_cli
 

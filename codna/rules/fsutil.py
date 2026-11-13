@@ -14,7 +14,7 @@ and bounds the walk; the semantics belong to :mod:`codna.rules.discovery` and
 from __future__ import annotations
 
 import os
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 __all__ = [
     "MAX_DEPTH",
@@ -98,14 +98,20 @@ def iter_named_dirs(
     rel_name: str,
     *,
     max_depth: int = MAX_DEPTH,
+    on_error: Callable[[OSError], None] | None = None,
 ) -> Iterator[tuple[str, str]]:
     """Yield ``(absolute_dir, rel_dir)`` for every ``rel_name`` directory at any depth.
 
     ``rel_name`` is a relative path with a fixed tail (``.codna/rules``, ``.cursor/skills``), so the
     same monorepo package can define its own instance of it. A directory reached through a symlink is
     never yielded: the caller cannot then be talked into reading a tree it did not name.
+
+    ``on_error`` receives every directory ``os.walk`` could not list. Without it the walk is SILENT
+    about them — ``os.walk`` swallows the ``OSError`` by default — and a caller cannot tell "this
+    directory holds nothing" from "this directory could not be read". That distinction is the whole
+    difference between an empty catalogue and a catalogue missing a layer the user can see on disk.
     """
-    for current, dirnames, _files in os.walk(repo_dir, followlinks=False):
+    for current, dirnames, _files in os.walk(repo_dir, followlinks=False, onerror=on_error):
         rel_current = posix(os.path.relpath(current, repo_dir))
         depth = 0 if rel_current == "." else rel_current.count("/") + 1
         if depth > max_depth:
@@ -123,6 +129,7 @@ def iter_dirs_containing(
     filename: str,
     *,
     max_depth: int = MAX_DEPTH,
+    on_error: Callable[[OSError], None] | None = None,
 ) -> Iterator[tuple[str, str]]:
     """Yield ``(absolute_dir, rel_dir)`` for every directory under ``start_dir`` holding ``filename``.
 
@@ -132,9 +139,13 @@ def iter_dirs_containing(
 
     ``start_dir`` itself is not yielded — the caller has already decided that it is the container,
     not a member.
+
+    ``on_error`` receives every directory ``os.walk`` could not list, for the reason given on
+    :func:`iter_named_dirs`: an unreadable directory must be reportable, not indistinguishable from
+    an empty one.
     """
     root = os.path.abspath(start_dir)
-    for current, dirnames, filenames in os.walk(root, followlinks=False):
+    for current, dirnames, filenames in os.walk(root, followlinks=False, onerror=on_error):
         rel_current = posix(os.path.relpath(current, root))
         depth = 0 if rel_current == "." else rel_current.count("/") + 1
         if depth > max_depth:

@@ -118,11 +118,15 @@ memory-languages = [
   "tree-sitter-php", "tree-sitter-ruby",
 ]
 
-# Local cross-repo dev: resolve the Telys public SDK from the sibling checkout.
-# uv reads this; pip ignores it. The runtime remains an explicit release staging step.
-# cli/ is two levels under Developer/, hence ../../.
-[tool.uv.sources]
-telys = { path = "../../memory-engine/packages/telys-sdk", editable = true }
+# There is deliberately NO `[tool.uv.sources]` entry for `telys` (nor for any other dependency). A
+# `telys = { path = "../../memory-engine/packages/telys-sdk", editable = true }` entry pinned this
+# package to a SIBLING REPO CHECKOUT, so `uv sync` resolved whatever version that checkout happened to
+# be at — measured at 0.1.4, three releases below the `telys.runtime.TEXT_COLUMN` floor declared above —
+# and `ide/applications/electron/scripts/bundle-telys.js` copied the same stale tree into the desktop
+# payload, where it failed `vector_tier_unreachable`. A versioned requirement resolves from the index
+# (or from the release wheelhouse) and cannot go stale. `telys>=0.1.11` above remains the single
+# declaration of what this package accepts; do not reintroduce a path source to "make the sibling
+# visible" — point `CODNA_TELYS_WHEELHOUSE`/`--find-links` at a locally built wheel instead.
 
 [project.urls]
 Homepage = "https://codna.ai"

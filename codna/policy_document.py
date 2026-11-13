@@ -59,6 +59,13 @@ schema errors: they match `[a-z][a-z0-9_]*`, resolve to no permission, and there
 
 Pure stdlib + PyYAML. Deterministic: the digest is over the canonical JSON of the parsed document,
 so formatting and key order do not change it.
+
+PyYAML is PREFERRED but not required: `policy_yaml` reads the subset of YAML a policy is written in
+(block mappings and sequences, flow sequences of scalars, plain/quoted scalars, numbers, booleans,
+nulls, comments), refusing duplicate keys and unknown constructs rather than approximating them. So a
+payload that ships without PyYAML still evaluates a policy instead of refusing every session; a
+document outside that subset is refused with `policy_reader_subset_exceeded`, which names the
+construct and tells the operator to install PyYAML.
 """
 from __future__ import annotations
 
@@ -71,6 +78,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import policy_yaml
 from .findings import digest_of
 
 __all__ = [
@@ -226,15 +234,17 @@ def _yaml_load(raw: str, source: str) -> Any:
     last value for a repeated key. For a permission document that is a fail-open: a `tools:` block
     appended below an existing one would silently replace the reviewed list. A duplicate key is
     therefore a parse error.
+
+    PYYAML IS PREFERRED, THE STDLIB SUBSET READER IS THE FALLBACK. `policy_yaml` parses the part of
+    YAML a policy uses and refuses everything else with its own code, so a payload that shipped
+    without PyYAML answers a real verdict for a real policy instead of refusing every session with
+    `policy_reader_unavailable`. The fallback is NOT a permissive path: it refuses duplicate keys by
+    the same rule, and it cannot construct an arbitrary object at all (no tags, no aliases), so the
+    protections this docstring names hold for both readers.
     """
-    try:
-        import yaml  # type: ignore
-    except ModuleNotFoundError as exc:  # pragma: no cover - pyyaml is a declared dependency
-        raise PolicyDocumentError(
-            "PyYAML is required to read a policy document",
-            code="policy_reader_unavailable",
-            details={"source": source, "hint": "pip install pyyaml"},
-        ) from exc
+    yaml = _pyyaml()
+    if yaml is None:
+        return _yaml_load_without_pyyaml(raw, source)
 
     class _Loader(yaml.SafeLoader):
         pass
@@ -272,6 +282,64 @@ def _yaml_load(raw: str, source: str) -> Any:
             f"policy document is not valid YAML: {exc.__class__.__name__}",
             code="policy_unparseable",
             details={"source": source, "error": str(exc).splitlines()[0][:400]},
+        ) from exc
+
+
+def _pyyaml() -> Any:
+    """The `yaml` module, or None when this interpreter cannot PROVIDE it.
+
+    Imported on demand rather than at module scope so importing `codna.policy_document` never depends
+    on an optional wheel — which is what made one absent package take down every session. A payload
+    that ships it gets the full parser; one that does not gets `policy_yaml`.
+
+    `ImportError` AND NOT ONLY `ModuleNotFoundError`, because "absent" is one way a wheel can be
+    unusable and it is not the only one. A `yaml/_yaml` C extension built for a different interpreter
+    raises `ImportError` from inside `yaml/__init__.py` (a linker or ABI failure, not a missing file),
+    which is NOT a `ModuleNotFoundError`. Catching the narrow class propagated that exception out of
+    `_yaml_load` and skipped the fallback this function exists to reach — so a corrupt PyYAML was
+    strictly worse than no PyYAML at all. The fallback reader is a real substitute here (it reaches
+    the same verdicts on the fixture matrix), and it fails CLOSED, so degrading is the safe direction.
+    """
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        return None
+    return yaml
+
+
+def _yaml_load_without_pyyaml(raw: str, source: str) -> Any:
+    """Parse with the stdlib subset reader, mapping each refusal to its own stable code.
+
+    THE THREE OUTCOMES ARE DISTINCT ON PURPOSE. A malformed document is `policy_unparseable` (the
+    same verdict PyYAML reaches); a repeated key is `policy_duplicate_key` (the same fail-open
+    protection, by name); and VALID YAML the subset does not implement is
+    `policy_reader_subset_exceeded` — a refusal that names the construct, because calling valid YAML
+    "unparseable" would send an operator to fix a file that is not broken.
+    """
+    try:
+        return policy_yaml.loads(raw)
+    except policy_yaml.DuplicateKeyError as exc:
+        raise PolicyDocumentError(
+            f"duplicate key {exc.key!r} in the policy document",
+            code="policy_duplicate_key",
+            details={"source": source, "key": str(exc.key), "line": exc.lineno},
+        ) from exc
+    except policy_yaml.UnsupportedYamlError as exc:
+        raise PolicyDocumentError(
+            f"the policy document uses {exc.message}, which the built-in reader does not support",
+            code="policy_reader_subset_exceeded",
+            details={
+                "source": source,
+                "line": exc.lineno,
+                "hint": "install PyYAML (pip install pyyaml) to read this document, or rewrite it "
+                "with plain mappings, block sequences and scalars",
+            },
+        ) from exc
+    except policy_yaml.YamlSyntaxError as exc:
+        raise PolicyDocumentError(
+            f"policy document is not valid YAML: {exc.message}",
+            code="policy_unparseable",
+            details={"source": source, "error": str(exc)[:400], "line": exc.lineno},
         ) from exc
 
 

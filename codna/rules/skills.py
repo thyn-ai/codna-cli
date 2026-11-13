@@ -365,7 +365,14 @@ def discover(
             ))
             continue
         file_root = real_root if in_repo else real_dir
-        for skill_dir, rel_dir in fsutil.iter_dirs_containing(entry.path, _SKILL_FILENAME):
+        # AN UNREADABLE DIRECTORY IS REPORTED, NOT SKIPPED. `os.walk` swallows the `OSError` by default,
+        # so a layer the process may not list (a TCC-protected path such as an iCloud-synced `~/.codex`,
+        # measured) produced a catalogue that was simply missing those skills — indistinguishable from a
+        # user who has none. The warning names the directory and the errno, so the surface can say which.
+        unreadable: list[OSError] = []
+        for skill_dir, rel_dir in fsutil.iter_dirs_containing(
+            entry.path, _SKILL_FILENAME, on_error=unreadable.append,
+        ):
             display = fsutil.posix(
                 f"{entry.label}/{rel_dir}/{_SKILL_FILENAME}"
             )
@@ -379,6 +386,15 @@ def discover(
             warnings.extend(extra)
             if skill is not None:
                 skills.append(skill)
+        for error in unreadable:
+            warnings.append(SkillWarning(
+                code="skills_dir_unreadable",
+                message=(
+                    f"could not be listed ({error.strerror or error.__class__.__name__}); "
+                    "any skills inside it are absent from this catalogue"
+                ),
+                source_path=fsutil.posix(getattr(error, "filename", None) or entry.label),
+            ))
 
     ordered = _dedupe(skills, warnings)
     if len(ordered) > MAX_SKILLS:

@@ -22,11 +22,63 @@ from .task_context import TaskContext
 from .state import find_secret_like_strings, validated_state
 
 __all__ = [
+    "DelegationPolicyOutcome",
+    "DelegationPolicyRequest",
     "EpisodeRequest",
     "NotifyRequest",
     "WorktreeCleanupOutcome",
     "WorktreeCleanupRequest",
 ]
+
+
+@dataclass(frozen=True)
+class DelegationPolicyRequest:
+    """Ask what this run's repository POLICY removes from the delegation toolset.
+
+    ``enable_agent_teams`` is a GATE, not a GRANT, and the grant is narrowed twice: by the approval
+    profile's ``allowedTools`` and again by ``.codna/policy.yaml`` at session create. A policy written
+    for a single-agent run leaves the profile intact and still strips every ``team_*`` name, which is
+    how a run reported ``delegation is attached`` and then failed every ``team_run_task`` call with
+    ``unavailable tool``.
+
+    IT IS AN ACTIVITY, NOT WORKFLOW CODE, and that is not a style choice: the answer requires reading
+    and parsing a file, and Temporal's workflow sandbox REFUSES filesystem access from workflow code
+    (``RestrictedWorkflowAccessError: Cannot access os.path from inside a workflow`` — measured by
+    ``test_swarm_e2e.py`` when this logic was first written inline). The read belongs in an activity
+    for the same reason every other read does.
+    """
+
+    run_id: str
+    repo_dir: str
+    enable_agent_teams: bool
+
+    def validate(self) -> None:
+        _require_ref(self.run_id, "run_id")
+        if not isinstance(self.repo_dir, str) or not self.repo_dir.startswith("/"):
+            raise ContractError(
+                "delegation policy repo_dir must be an absolute path",
+                code="contract_invalid",
+                details={"field": "repo_dir"},
+            )
+        if not isinstance(self.enable_agent_teams, bool):
+            raise ContractError(
+                "delegation policy enable_agent_teams must be a boolean",
+                code="contract_invalid",
+                details={"field": "enable_agent_teams"},
+            )
+
+
+@dataclass(frozen=True)
+class DelegationPolicyOutcome:
+    """Which prompt-named team tools the policy strips, and the file that decided it.
+
+    ``stripped`` is empty for every run that delegates normally, so the caller reports nothing in the
+    ordinary case. ``policy_path`` is carried so the note names the file an operator has to edit —
+    the whole point of the report is to say WHERE the fix is, not merely that delegation is off.
+    """
+
+    stripped: tuple[str, ...]
+    policy_path: str
 
 
 @dataclass(frozen=True)

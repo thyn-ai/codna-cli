@@ -46,6 +46,7 @@ from .contracts import (
     ACTIVITY_TURN_TIMEOUT_S,
     ACTIVITY_VERIFY_TIMEOUT_S,
     NAME_CHECKPOINT,
+    NAME_DELEGATION_POLICY,
     NAME_EPISODE,
     NAME_NOTIFY,
     NAME_OPEN_PR,
@@ -146,6 +147,7 @@ review_task = _steps.review_task
 open_pr = _steps.open_pr
 remember_episode = _steps.remember_episode
 notify = _steps.notify
+delegation_policy = _steps.delegation_policy
 worktree_cleanup = _steps.worktree_cleanup
 # D5 goal mode. Re-exported on the same rule as the step bodies: the registered activity and the
 # function a test calls must be one object.
@@ -167,6 +169,9 @@ review_task_activity = activity.defn(name=NAME_REVIEW)(review_task)
 open_pr_activity = activity.defn(name=NAME_OPEN_PR)(open_pr)
 remember_episode_activity = activity.defn(name=NAME_EPISODE)(remember_episode)
 notify_activity = activity.defn(name=NAME_NOTIFY)(notify)
+delegation_policy_activity = activity.defn(name=NAME_DELEGATION_POLICY)(
+    delegation_policy
+)
 worktree_cleanup_activity = activity.defn(name=NAME_WORKTREE_CLEANUP)(worktree_cleanup)
 watch_ci_activity = activity.defn(name=NAME_WATCH_CI)(watch_ci)
 recall_episodes_activity = activity.defn(name=NAME_RECALL)(recall_episodes)
@@ -180,6 +185,7 @@ ACTIVITY_NAMES: Final[tuple[str, ...]] = (
     NAME_OPEN_PR,
     NAME_EPISODE,
     NAME_NOTIFY,
+    NAME_DELEGATION_POLICY,
     NAME_WORKTREE_CLEANUP,
     NAME_WATCH_CI,
     NAME_RECALL,
@@ -194,6 +200,7 @@ ACTIVITIES: Final[tuple[Any, ...]] = (
     open_pr_activity,
     remember_episode_activity,
     notify_activity,
+    delegation_policy_activity,
     worktree_cleanup_activity,
     watch_ci_activity,
     recall_episodes_activity,
@@ -210,6 +217,7 @@ _BODIES: Final[dict[str, Callable[[Any], Any]]] = {
     NAME_OPEN_PR: open_pr_activity,
     NAME_EPISODE: remember_episode_activity,
     NAME_NOTIFY: notify_activity,
+    NAME_DELEGATION_POLICY: delegation_policy_activity,
     NAME_WORKTREE_CLEANUP: worktree_cleanup_activity,
     NAME_WATCH_CI: watch_ci_activity,
     NAME_RECALL: recall_episodes_activity,
@@ -255,6 +263,7 @@ _TIMEOUTS: Final[dict[str, int]] = {
     NAME_OPEN_PR: ACTIVITY_TIMEOUT_S,
     NAME_EPISODE: ACTIVITY_TIMEOUT_S,
     NAME_NOTIFY: ACTIVITY_TIMEOUT_S,
+    NAME_DELEGATION_POLICY: ACTIVITY_TIMEOUT_S,
     # A sweep of a run's worktrees: one `git worktree remove` per task, each verified against git's own
     # list. It is not a paid step, and a run's task count is bounded, so the ordinary activity ceiling
     # is right; a larger one would only hide a wedged worker behind a longer wait.
