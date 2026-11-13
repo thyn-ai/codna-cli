@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -2918,3 +2919,73 @@ def test_post_runs_refuses_parallel_tasks_without_worktrees(
     # The spec's own code, propagated: the conflict is a CONTRACT violation (parallelism requires
     # worktrees), so it keeps the contract's code rather than being flattened into a generic one.
     assert body["error"]["code"] == "contract_invalid"
+
+
+# -- the signals that end the foreground loop ----------------------------------------------
+#
+# The subprocess half of this is `test_serve_process.py` (a real `codna serve`, a real pty, a real
+# hangup). These two assert the POLICY in isolation, so a future change to it fails here with a
+# sentence about signals rather than as a mysterious process death in the other file.
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="SIGHUP does not exist on this platform")
+def test_a_hangup_is_ignored_while_a_stop_signal_is_handled(config: Any) -> None:
+    """SIGHUP (the terminal went away) must NOT stop the server; SIGTERM (asked to stop) must.
+
+    This is the disposition itself, not its effect, and the distinction is the product decision:
+    a server the IDE is talking to must not die because the shell that launched it finished.
+    """
+    settings = RunApiSettings(port=0, token_path=config.paths.root / "sig.token")
+    server = RunApiServer(
+        config=config,
+        backend=ScriptedBackend(),
+        settings=settings,
+        siem=NullSiemSink(),
+    )
+    before = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        server.bind()
+        # `_install_signal_handlers` is what `serve_forever` installs; asserting it directly keeps
+        # this test off the serving loop (which would block the suite).
+        handlers = server._install_signal_handlers(server._httpd)  # type: ignore[arg-type]
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+        assert callable(signal.getsignal(signal.SIGTERM))
+        assert callable(signal.getsignal(signal.SIGINT))
+        assert set(handlers) == {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+    finally:
+        # NO `server.stop()` HERE: the loop was never started, and `stop()` calls `shutdown()`,
+        # which waits forever for a `serve_forever` that does not exist. Closing the socket is all
+        # this test owns.
+        assert server._httpd is not None
+        server._httpd.server_close()
+        for sig, handler in before.items():
+            signal.signal(sig, handler)
+
+
+def test_a_stop_signal_records_why_the_loop_ended(config: Any) -> None:
+    """`stop_reason` is the fact `serve` prints, so an exit is never silent again."""
+    settings = RunApiSettings(port=0, token_path=config.paths.root / "sig2.token")
+    server = RunApiServer(
+        config=config,
+        backend=ScriptedBackend(),
+        settings=settings,
+        siem=NullSiemSink(),
+    )
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        server.bind()
+        # The dict is the PREVIOUS handlers, for restoration; the handler this call installed is
+        # the one `getsignal` now reports, which is what the runtime will invoke.
+        server._install_signal_handlers(server._httpd)  # type: ignore[arg-type]
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler)
+        # Invoke the installed handler the way the runtime would. It starts a shutdown thread and
+        # sets `stopping`; no `serve_forever` is running, so the shutdown thread has nothing to
+        # wait on and the assertions below are about the handler's own contract.
+        handler(signal.SIGTERM, None)
+        assert server.stop_reason == "SIGTERM"
+        assert server.api.stopping.is_set()
+        assert server._httpd is not None
+        server._httpd.server_close()
+    finally:
+        signal.signal(signal.SIGTERM, before)

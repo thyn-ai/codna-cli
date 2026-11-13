@@ -321,15 +321,31 @@ def test_local_client_skips_cross_interpreter_engine_site_packages(tmp_path) -> 
     assert local_client_module._compatible_engine_site_packages(engine_dir) == [compatible]
 
 
-def test_packaged_backend_removes_failed_default_dev_checkout_import_paths(tmp_path, monkeypatch) -> None:
+def test_packaged_backend_never_imports_a_home_directory_checkout(tmp_path, monkeypatch) -> None:
+    """A checkout at `~/Developer/decision-engine` must not be consulted at all.
+
+    This used to be the IMPLICIT default: with ALGENTA_ENGINE_DIR unset, `resolve_runtime_config` guessed
+    `Path.home() / "Developer" / "decision-engine"` and put it on `sys.path`. On a developer machine that is a
+    real, unrelated checkout whose `apps.*` package Codna would then import (and whose Mojo daemon it would
+    start); on a user machine it is a phantom. The fix is that absence is `None`, so this test now pins the
+    stronger property: a home-directory checkout is not merely excluded AFTER a failed import, it is never
+    looked at.
+    """
     fake_home = tmp_path / "home"
     fake_engine_dir = fake_home / "Developer" / "decision-engine"
     fake_site_packages = fake_engine_dir / ".venv" / "lib" / "python3.12" / "site-packages"
     fake_site_packages.mkdir(parents=True)
     fake_apps = fake_engine_dir / "apps" / "api_server"
     fake_apps.mkdir(parents=True)
+    # A COMPLETE-looking checkout, so "it was not imported" cannot be explained by "it would have failed".
     (fake_engine_dir / "apps" / "__init__.py").write_text("", encoding="utf-8")
     (fake_apps / "__init__.py").write_text("", encoding="utf-8")
+    (fake_apps / "services").mkdir()
+    (fake_apps / "services" / "repository_intelligence_core.py").write_text("", encoding="utf-8")
+    (fake_apps / "models").mkdir()
+    (fake_apps / "models" / "data_connector.py").write_text("", encoding="utf-8")
+    (fake_apps / "schemas").mkdir()
+    (fake_apps / "schemas" / "repositories.py").write_text("", encoding="utf-8")
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "service.rb").write_text("def price\n  1\nend\n", encoding="utf-8")
@@ -340,6 +356,9 @@ def test_packaged_backend_removes_failed_default_dev_checkout_import_paths(tmp_p
     # import genuinely fails and the packaged backend fallback + path cleanup are exercised.
     _isolate_from_packaged_backend(monkeypatch)
 
+    config = local_client_module.resolve_runtime_config()
+    assert config.engine_dir is None, "an unset ALGENTA_ENGINE_DIR must not resolve a home-directory guess"
+
     client = LocalCodnaRuntimeClient()
     connector = client.create_connector(name="clean-install", connector_type="local_repo", config={"path": str(repo)})
     snapshot = client.create_repository_snapshot(connector["id"], {})
@@ -347,6 +366,8 @@ def test_packaged_backend_removes_failed_default_dev_checkout_import_paths(tmp_p
     assert snapshot["backend_mode"] == "packaged_local_triage"
     assert str(fake_engine_dir.resolve()) not in sys.path
     assert str(fake_site_packages.resolve()) not in sys.path
+    # and nothing else under the fake home leaked in on the way
+    assert not any(str(fake_home.resolve()) in entry for entry in sys.path)
 
 
 def test_local_client_packaged_backend_runs_packaged_fix_steps(tmp_path, monkeypatch) -> None:

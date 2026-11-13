@@ -34,6 +34,136 @@ def _write_fake_engine_checkout(tmp_path: Path) -> Path:
     (api_server_dir / "main.py").write_text("app = object()\n", encoding="utf-8")
     return engine_dir
 
+def test_resolve_runtime_config_has_no_home_directory_engine_default(tmp_path, monkeypatch) -> None:
+    """Absent ALGENTA_ENGINE_DIR, `engine_dir` is `None` — never `~/Developer/decision-engine`.
+
+    THE DEFECT THIS PINS. The old default guessed that path. On a user's machine it either does not exist
+    (so the failure surfaced as a missing backend, far from its cause) or it is an unrelated project that
+    happens to own the name, whose `apps.*` package Codna would import and whose Mojo daemon it would start.
+    The guess is what activated the legacy pool daemon in a probe. A believable fake checkout under HOME is
+    installed here so "None" cannot be explained by "there was nothing there".
+    """
+    fake_home = tmp_path / "home"
+    fake_checkout = fake_home / "Developer" / "decision-engine"
+    (fake_checkout / "apps" / "api_server").mkdir(parents=True)
+    (fake_checkout / "apps" / "api_server" / "main.py").write_text("app = object()\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.delenv("ALGENTA_ENGINE_DIR", raising=False)
+
+    config = resolve_runtime_config()
+
+    assert config.engine_dir is None
+    # The derived values must not point into the fake checkout either.
+    assert config.engine_build_id == ""
+    assert str(fake_checkout) not in config.engine_env_file.as_posix()
+    assert not config.engine_env_file.as_posix().startswith(str(fake_home / "Developer"))
+
+
+def test_resolve_runtime_config_engine_dir_comes_from_the_env_var_only(tmp_path, monkeypatch) -> None:
+    engine_dir = _write_fake_engine_checkout(tmp_path)
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.setenv("ALGENTA_ENGINE_DIR", str(engine_dir))
+    monkeypatch.delenv("ALGENTA_ENGINE_PYTHON", raising=False)
+    monkeypatch.delenv("ALGENTA_ENGINE_ENV_FILE", raising=False)
+
+    config = resolve_runtime_config()
+
+    assert config.engine_dir == engine_dir
+    # An explicitly supplied checkout still drives the env file, and the build id is a real fingerprint.
+    assert config.engine_env_file == engine_dir / ".env"
+    assert config.engine_build_id != ""
+
+
+def test_resolve_runtime_config_hash_distinguishes_unset_from_set_engine_dir(tmp_path, monkeypatch) -> None:
+    """A hash that conflated the two would let a stale runtime be reused after the checkout changed state."""
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    engine_dir = _write_fake_engine_checkout(tmp_path)
+    monkeypatch.delenv("ALGENTA_ENGINE_DIR", raising=False)
+    unset = resolve_runtime_config()
+
+    monkeypatch.setenv("ALGENTA_ENGINE_DIR", str(engine_dir))
+    configured = resolve_runtime_config()
+
+    assert unset.runtime_config_hash != configured.runtime_config_hash
+
+
+def test_require_engine_dir_refuses_with_a_coded_error_naming_the_variable(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.delenv("ALGENTA_ENGINE_DIR", raising=False)
+    config = resolve_runtime_config()
+
+    with pytest.raises(RuntimeConfigError) as excinfo:
+        config_module.require_engine_dir(config, consumer="the local FastAPI engine runtime")
+
+    assert excinfo.value.code == "engine_dir_unset"
+    assert excinfo.value.details["required_env"] == "ALGENTA_ENGINE_DIR"
+    assert excinfo.value.details["consumer"] == "the local FastAPI engine runtime"
+    assert "ALGENTA_ENGINE_DIR" in str(excinfo.value)
+
+
+def test_require_engine_dir_returns_the_explicit_checkout(tmp_path, monkeypatch) -> None:
+    engine_dir = _write_fake_engine_checkout(tmp_path)
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.setenv("ALGENTA_ENGINE_DIR", str(engine_dir))
+    config = resolve_runtime_config()
+
+    assert config_module.require_engine_dir(config, consumer="anything") == engine_dir
+
+
+def test_engine_spawn_refuses_when_no_checkout_is_named(tmp_path, monkeypatch) -> None:
+    """The FastAPI engine executes out of the checkout, so its spawn is one of the refusal sites."""
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.delenv("ALGENTA_ENGINE_DIR", raising=False)
+    config = resolve_runtime_config()
+
+    with pytest.raises(LocalRuntimeError) as excinfo:
+        local_stack_module._engine_spawn(config, "runtime-1")
+
+    assert excinfo.value.code == "engine_dir_unset"
+    assert excinfo.value.details["required_env"] == "ALGENTA_ENGINE_DIR"
+
+
+def test_start_runtime_refuses_before_spawning_a_sidecar(tmp_path, monkeypatch) -> None:
+    """Refusing late would leave the sidecar running for a runtime that can never become healthy."""
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.delenv("ALGENTA_ENGINE_DIR", raising=False)
+    config = resolve_runtime_config()
+    spawned: list[object] = []
+
+    monkeypatch.setattr(
+        local_stack_module,
+        "spawn_detached_process",
+        lambda *args, **kwargs: spawned.append((args, kwargs)),
+    )
+
+    with pytest.raises(LocalRuntimeError) as excinfo:
+        local_stack_module._start_runtime(config)
+
+    assert excinfo.value.code == "engine_dir_unset"
+    assert spawned == [], "nothing may be spawned for a runtime with no engine checkout"
+
+
+def test_ensure_running_surfaces_engine_dir_unset_in_the_runtime_error_shape(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    monkeypatch.delenv("ALGENTA_ENGINE_DIR", raising=False)
+    monkeypatch.delenv("CODNA_ENGINE_URL", raising=False)
+    monkeypatch.delenv("ALGENTA_ENGINE_URL", raising=False)
+    monkeypatch.delenv("ALGENTA_BASE_URL", raising=False)
+    # Hermetic: the machine's own listeners must not turn this into a collision instead of the refusal.
+    monkeypatch.setattr(
+        local_stack_module,
+        "inspect_runtime",
+        lambda **_kwargs: {"status": "not_running"},
+    )
+
+    with pytest.raises(LocalRuntimeError) as excinfo:
+        ensure_running()
+
+    assert excinfo.value.code == "engine_dir_unset"
+    assert excinfo.value.details["required_env"] == "ALGENTA_ENGINE_DIR"
+
+
 def test_resolve_runtime_config_defaults_to_fixed_ports(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
     monkeypatch.delenv("CODNA_ENGINE_URL", raising=False)

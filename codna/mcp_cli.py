@@ -14,6 +14,16 @@ def _die(message: str) -> None:
 def cmd_mcp(args, die=None) -> int:
     die = die or _die
     action = getattr(args, "action", "start") or "start"
+    if action == "browser":
+        # Status only. It reads the switch and the launch configuration and prints them; it never starts
+        # the browser, so it is safe to run anywhere — including CI and a machine with no Node.
+        from .browser_tool import browser_tool_state
+
+        state = browser_tool_state()
+        print(json.dumps(state, indent=2))
+        # A configured-but-invalid setting is a failure: the user asked what is wrong and "off" is not the
+        # answer. "Off" and "on but missing npx" are both successful answers to the question.
+        return 1 if state.get("error") else 0
     if action == "install":
         from .mcp_install import McpInstallError, install
 

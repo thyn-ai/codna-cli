@@ -77,6 +77,8 @@ __all__ = [
     "CheckpointOutcome",
     "CheckpointRequest",
     "ContractError",
+    "DelegationPolicyOutcome",
+    "DelegationPolicyRequest",
     "EpisodeOutcome",
     "EpisodeRequest",
     "GRAPH_ENGINES",
@@ -85,6 +87,7 @@ __all__ = [
     "MAX_STEER_NOTE_CHARS",
     "MAX_STEER_NOTES",
     "NAME_CHECKPOINT",
+    "NAME_DELEGATION_POLICY",
     "NAME_EPISODE",
     "NAME_NOTIFY",
     "NAME_OPEN_PR",
@@ -158,6 +161,8 @@ from .goal_contracts import (  # noqa: E402
 # something ABOUT a run, and none of them can change what a turn does. Re-exported so every caller
 # keeps importing one module.
 from .contracts_bookkeeping import (  # noqa: E402
+    DelegationPolicyOutcome,
+    DelegationPolicyRequest,
     EpisodeRequest,
     NotifyRequest,
     WorktreeCleanupOutcome,
@@ -211,6 +216,10 @@ NAME_REVIEW: Final = "codna.step.review"
 NAME_OPEN_PR: Final = "codna.step.open_pr"
 NAME_EPISODE: Final = "codna.step.episode"
 NAME_NOTIFY: Final = "codna.step.notify"
+# Run-level, scheduled once by `RunWorkflow` before its first turn: reads the repository policy to
+# say whether the delegation FLAGS the run carried can actually reach the model. It is an activity
+# because it touches the filesystem, which the workflow sandbox refuses.
+NAME_DELEGATION_POLICY: Final = "codna.step.delegation_policy"
 
 # D5 goal mode: the ceiling on the plan-side goal block a `TaskSpec` may carry. Generous for an
 # objective plus four episodes, small enough that a run cannot smuggle a transcript into history.

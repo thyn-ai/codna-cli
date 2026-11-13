@@ -73,12 +73,14 @@ from .contracts import (
     WorktreeCleanupOutcome,
     WorktreeCleanupRequest,
 )
+from .delegation_policy import delegation_policy as _read_delegation_policy
 from .ledger import RunLedger
 from .state import AskRef, CheckpointRef, TaskState, TaskStateError, VerifyRef
 from .worktree import remove_run_worktrees
 
 __all__ = [
     "checkpoint_turn",
+    "delegation_policy",
     "notify",
     "open_pr",
     "plan_task",
@@ -812,6 +814,14 @@ def _note_cleanup(
     if failed is not None:
         payload["failed"] = failed
     runtime.ledger(request.run_id).append("note", task_id=None, payload=payload)
+
+
+# The activity's BODY lives in `delegation_policy`, a module that imports no workflow runtime: the read
+# is a function of its request plus one file, so asserting its answer (and the sentence built from it)
+# must not require the OPTIONAL `durable` extra. Re-exported as the SAME object rather than wrapped, on
+# the rule `activities.py` follows for every step: the registered activity, the graph's direct call and
+# a test's call are one function, not three lookalikes.
+delegation_policy = _read_delegation_policy
 
 
 def notify(request: NotifyRequest) -> NotifyOutcome:

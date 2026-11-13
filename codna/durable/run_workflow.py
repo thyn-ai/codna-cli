@@ -371,68 +371,15 @@ class RunWorkflow:
         return self.completion("completed")
 
     async def _report_capabilities(self, spec: RunSpec) -> None:
-        """Record what the engine path DOES and does not carry, ONCE, at the start of a run (D5).
+        """Record what the engine path DOES and does not carry, ONCE, at the start of a run (D5/D7).
 
-        MCP is reported in BOTH directions, and the two notes mean different things: an operator who
-        configured servers learns from the run which ones were handed to the engine, and an operator
-        who configured none reads that the field exists rather than assuming their IDE-level server
-        was consulted. A one-sided note (only "not attached") cannot distinguish "carried" from
-        "silently dropped", which is the confusion this whole area exists to remove.
-
-        Deliberately a notification, not a failure: a run must not refuse to start because one
-        optional integration is unavailable, and the information is only actionable for an operator
-        who expected it.
+        The sentences and the policy verdict live in `capability_report` (split out at the
+        repository's line ceiling). This method only supplies the workflow's own notifier, so the
+        report cannot grow a second way of reaching the ledger.
         """
-        from .rules import mcp_attachment_state
-        from .swarm import swarm_attachment_state
+        from .capability_report import report_capabilities
 
-        # Built from the RUN's own tasks, not from an empty context: a note that said "no servers
-        # configured" for a run whose tasks all configured one would be the exact wrong-audit-note this
-        # reporting exists to avoid. A run's tasks may differ, so the union is what was carried.
-        servers = tuple(
-            server
-            for task in spec.tasks
-            for server in task.mcp_servers
-            if server.get("disabled") is not True
-        )
-        attachment = mcp_attachment_state(type("_RunMcpView", (), {"mcp_servers": servers})())
-        if attachment.attached:
-            await self._notify(
-                "note",
-                f"run {spec.run_id}: MCP is attached — servers: {', '.join(attachment.servers)}",
-            )
-        else:
-            await self._notify("note", f"run {spec.run_id}: MCP is not attached — {attachment.reason}")
-        # D7/SWARM: the same two-way report for delegation, and for the same reason — an operator who
-        # asked for a swarm learns from the run that it was carried, and one who did not reads that the
-        # field exists rather than assuming their expectation was silently ignored.
-        swarm = swarm_attachment_state(
-            type(
-                "_RunSwarmView",
-                (),
-                {
-                    "enable_spawn_agent": any(task.enable_spawn_agent for task in spec.tasks),
-                    "enable_agent_teams": any(task.enable_agent_teams for task in spec.tasks),
-                },
-            )()
-        )
-        if swarm.attached:
-            carried = [
-                name
-                for name, on in (
-                    ("enable_spawn_agent", swarm.spawn),
-                    ("enable_agent_teams", swarm.teams),
-                )
-                if on
-            ]
-            await self._notify(
-                "note",
-                f"run {spec.run_id}: delegation is attached — {', '.join(carried)}",
-            )
-        else:
-            await self._notify(
-                "note", f"run {spec.run_id}: delegation is not attached — {swarm.reason}"
-            )
+        await report_capabilities(spec, self._notify, logger=workflow.logger)
 
     async def _finalize(self, outcome: str) -> None:
         """THE run-level finalisation point: reclaim this run's per-task worktrees (D5).

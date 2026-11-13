@@ -109,6 +109,100 @@ def test_graph_does_not_import_config():
     assert "from .version import" in source
 
 
+#: Modules that must stay importable WITHOUT the OPTIONAL `durable` extra — the invariant
+#: `tests/durable/conftest.py` states and the offline CI job depends on. The extra is not installed
+#: there, so a module-scope ``from temporalio import …`` anywhere on their import chain turns
+#: "extra missing" into a collection error for whoever imports them.
+EXTRA_FREE_MODULES = (
+    # The delegation policy read and the sentence built from it: a file read and a string builder.
+    # `capability_report` used to define the sentence and imports `workflow_support` (→ temporalio),
+    # which made a PURE function need the extra to be tested; the note moved here (the activity body
+    # came with it) and the split is what this pins.
+    "codna.durable.delegation_policy",
+)
+
+
+@pytest.mark.parametrize("module", EXTRA_FREE_MODULES)
+def test_extra_free_modules_import_without_the_durable_extra(module: str):
+    """Import ``module`` in a subprocess where `temporalio`/`langgraph` CANNOT be imported.
+
+    A subprocess with a ``sys.meta_path`` blocker, not this process: the host has the extra installed
+    here and pytest may already have imported it, so an in-process check would prove nothing. The
+    blocker reproduces the offline job exactly — any module-scope import of the extra raises.
+    """
+    script = textwrap.dedent(
+        f"""
+        import importlib.abc, sys
+
+        BLOCKED = ("temporalio", "langgraph", "langchain_core", "langsmith")
+
+        class Blocker(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split(".", 1)[0] in BLOCKED:
+                    raise ModuleNotFoundError(
+                        f"No module named {{fullname!r}} (blocked: the `durable` extra)", name=fullname
+                    )
+                return None
+
+        sys.meta_path.insert(0, Blocker())
+        import {module}
+        leaked = sorted(name for name in sys.modules if name.split(".", 1)[0] in BLOCKED)
+        assert not leaked, leaked
+        print("ok")
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(CLI_DIR),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"{module} is not importable without the OPTIONAL `durable` extra:\n{completed.stderr}"
+    )
+    assert completed.stdout.strip() == "ok"
+
+
+def test_the_extra_free_guard_actually_detects_the_extra():
+    """The guard above must fail on a module that DOES import the extra, or it proves nothing.
+
+    `capability_report` is the exact module the split moved the note OUT of: it schedules an activity
+    through `workflow_support`, so it imports ``temporalio``. If the blocked subprocess above ever
+    silently allowed that import, every assertion in it would be vacuous.
+    """
+    script = textwrap.dedent(
+        """
+        import importlib.abc, sys
+
+        BLOCKED = ("temporalio",)
+
+        class Blocker(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split(".", 1)[0] in BLOCKED:
+                    raise ModuleNotFoundError(f"No module named {fullname!r}", name=fullname)
+                return None
+
+        sys.meta_path.insert(0, Blocker())
+        import codna.durable.capability_report
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(CLI_DIR),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode != 0, (
+        "`capability_report` imported successfully with `temporalio` blocked, so it no longer needs "
+        "the extra — which would make the guard above vacuous rather than a guard"
+    )
+    assert "temporalio" in completed.stderr
+
+
 def test_the_sandbox_canary_actually_detects_a_violation():
     """The guard itself is tested: a module that imports the forbidden layer IS reported.
 
