@@ -530,11 +530,15 @@ def verify_task(request: VerifyRequest) -> "ActivityOutcome":  # noqa: F821 - se
         log_path = getattr(outcome, "log_path", None) or _write_verify_log(
             active, request, plan, outcome
         )
+        environment = ""
     else:
         result = _run_in_sandbox(request, plan, tree=tree)
         passed = bool(result.accepted())
         returncode = result.returncode
-        log_path = _write_verify_log(active, request, plan, result)
+        # Which PATH this attempt ran under. A `127` is only diagnosable if the attempt records it;
+        # before this, the log showed the shell's error and nothing about where the shell looked.
+        environment = str(getattr(result, "env_note", "") or "")
+        log_path = _write_verify_log(active, request, plan, result, environment=environment)
 
     ref = f"verify/{request.context.task_id}/{plan.digest[:12]}"
     updated = replace(
@@ -552,22 +556,43 @@ def verify_task(request: VerifyRequest) -> "ActivityOutcome":  # noqa: F821 - se
             "returncode": returncode,
             "commands": list(plan.commands),
             "log_path": log_path,
+            # Empty when the injected test seam ran instead of a sandbox: there was no PATH to record.
+            "environment": environment,
         },
     )
     return ActivityOutcome(
         state=updated.to_payload(),
-        details={"verify_ref": ref, "passed": passed, "returncode": returncode},
+        details={
+            "verify_ref": ref,
+            "passed": passed,
+            "returncode": returncode,
+            "environment": environment,
+        },
     )
 
 
 def _run_in_sandbox(request: VerifyRequest, plan: VerifyPlan, *, tree: str) -> Any:
-    """Execute each command under the sandbox, in ``tree``, stopping at the first failure."""
-    from ..sandbox import Sandbox, scrub_env
+    """Execute each command under the sandbox, in ``tree``, stopping at the first failure.
 
+    The environment is the worker's own — credential-scrubbed by `scrub_env`, which is the security
+    boundary and stays untouched — with its PATH resolved against the user's login shell first. Without
+    that step a worker started by a launcher inherits a minimal PATH, so `node`, `bun` and `uv` are
+    simply not found and a correct repository verifies as `exit 127` (measured: run
+    ``run-20261113T225225Z``, `/bin/sh: node: command not found`, three attempts, correct code). The
+    decision, its cache and its failure mode live in `codna.verify_env`; this call only applies it.
+    """
+    from ..sandbox import Sandbox, scrub_env
+    from ..verify_env import resolve_verify_environment
+
+    scrubbed = scrub_env(dict(os.environ))
+    environment = resolve_verify_environment(base_env=scrubbed)
     sandbox = Sandbox(
         network="deny",
         timeout_seconds=int(request.timeout_s),
-        env=scrub_env(dict(os.environ)),
+        # A COPY: the resolved env is shared with the process-lifetime cache in `verify_env`, and a
+        # sandbox that mutated it would poison every later attempt in this worker.
+        env=dict(environment.env),
+        env_note=environment.describe(),
     )
     last: Any = None
     for command in plan.commands:
@@ -582,12 +607,21 @@ def _run_in_sandbox(request: VerifyRequest, plan: VerifyPlan, *, tree: str) -> A
 
 
 def _write_verify_log(
-    runtime: ActivityRuntime, request: VerifyRequest, plan: VerifyPlan, result: Any
+    runtime: ActivityRuntime,
+    request: VerifyRequest,
+    plan: VerifyPlan,
+    result: Any,
+    *,
+    environment: str = "",
 ) -> str:
     """Persist the output beside the ledger; return a path RELATIVE to the run directory.
 
     Relative because `VerifyRef.log_path` is validated against a reference pattern that refuses
     absolute paths — and because a run directory that moves must not invalidate its own history.
+
+    ``environment`` records which PATH the attempt ran under. A verify that fails should be explainable
+    from its own log: `127 node: not found` plus the PATH that was searched is a diagnosis, while the
+    same `127` alone is a mystery that costs an investigation every time it recurs.
     """
     logs = _run_dir(runtime.runs_root, request.context.run_id) / "verify"
     logs.mkdir(parents=True, exist_ok=True)
@@ -595,7 +629,8 @@ def _write_verify_log(
     path = logs / f"turn-{turn_seq}-{plan.digest[:12]}.log"
     body = "\n".join(f"$ {command}" for command in plan.commands)
     body += f"\n\nreturncode: {getattr(result, 'returncode', '?')}"
-    body += f"\ntimed_out: {bool(getattr(result, 'timed_out', False))}\n"
+    body += f"\ntimed_out: {bool(getattr(result, 'timed_out', False))}"
+    body += f"\nenvironment: {environment or '(injected test seam: no sandbox PATH)'}\n"
     body += "\n-- stdout --\n" + str(getattr(result, "stdout", "")) + "\n"
     body += "-- stderr --\n" + str(getattr(result, "stderr", "")) + "\n"
     path.write_text(body, encoding="utf-8")

@@ -70,6 +70,10 @@ class SandboxResult:
     argv: list[str]
     cwd: str
     network: str
+    #: How the run's PATH was decided (see `codna.verify_env`). Carried on the RESULT, not only on the
+    #: Sandbox, because the thing that must be diagnosable is the finished attempt: the run that
+    #: exited 127 has to say which PATH it exited 127 under.
+    env_note: str = ""
 
     def accepted(self, accepted_exit_codes=(0,)) -> bool:
         return (not self.timed_out) and self.returncode in tuple(accepted_exit_codes)
@@ -80,7 +84,10 @@ class Sandbox:
     network: str = "deny"
     timeout_seconds: int = 1800
     env: dict = field(default_factory=dict)
-    network_backend: object = None  # optional real egress-deny wrapper (Linux runner)
+    network_backend: object = None  # optional egress-deny wrapper (Linux runner)
+    #: Where `env["PATH"]` came from, when the caller resolved it (see `codna.verify_env`). Recorded
+    #: verbatim on every result so a failed attempt can be diagnosed from its log alone.
+    env_note: str = ""
 
     def __post_init__(self):
         # The sandbox is the enforcement boundary: it DEMANDS a clean env and raises on any
@@ -106,6 +113,10 @@ class Sandbox:
                 text=True,
                 timeout=self.timeout_seconds,
             )
-            return SandboxResult(proc.returncode, proc.stdout, proc.stderr, False, argv, cwd, self.network)
+            return SandboxResult(
+                proc.returncode, proc.stdout, proc.stderr, False, argv, cwd, self.network, self.env_note
+            )
         except subprocess.TimeoutExpired as exc:
-            return SandboxResult(124, exc.stdout or "", exc.stderr or "", True, argv, cwd, self.network)
+            return SandboxResult(
+                124, exc.stdout or "", exc.stderr or "", True, argv, cwd, self.network, self.env_note
+            )
