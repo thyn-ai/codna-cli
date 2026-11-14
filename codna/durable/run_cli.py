@@ -131,6 +131,8 @@ def run_payload_for(
     enable_agent_teams: bool = False,
     max_parallel_tasks: int = 1,
     worktree_branch: str = "",
+    auto_approve_local_only: bool = False,
+    approval_policy_digest: str = "",
 ) -> dict[str, Any]:
     """The `RunSpec` payload for one invocation, validated BEFORE anything is started.
 
@@ -180,6 +182,8 @@ def run_payload_for(
             enable_spawn_agent=enable_spawn_agent,
             enable_agent_teams=enable_agent_teams,
             worktree_branch=worktree_branch.strip(),
+            auto_approve_local_only=auto_approve_local_only,
+            approval_policy_digest=approval_policy_digest,
         )
         for index, brief in enumerate(briefs, start=1)
     )
@@ -309,7 +313,7 @@ def _worker_choice(args: Any) -> bool:
     return bool(getattr(args, "run_worker_by_default", False))
 
 
-def _require_repository_policy(repo_dir: Path) -> None:
+def _require_repository_policy(repo_dir: Path) -> tuple[bool, str]:
     """Refuse to start a durable run whose repository policy does not validate.
 
     FAIL CLOSED: this raises for every non-allowing verdict, including a MISSING file. A durable run
@@ -325,8 +329,9 @@ def _require_repository_policy(repo_dir: Path) -> None:
 
     policy_path = policy_path_for(repo_dir)
     verdict = policy_verdict(policy_path, required=True)
-    if verdict.allowed:
-        return
+    if verdict.allowed and verdict.permissions is not None:
+        enabled = verdict.permissions.approval_mode == "auto_for_low_risk"
+        return enabled, verdict.policy_digest if enabled else ""
     raise _error(
         f"the repository policy does not permit this run: {verdict.reason}",
         code=verdict.code,
@@ -341,6 +346,20 @@ def _require_repository_policy(repo_dir: Path) -> None:
             "and an unparseable or unknown-key document is refused rather than ignored"
         ),
     )
+
+
+def _optional_repository_policy(repo_dir: Path) -> tuple[bool, str]:
+    """A present policy opts in explicitly; an absent API policy stays human-gated.
+
+    This is only for the Run API, whose pre-existing contract did not require a policy file. The
+    interactive CLI and unattended trigger surfaces use `_require_repository_policy`, which requires one.
+    A malformed or unknown-key document is never treated as absent.
+    """
+    from ..policy_document import policy_path_for
+
+    if not policy_path_for(repo_dir).exists():
+        return False, ""
+    return _require_repository_policy(repo_dir)
 
 
 def _run_start_error(run_id: str, config: DurableConfig, exc: BaseException) -> Any:
@@ -536,7 +555,7 @@ def cmd_run(args: Any) -> int:
     # an operator can fix immediately, not a run that starts and then fails every turn. The sidecar
     # reads the same file through the same module on the turn path; this is the second consumer of
     # one implementation, not a second implementation.
-    _require_repository_policy(repo_dir)
+    auto_approve_local_only, approval_policy_digest = _require_repository_policy(repo_dir)
     payload = run_payload_for(
         config=config,
         run_id=run_id,
@@ -559,6 +578,8 @@ def cmd_run(args: Any) -> int:
         enable_spawn_agent=_swarm_choice(args, "spawn_agent"),
         enable_agent_teams=_swarm_choice(args, "agent_teams"),
         max_parallel_tasks=int(getattr(args, "parallel", 1) or 1),
+        auto_approve_local_only=auto_approve_local_only,
+        approval_policy_digest=approval_policy_digest,
     )
     # An implicit `ensure_started` is for the LOCAL profile only. Against Cloud there is nothing to
     # start, and a local start would happily succeed while the run then failed to connect — a

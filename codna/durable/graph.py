@@ -111,6 +111,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Awaitable, Callable, Final, Literal, Mapping
 
+from .approval_policy import AUTO_APPROVAL_RESUME, auto_approval_eligible
 from .contracts import (
     ACTIVITY_HEARTBEAT_TIMEOUT_S,
     ACTIVITY_TIMEOUT_S,
@@ -142,6 +143,7 @@ from .contracts import (
     implement_prompt,
     task_spec_from_config,
 )
+from .parking import park_reason
 from .routing import DEFAULT_MAX_ATTEMPTS, Route, after_plan, after_review, after_verify
 from .state import TaskState
 from .version import GRAPH_VERSION
@@ -273,7 +275,7 @@ _GRAPH_KEY: Final = GRAPH_NAME
 # every node therefore go through `task_state_from_graph_state`, which drops exactly these keys and
 # then validates, rather than relaxing the decoder (a decoder that ignores unknown keys would also
 # ignore a field a future change forgot to validate).
-GRAPH_INTERNAL_KEYS: Final[frozenset[str]] = frozenset({"__interrupt__"})
+GRAPH_INTERNAL_KEYS: Final[frozenset[str]] = frozenset({"__interrupt__", "auto_approved"})
 
 
 def task_state_from_graph_state(state: Mapping[str, Any]) -> TaskState:
@@ -590,6 +592,16 @@ async def wait_for_human(state: dict[str, Any]) -> dict[str, Any]:
     from langgraph.types import interrupt
 
     current = task_state_from_graph_state(state)
+    try:
+        enabled = _node_context().spec.auto_approve_local_only
+    except (ImportError, ValueError):
+        # A direct caller with no TaskSpec has no policy grant. Missing configuration is the
+        # default human path, never permission to synthesize a policy or bypass validation.
+        enabled = False
+    if auto_approval_eligible(current, enabled=enabled):
+        # This is not a human resume value and no identity is invented. The workflow recognizes
+        # this explicit sentinel and writes `auto_approved` with the validated policy's digest.
+        return {**state, "pending_approval": None, **AUTO_APPROVAL_RESUME}
     prompt = {
         "kind": "approve",
         "run_id": current.run_id,
@@ -604,6 +616,15 @@ async def wait_for_human(state: dict[str, Any]) -> dict[str, Any]:
         # skipped" instead of "pr: null" and having to guess.
         "publish_skip": current.publish_skip,
         "budget_exhausted": current.budget.exhausted,
+        # WHY the run parked, in the shared vocabulary `park_reason` already defines. Without this the
+        # graph engine cannot tell "the work is ready for a pull request" apart from "verification
+        # failed three times and the attempt budget is spent", and the approval it records says
+        # `open_pr_ready` for both. Measured (`run-20261113T225225Z`): three verify records with
+        # `passed: false` and `returncode: 127`, then an approval whose recorded reason was
+        # `open_pr_ready` — so the human gate reported the work as ready when its own verify had never
+        # passed. The prompt is the only channel that survives into `_await_decision`, which is why
+        # the reason travels here rather than being re-derived there.
+        "park_reason": park_reason(current),
     }
     decision = interrupt(prompt)
     if not isinstance(decision, dict):
@@ -692,7 +713,11 @@ def build_task_graph(
         """
 
         async def decide(state: dict[str, Any]) -> str:
-            return router(task_state_from_graph_state(state), max_attempts=max_attempts)
+            current = task_state_from_graph_state(state)
+            # Policy sentinel, not a TaskState field: never decode it as a human approval.
+            if state.get("auto_approved") is True:
+                return "wait_for_human"
+            return router(current, max_attempts=max_attempts)
 
         decide.__name__ = f"route_{router.__name__}"
         return decide

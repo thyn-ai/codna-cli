@@ -401,6 +401,10 @@ class TaskSpec:
     # Page: `worktree` must be True for this to have any effect. A shared checkout cannot be on two
     # branches at once, and the run that uses this one must not move the developer's HEAD.
     worktree_branch: str = ""
+    # A validated policy grant for terminal completion only. The CLI reads the repository policy
+    # before starting; workflows never read policy files or infer a grant during replay.
+    auto_approve_local_only: bool = False
+    approval_policy_digest: str = ""
 
     def __post_init__(self) -> None:
         # Canonicalise on construction, so the recorded payload (and therefore history, the ledger and
@@ -537,6 +541,20 @@ class TaskSpec:
             )
         except SwarmConfigError as exc:
             raise ContractError(str(exc), code=exc.code, details=exc.details) from exc
+        if not isinstance(self.auto_approve_local_only, bool):
+            raise ContractError(
+                "auto_approve_local_only must be a boolean",
+                code="contract_invalid",
+                details={"field": "auto_approve_local_only"},
+            )
+        if self.auto_approve_local_only:
+            _require_ref(self.approval_policy_digest, "approval_policy_digest")
+        elif self.approval_policy_digest:
+            raise ContractError(
+                "an approval policy digest requires auto_approve_local_only",
+                code="contract_invalid",
+                details={"field": "approval_policy_digest"},
+            )
         if not isinstance(self.worktree_branch, str):
             raise ContractError(
                 "worktree_branch must be a string",
@@ -693,6 +711,8 @@ class TaskSpec:
             "enable_spawn_agent": self.enable_spawn_agent,
             "enable_agent_teams": self.enable_agent_teams,
             "worktree_branch": self.worktree_branch,
+            "auto_approve_local_only": self.auto_approve_local_only,
+            "approval_policy_digest": self.approval_policy_digest,
         }
 
 
