@@ -28,6 +28,7 @@ from .contracts import (
     NAME_CHECKPOINT,
     NAME_DELEGATION_POLICY,
     NAME_EPISODE,
+    NAME_MCP_ATTACHMENT,
     NAME_NOTIFY,
     NAME_OPEN_PR,
     NAME_PLAN,
@@ -43,6 +44,10 @@ from .contracts import (
     TaskSummary,
 )
 from .graph import ACTIVITY_RETRIES, STEP_TIMEOUT_S
+# The park vocabulary lives in a LEAF module (`parking`) so the workflow-facing `graph.py` can read it
+# without importing this one — whose `codna.runtime` reach the workflow sandbox refuses. Re-exported
+# here because every existing caller imports it from this module.
+from .parking import park_kind, park_reason
 from .state import Budget, PendingApproval, TaskState
 
 __all__ = [
@@ -77,6 +82,8 @@ ACTIVITY_NAMES: Final[tuple[str, ...]] = (
     NAME_OPEN_PR,
     NAME_EPISODE,
     NAME_NOTIFY,
+    NAME_DELEGATION_POLICY,
+    NAME_MCP_ATTACHMENT,
     # Run-level, but listed here so `activity_timeout` can answer for it: `RunWorkflow` schedules it
     # through this module's helper like every other activity, and a name missing from this tuple is a
     # `ValueError` at schedule time rather than a silently untimed step.
@@ -119,11 +126,13 @@ def result_type(name: str) -> type:
         NotifyOutcome,
         PullRequestOutcome,
     )
-    from .contracts import DelegationPolicyOutcome, WorktreeCleanupOutcome
+    from .contracts import DelegationPolicyOutcome, McpAttachmentOutcome, WorktreeCleanupOutcome
     from .goal_contracts import RecallOutcome, WatchCiOutcome
 
     if name == NAME_DELEGATION_POLICY:
         return DelegationPolicyOutcome
+    if name == NAME_MCP_ATTACHMENT:
+        return McpAttachmentOutcome
     if name == NAME_CHECKPOINT:
         return CheckpointOutcome
     if name == NAME_OPEN_PR:
@@ -339,6 +348,8 @@ def spec_from(payload: Mapping[str, Any]) -> TaskSpec:
         # Absent before run-from-a-branch existed: `""` is "my own branch", so such a run replays
         # adopting nothing rather than being pointed at a branch it never used.
         worktree_branch=str(payload.get("worktree_branch") or ""),
+        auto_approve_local_only=payload.get("auto_approve_local_only", False),
+        approval_policy_digest=payload.get("approval_policy_digest", ""),
     )
     spec.validate()
     return spec
@@ -419,31 +430,6 @@ def run_id_of(workflow_id: str) -> str:
     payload decode, no I/O, replay-safe.
     """
     return workflow_id.split(":", 1)[1] if ":" in workflow_id else workflow_id
-
-
-def park_reason(state: TaskState) -> str:
-    """Why a task is parking, in the vocabulary `status` and the ledger use."""
-    # `answer_required` first: it is the only reason that is NOT a judgement about the work — the work
-    # has not happened yet, because the agent is waiting for a decision. Reporting it as
-    # `plan_not_produced` would send a human looking for a broken plan.
-    if state.ask is not None:
-        return "answer_required"
-    if state.budget.exhausted:
-        return "budget_exhausted"
-    if state.plan_ref is None:
-        return "plan_not_produced"
-    if state.verify_ref is None or not state.verify_ref.passed:
-        return "verify_failed"
-    return "review_not_approved"
-
-
-def park_kind(state: TaskState) -> str:
-    # `ask` is the third kind `PendingApproval` already declares: a parked run whose approval releases a
-    # specific tool call, not a whole task. Keeping it distinct is what lets a UI render the engine's
-    # question instead of a generic "approve this task".
-    if state.ask is not None:
-        return "ask"
-    return "budget" if state.budget.exhausted else "approve"
 
 
 def park_approval(state: TaskState, reason: str) -> PendingApproval:

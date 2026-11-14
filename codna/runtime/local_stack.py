@@ -98,6 +98,9 @@ def _runtime_env(config: RuntimeConfig, runtime_id: str) -> dict[str, str]:
         "CODNA_SIDECAR_PORT": str(config.sidecar_port),
         "CODNA_CLI_VERSION": config.codna_cli_version,
         "CODNA_ENGINE_BUILD_ID": config.engine_build_id,
+        # `config.sidecar_build_id` is the verified desktop stamp when the app supplied one, otherwise
+        # the normal source/install fingerprint. This is the exact value `/health` reports and the
+        # readiness gate compares; never recompute a different identity after the binary was chosen.
         "CODNA_SIDECAR_BUILD_ID": config.sidecar_build_id,
         "RUNTIME_FALLBACK_MODE": "deny",
     }

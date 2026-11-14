@@ -63,7 +63,7 @@ def schedule_definition_for(args: Any, config: DurableConfig) -> Any:
     validation reachable only through a live namespace would put the cheapest possible check behind
     the most expensive possible setup.
     """
-    from .run_cli import _error, run_payload_for
+    from .run_cli import _require_repository_policy, _error, run_payload_for
     from .run_cli import _worktree_choice
     from .schedule import ScheduleDefinition, ScheduleError, schedule_id_for
 
@@ -84,6 +84,7 @@ def schedule_definition_for(args: Any, config: DurableConfig) -> Any:
         )
     repo_dir = _cli._repo_dir(args.repo)
     base_run_id = validate_run_id(args.run_id or _cli._new_run_id())
+    auto_approve, policy_digest = _require_repository_policy(repo_dir)
     payload = run_payload_for(
         config=config,
         run_id=base_run_id,
@@ -100,6 +101,8 @@ def schedule_definition_for(args: Any, config: DurableConfig) -> Any:
         base_url=getattr(args, "base_url", None),
         provider_key_source=getattr(args, "provider_key_source", None),
         worktree=_worktree_choice(args),
+        auto_approve_local_only=auto_approve,
+        approval_policy_digest=policy_digest,
     )
     payload["run_id"] = f"{base_run_id}-scheduled"
     definition = ScheduleDefinition(
@@ -198,7 +201,7 @@ def cmd_trigger(args: Any) -> int:
     of starting a second. This is the local, single-delivery form of what the App's ingress does; it
     exists so the property is exercisable (and testable) without a live GitHub App.
     """
-    from .run_cli import _error, run_payload_for, _worktree_choice
+    from .run_cli import _require_repository_policy, _error, run_payload_for, _worktree_choice
     from .trigger import (
         WebhookDispatch,
         WebhookTriggerError,
@@ -237,6 +240,7 @@ def cmd_trigger(args: Any) -> int:
         reason="manual trigger",
     )
     run_id = run_id_for_delivery(delivery, kind)
+    auto_approve, policy_digest = _require_repository_policy(repo_dir)
     payload = run_payload_for(
         config=config,
         run_id=run_id,
@@ -249,6 +253,8 @@ def cmd_trigger(args: Any) -> int:
         max_attempts=getattr(args, "max_attempts", 3),
         engine=getattr(args, "engine", None) or config.graph_engine,
         worktree=_worktree_choice(args),
+        auto_approve_local_only=auto_approve,
+        approval_policy_digest=policy_digest,
     )
     payload["goal"] = goal_for_webhook(objective=brief).to_payload()
     dispatch = WebhookDispatch(
