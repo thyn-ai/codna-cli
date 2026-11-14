@@ -249,6 +249,14 @@ class WorkerSettings:
     pool_name: str | None = None
     pool_workers: int | None = None
     pool_state: str | None = None
+    # THE APP'S SUPERVISION CONTRACT. True when this process was started BY the IDE and must therefore
+    # stop when that app goes away (`--guard-parent-pid`). False for a worker a human typed, which must
+    # behave exactly as it always did: a terminal running `codna worker` is not a supervisor and losing
+    # it is not a reason to abandon an in-flight turn. See `parent_guard.py` for the mechanism.
+    guard_parent: bool = False
+    # The exact parent pid the desktop named. `True` without this value is not a supervision contract: it
+    # could silently guard a different process if the child was reparented between spawn and startup.
+    guard_parent_pid: int | None = None
     # D6: HOW to authenticate, resolved from the config and called at connect time. A zero-argument
     # callable rather than a resolved dict so the credential is read as late as possible (a rotation
     # between settings-resolution and connect is honoured), and a plain function rather than a
@@ -285,6 +293,10 @@ class WorkerSettings:
             "pool": self.pool_name,
             "pool_workers": self.pool_workers,
             "pool_state": self.pool_state,
+            # The supervision contract, stated in the banner: True means this worker stops with the app
+            # that forked it (`--guard-parent-pid`), False means it is a hand-run worker with no owner.
+            "guard_parent": self.guard_parent,
+            "guard_parent_pid": self.guard_parent_pid,
         }
 
 
@@ -297,6 +309,8 @@ def worker_settings_from_config(
     promote_current: bool = True,
     engine: str | None = None,
     env: Mapping[str, str] | None = None,
+    guard_parent: bool = False,
+    guard_parent_pid: int | None = None,
 ) -> WorkerSettings:
     """Resolve the worker's settings from the durable config, validating the concurrency cap.
 
@@ -360,6 +374,8 @@ def worker_settings_from_config(
         pool_workers=config.pool.workers if config.pool else None,
         pool_state=config.pool.state if config.pool else None,
         connect_options=config.connect_options,
+        guard_parent=guard_parent,
+        guard_parent_pid=guard_parent_pid,
     )
 
 

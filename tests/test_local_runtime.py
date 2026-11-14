@@ -513,6 +513,32 @@ def test_sidecar_spawn_bundled_binary_redirects_proofs_to_writable_root(tmp_path
     assert env["AGENT_CORE_ROOT_DIR"] == str(config.cline_data_dir)
 
 
+def test_stamped_sidecar_build_id_is_preserved_and_forwarded_to_health(tmp_path, monkeypatch) -> None:
+    """The desktop host reads the build stamp beside its bundled binary and passes that ID into Python.
+
+    `agent_core_runtime`'s health gate compares `/health`'s `build_id` with `config.sidecar_build_id`,
+    so if this spawn recomputed a source fingerprint, the shipped binary would fail readiness even though
+    its own `/health` correctly reported the stamp. This test proves the same ID crosses both boundaries:
+    env → `RuntimeConfig` → sidecar child env.
+    """
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
+    binary = tmp_path / "codna-sidecar"
+    binary.write_bytes(b"\x7fELF fake sidecar")
+    binary.chmod(0o755)
+    monkeypatch.setenv("CODNA_SIDECAR_BINARY", str(binary))
+    monkeypatch.setenv("CODNA_SIDECAR_BUILD_ID", "branch-c2ec211a")
+    monkeypatch.setenv("CODNA_CLI_VERSION", "0.2.114")
+    monkeypatch.setattr(local_stack_module.shutil, "which", lambda name: None)
+
+    config = resolve_runtime_config()
+    command, _cwd, env = local_stack_module._sidecar_spawn(config, "runtime-1")
+
+    assert config.sidecar_build_id == "branch-c2ec211a"
+    assert command == [str(binary)]
+    assert env["CODNA_SIDECAR_BUILD_ID"] == "branch-c2ec211a"
+    assert env["CODNA_CLI_VERSION"] == "0.2.114"
+
+
 def test_runtime_child_env_uses_keys_file_values_without_runtime_url_authority(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / ".codna"))
     monkeypatch.setenv("ALGENTA_ENGINE_DIR", str(_write_fake_engine_checkout(tmp_path)))
