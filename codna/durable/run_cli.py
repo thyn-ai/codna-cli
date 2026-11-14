@@ -131,6 +131,8 @@ def run_payload_for(
     enable_agent_teams: bool = False,
     max_parallel_tasks: int = 1,
     worktree_branch: str = "",
+    auto_approve_local_only: bool = False,
+    approval_policy_digest: str = "",
 ) -> dict[str, Any]:
     """The `RunSpec` payload for one invocation, validated BEFORE anything is started.
 
@@ -180,6 +182,8 @@ def run_payload_for(
             enable_spawn_agent=enable_spawn_agent,
             enable_agent_teams=enable_agent_teams,
             worktree_branch=worktree_branch.strip(),
+            auto_approve_local_only=auto_approve_local_only,
+            approval_policy_digest=approval_policy_digest,
         )
         for index, brief in enumerate(briefs, start=1)
     )
@@ -309,7 +313,7 @@ def _worker_choice(args: Any) -> bool:
     return bool(getattr(args, "run_worker_by_default", False))
 
 
-def _require_repository_policy(repo_dir: Path) -> None:
+def _require_repository_policy(repo_dir: Path) -> tuple[bool, str]:
     """Refuse to start a durable run whose repository policy does not validate.
 
     FAIL CLOSED: this raises for every non-allowing verdict, including a MISSING file. A durable run
@@ -325,8 +329,9 @@ def _require_repository_policy(repo_dir: Path) -> None:
 
     policy_path = policy_path_for(repo_dir)
     verdict = policy_verdict(policy_path, required=True)
-    if verdict.allowed:
-        return
+    if verdict.allowed and verdict.permissions is not None:
+        enabled = verdict.permissions.approval_mode == "auto_for_low_risk"
+        return enabled, verdict.policy_digest if enabled else ""
     raise _error(
         f"the repository policy does not permit this run: {verdict.reason}",
         code=verdict.code,
@@ -341,6 +346,20 @@ def _require_repository_policy(repo_dir: Path) -> None:
             "and an unparseable or unknown-key document is refused rather than ignored"
         ),
     )
+
+
+def _optional_repository_policy(repo_dir: Path) -> tuple[bool, str]:
+    """A present policy opts in explicitly; an absent API policy stays human-gated.
+
+    This is only for the Run API, whose pre-existing contract did not require a policy file. The
+    interactive CLI and unattended trigger surfaces use `_require_repository_policy`, which requires one.
+    A malformed or unknown-key document is never treated as absent.
+    """
+    from ..policy_document import policy_path_for
+
+    if not policy_path_for(repo_dir).exists():
+        return False, ""
+    return _require_repository_policy(repo_dir)
 
 
 def _run_start_error(run_id: str, config: DurableConfig, exc: BaseException) -> Any:
@@ -536,7 +555,7 @@ def cmd_run(args: Any) -> int:
     # an operator can fix immediately, not a run that starts and then fails every turn. The sidecar
     # reads the same file through the same module on the turn path; this is the second consumer of
     # one implementation, not a second implementation.
-    _require_repository_policy(repo_dir)
+    auto_approve_local_only, approval_policy_digest = _require_repository_policy(repo_dir)
     payload = run_payload_for(
         config=config,
         run_id=run_id,
@@ -559,6 +578,8 @@ def cmd_run(args: Any) -> int:
         enable_spawn_agent=_swarm_choice(args, "spawn_agent"),
         enable_agent_teams=_swarm_choice(args, "agent_teams"),
         max_parallel_tasks=int(getattr(args, "parallel", 1) or 1),
+        auto_approve_local_only=auto_approve_local_only,
+        approval_policy_digest=approval_policy_digest,
     )
     # An implicit `ensure_started` is for the LOCAL profile only. Against Cloud there is nothing to
     # start, and a local start would happily succeed while the run then failed to connect — a
@@ -623,75 +644,31 @@ def cmd_run(args: Any) -> int:
 
 
 def cmd_worker(args: Any) -> int:
-    """`codna worker` / `codna durable worker`: poll this host's queue until a signal."""
-    from . import require_durable
-    from .worker import run_worker_sync, worker_settings_from_config
+    """`codna worker` / `codna durable worker`: poll this host's queue until a signal.
 
-    require_durable()
-    config = _cli._config(args)
-    # Both spellings mean the same thing: "--dev-server" is the plan's name for it, and
-    # "--start-dev-server" is what earlier commands already used. Refusing neither keeps a script that
-    # used one working after the other was added.
-    #
-    # `--start-dev-server` on a Cloud config is a REFUSAL rather than a no-op: the flag asks for a
-    # local server, and silently ignoring it would leave an operator believing one is running. (A
-    # Cloud worker does not need it — Cloud is already up.)
-    if getattr(args, "start_dev_server", False) or getattr(args, "dev_server", False):
-        server = _cli._dev_server(config)  # raises `durable_dev_server_not_applicable` for cloud
-        with _cli._dev_server_errors():
-            server.ensure_started(timeout_s=args.start_timeout)
-    settings = worker_settings_from_config(
-        config,
-        max_concurrent_activities=args.max_concurrent_activities,
-        ensure_sidecar=not args.no_sidecar,
-        grace_period_s=args.grace_period,
-        promote_current=not args.no_promote,
-        engine=getattr(args, "engine", None),
-    )
-    _cli._print({"worker": settings.to_payload()})
-    return run_worker_sync(settings)
+    Delegated to `worker_cli` so this module keeps the commands that START a run and the parser
+    registration, under the repository's 1000-line ceiling.
+    """
+    from .worker_cli import cmd_worker as _worker_cmd
+
+    return int(_worker_cmd(args))
 
 
 # -- parser registration -------------------------------------------------------------------
 
 
 def add_worker_execution_flags(worker: Any) -> None:
-    """The flags that control HOW a worker executes — the ones a run also needs in-process.
+    """The worker execution flags live in `worker_cli.py` (see `tests/test_modularity.py`)."""
+    from .worker_cli import add_worker_execution_flags as _add
 
-    Disjoint from `add_run_flags`: a parser that receives both sets must not see one option string
-    twice (`--start-timeout` and `--engine` belong to the run set), because argparse refuses a
-    duplicate outright. Keeping the split here means each flag has exactly one owner.
-    """
-    worker.add_argument("--max-concurrent-activities", type=int, default=2,
-                        help="how many steps may run at once (default: 2)")
-    worker.add_argument("--no-sidecar", action="store_true",
-                        help="do not ensure agent-core is running (connect to what is there)")
-    worker.add_argument("--grace-period", type=float, default=10.0,
-                        help="seconds to let in-flight steps finish on shutdown")
-    worker.add_argument("--no-promote", action="store_true",
-                        help="do not make this build the deployment's current version when none is")
-    worker.add_argument("--start-dev-server", action="store_true",
-                        help="start the local Temporal dev server if it is not running")
-    worker.add_argument("--dev-server", action="store_true",
-                        help="start the local dev server if it is not running "
-                             "(the same thing as --start-dev-server)")
+    _add(worker)
 
 
 def add_worker_flags(worker: Any) -> None:
     """The full `worker` flag set. One definition for both surfaces (`codna worker`, `durable worker`)."""
-    add_worker_execution_flags(worker)
-    worker.add_argument("--start-timeout", type=float, default=60.0, help="dev-server start timeout")
-    worker.add_argument("--engine", choices=("langgraph", "plain"),
-                        help="graph engine (default from config)")
-    # WHICH SERVER. `--temporal-profile cloud` is the flag form of `CODNA_TEMPORAL_PROFILE=cloud`, so
-    # a worker can be pointed at Temporal Cloud without editing a file or exporting a variable into
-    # the shell that later runs something else. `None` means "decide from the environment" (see
-    # `config._resolve_profile`), which is what keeps the local default byte-for-byte unchanged.
-    # It belongs to the WORKER set (not the execution set) because `codna run` deliberately keeps the
-    # server choice for itself: an in-process worker must poll the same server the run was started on.
-    worker.add_argument("--temporal-profile", choices=("local", "cloud"), default=None,
-                        help="which Temporal server: 'local' (dev server) or 'cloud' (TLS + API key); "
-                             "default: inferred from TEMPORAL_* / CODNA_TEMPORAL_PROFILE")
+    from .worker_cli import add_worker_flags as _add
+
+    _add(worker)
 
 
 def add_run_flags(run: Any, *, brief_required: bool = False) -> None:

@@ -44,6 +44,7 @@ from .browser_tool import (
     browser_server_args,
     browser_tool_config,
     playwright_tool_for,
+    screenshot_output_path,
 )
 
 __all__ = [
@@ -645,24 +646,13 @@ def screenshot_paths(output_dir: str, filename: str) -> tuple[str, str]:
     therefore a plain relative path under the browser output directory; an absolute path or ``..`` is
     REFUSED rather than clamped, because silently relocating a write is its own confusion.
     """
-    root = os.path.abspath(output_dir)
     name = (filename or "").strip() or f"page-{time.strftime('%Y%m%dT%H%M%S')}.png"
-    if os.path.isabs(name) or name.startswith("~"):
-        raise BrowserToolError(
-            f"screenshot filenames are relative to the browser output directory ({root}); "
-            "an absolute path is refused",
-            code="browser_screenshot_path_invalid",
-            details={"filename": name},
-        )
-    absolute = os.path.abspath(os.path.join(root, name))
-    if os.path.commonpath([root, absolute]) != root:
-        raise BrowserToolError(
-            f"screenshot filenames must stay inside the browser output directory ({root}); "
-            "'..' is refused",
-            code="browser_screenshot_path_invalid",
-            details={"filename": name},
-        )
-    return name, absolute
+    try:
+        return screenshot_output_path(output_dir, name)
+    except BrowserToolConfigError as exc:
+        # Same refusal, carried into this module's error family so a caller catching `BrowserToolError`
+        # still sees the code and the offending value rather than a foreign exception type.
+        raise BrowserToolError(str(exc), code=exc.code, details=exc.details) from exc
 
 
 def _mime_for(path: str) -> str:

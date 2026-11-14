@@ -458,7 +458,18 @@ def resolve_runtime_config(
             (".ts", ".js", ".mjs", ".json"),
         ),
     ]
-    sidecar_build_id = _composite_fingerprint(_sidecar_fingerprint_targets)
+    sidecar_build_id = (
+        # A caller that already read and verified the stamp beside its exact binary (the desktop host
+        # does this through `sidecarStamp`) passes that identity into the worker. Preserve it verbatim:
+        # `/health` reports CODNA_SIDECAR_BUILD_ID, and the runtime's health gate compares that value
+        # with `config.sidecar_build_id`. Replacing the verified stamp with a source-tree fingerprint
+        # here made the health endpoint answer a different build from the bytes the worker launched.
+        #
+        # This is an explicit, per-process identity override, not a fallback: when it is absent the
+        # source checkout / installed-package fingerprint remains exactly what it was.
+        (resolved_env.get("CODNA_SIDECAR_BUILD_ID") or "").strip()
+        or _composite_fingerprint(_sidecar_fingerprint_targets)
+    )
     config_hash = _runtime_config_hash(
         {
             "port_base": port_base,

@@ -30,14 +30,28 @@ the report instead of re-reading a file that may have changed since.
 it imports ``temporalio`` through `workflow_support`; the pure string builder and the pure read must
 NOT, or asserting either would require the OPTIONAL extra. They are imported here — and re-exported,
 so every existing caller keeps importing this module — rather than duplicated.
+
+**The MCP note follows the same rule, for the same measured reason.** `capability_notes`, its
+`declared_mcp_servers` helper and `mcp_attachment_note` live in `capability_notes`, which imports only
+stdlib, typing, ``contracts``, ``mcp`` and ``swarm``. They were defined HERE when first written, and a
+test importing them turned "extra not installed" into ``ModuleNotFoundError: No module named
+'temporalio'`` on the offline lane — the regression `tests/durable/test_import_hygiene.py` now pins.
+Re-exported below, so a caller that already imports this module is unaffected.
 """
 from __future__ import annotations
 
 from typing import Any, Protocol
 
+from .capability_notes import (
+    capability_notes,
+    declared_mcp_servers,
+    mcp_attachment_note,
+)
 from .contracts import (
     NAME_DELEGATION_POLICY,
+    NAME_MCP_ATTACHMENT,
     DelegationPolicyRequest,
+    McpAttachmentRequest,
     RunSpec,
 )
 from .delegation_policy import delegation_policy_note
@@ -45,7 +59,9 @@ from .workflow_support import workflow_activity
 
 __all__ = [
     "capability_notes",
+    "declared_mcp_servers",
     "delegation_policy_note",
+    "mcp_attachment_note",
     "report_capabilities",
 ]
 
@@ -54,56 +70,6 @@ class _Notifier(Protocol):
     """The one capability this module needs from the workflow: append a ledger row."""
 
     async def __call__(self, kind: str, message: str, *, repo_dir: str = "") -> None: ...
-
-
-def capability_notes(spec: RunSpec) -> list[tuple[str, str]]:
-    """The MCP and delegation notes this run should carry, as ``(kind, message)`` pairs.
-
-    PURE, so the sentences are testable without a workflow, a sandbox or a sidecar. The delegation
-    entry says only that the flags were CARRIED; whether the policy lets them act is the activity's
-    answer, appended by `report_capabilities`.
-    """
-    from .rules import mcp_attachment_state
-    from .swarm import swarm_attachment_state
-
-    # Built from the RUN's own tasks, not from an empty context: a note that said "no servers
-    # configured" for a run whose tasks all configured one would be the exact wrong-audit-note this
-    # reporting exists to avoid. A run's tasks may differ, so the union is what was carried.
-    servers = tuple(
-        server
-        for task in spec.tasks
-        for server in task.mcp_servers
-        if server.get("disabled") is not True
-    )
-    attachment = mcp_attachment_state(type("_RunMcpView", (), {"mcp_servers": servers})())
-    if attachment.attached:
-        mcp = f"run {spec.run_id}: MCP is attached — servers: {', '.join(attachment.servers)}"
-    else:
-        mcp = f"run {spec.run_id}: MCP is not attached — {attachment.reason}"
-
-    swarm = swarm_attachment_state(
-        type(
-            "_RunSwarmView",
-            (),
-            {
-                "enable_spawn_agent": any(task.enable_spawn_agent for task in spec.tasks),
-                "enable_agent_teams": any(task.enable_agent_teams for task in spec.tasks),
-            },
-        )()
-    )
-    if swarm.attached:
-        carried = [
-            name
-            for name, on in (
-                ("enable_spawn_agent", swarm.spawn),
-                ("enable_agent_teams", swarm.teams),
-            )
-            if on
-        ]
-        delegation = f"run {spec.run_id}: delegation is attached — {', '.join(carried)}"
-    else:
-        delegation = f"run {spec.run_id}: delegation is not attached — {swarm.reason}"
-    return [("note", mcp), ("note", delegation)]
 
 
 async def report_capabilities(
@@ -118,17 +84,84 @@ async def report_capabilities(
     optional integration is unavailable, and the information is only actionable for an operator who
     expected it. That is also why the activity result is read defensively — a report about a run must
     never be able to fail the run.
-    """
-    for kind, message in capability_notes(spec):
-        await notify(kind, message)
 
-    enable_agent_teams = any(task.enable_agent_teams for task in spec.tasks)
-    if not enable_agent_teams:
-        # Only a run that asked to form a team can have its team tools stripped. Asking an activity
-        # here would spend a round trip to learn nothing.
+    **Both answers come from ACTIVITIES, and that is what makes them true.** The MCP answer depends on
+    the WORKER's environment (``CODNA_BROWSER_TOOL``, ``CODNA_MCP_SERVERS``), which a workflow may not
+    read; the delegation answer depends on the repository's policy file, for the same reason. Asking in
+    an activity also puts each answer in history, so a replay derives these rows instead of re-reading a
+    variable or a file that may have changed since.
+    """
+    enough = _declared_delegation_carried(spec)
+    message = await _mcp_note(spec, logger=logger)
+    if message is not None:
+        await notify("note", message)
+    await notify("note", _delegation_carried_note(spec, enough))
+    if not enough:
         return
+    verdict = await _delegation_policy_verdict(spec, logger=logger)
+    if verdict is None:
+        return
+    policy_message = delegation_policy_note(
+        spec.run_id,
+        tuple(getattr(verdict, "stripped", ()) or ()),
+        str(getattr(verdict, "policy_path", "") or ""),
+    )
+    if policy_message is not None:
+        await notify("note", policy_message)
+
+
+async def _mcp_note(spec: RunSpec, *, logger: Any = None) -> str | None:
+    """The MCP row, from the ``mcp_attachment`` activity; ``None`` when even that could not be asked."""
+    request = McpAttachmentRequest(run_id=spec.run_id, servers=declared_mcp_servers(spec))
     try:
-        verdict = await workflow_activity(
+        outcome = await workflow_activity(NAME_MCP_ATTACHMENT, request)
+    except Exception as exc:  # noqa: BLE001 - a report must never fail a run
+        if logger is not None:
+            logger.warning(
+                "run %s: MCP attachment report failed: %r (cause: %r)",
+                spec.run_id, exc, getattr(exc, "cause", None),
+            )
+        return None
+    return mcp_attachment_note(spec.run_id, outcome)
+
+
+def _declared_delegation_carried(spec: RunSpec) -> bool:
+    """Whether the run CARRIED a delegation flag — the gate on asking the policy at all.
+
+    Only a run that asked to spawn agents or form a team can have its delegation tools stripped, so a run
+    that carried neither schedules no policy read: it would spend a round trip to learn nothing.
+    """
+    return any(
+        task.enable_spawn_agent or task.enable_agent_teams for task in spec.tasks
+    )
+
+
+def _delegation_carried_note(spec: RunSpec, carried: bool) -> str:
+    """The delegation row BEFORE the policy verdict: what the run asked for, and whether it was kept.
+
+    Built here rather than in `capability_notes` because the workflow path must not touch `swarm`'s
+    module-level state from workflow code; the sentence is a function of the spec alone.
+    """
+    if carried:
+        names = [
+            name
+            for name, on in (
+                ("enable_spawn_agent", any(t.enable_spawn_agent for t in spec.tasks)),
+                ("enable_agent_teams", any(t.enable_agent_teams for t in spec.tasks)),
+            )
+            if on
+        ]
+        return f"run {spec.run_id}: delegation is attached — {', '.join(names)}"
+    return (
+        f"run {spec.run_id}: delegation is not attached — the run carried no delegation flags, so it "
+        "gets no subagents and no team tools"
+    )
+
+
+async def _delegation_policy_verdict(spec: RunSpec, *, logger: Any = None) -> Any:
+    """The policy read for a run that carried team flags; ``None`` when it could not be answered."""
+    try:
+        return await workflow_activity(
             NAME_DELEGATION_POLICY,
             DelegationPolicyRequest(
                 run_id=spec.run_id,
@@ -139,12 +172,4 @@ async def report_capabilities(
     except Exception:  # noqa: BLE001 - a report must never fail a run
         if logger is not None:
             logger.warning("run %s: delegation policy report failed", spec.run_id)
-        return
-    stripped = tuple(getattr(verdict, "stripped", ()) or ())
-    message = delegation_policy_note(
-        spec.run_id,
-        stripped,
-        str(getattr(verdict, "policy_path", "") or ""),
-    )
-    if message is not None:
-        await notify("note", message)
+        return None
