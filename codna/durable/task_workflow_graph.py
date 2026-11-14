@@ -36,6 +36,8 @@ from .contracts import (
     TaskSpec,
 )
 from .state import TaskState
+from .parking import park_reason
+from .approval_policy import AUTO_APPROVAL_REASON, auto_approval_eligible
 from .workflow_support import (
     approved_outcome,
     task_completion,
@@ -93,6 +95,7 @@ class TaskWorkflow:
         self._interrupts: list[dict[str, Any]] = []
         self._nodes_run: list[str] = []
         self._outcome: TaskOutcome | None = None
+        self._auto_approved = False
         self._spend: list[float] = [0.0]
 
     @workflow.run
@@ -137,6 +140,8 @@ class TaskWorkflow:
                 self._outcome = "stopped"
                 return
             interrupted = await self._drain(app, pending)
+            if self._auto_approved:
+                return
             if not interrupted:
                 return
             decision = await self._await_decision()
@@ -161,12 +166,55 @@ class TaskWorkflow:
                         interrupted = True
                         continue
                     self._nodes_run.append(str(node_name))
+                    if isinstance(value, Mapping) and value.get("auto_approved") is True:
+                        await self._auto_approve()
+                        continue
                     self._absorb(value)
                 if interrupted:
                     break
         finally:
             await stream.aclose()
         return interrupted
+
+    async def _auto_approve(self) -> dict[str, bool]:
+        """Record a policy grant, never a fabricated human identity or `approval.granted`."""
+        spec = self._spec
+        if spec is None:
+            raise ValueError("auto approval requires a validated task policy")
+        current = TaskState.from_payload(self._state)
+        if not auto_approval_eligible(current, enabled=spec.auto_approve_local_only):
+            raise ValueError("auto approval requires verified, reviewed local-only evidence")
+        self._approvals.append({
+            "identity": None,
+            "kind": "auto_approved",
+            "turn_seq": current.turn_seq,
+            "reason": AUTO_APPROVAL_REASON,
+            "policy_digest": spec.approval_policy_digest,
+        })
+        self._outcome = approved_outcome(current)
+        await self._record_auto_approval(NotifyRequest(
+            run_id=self._run_id,
+            task_id=self._task_id,
+            kind="auto_approved",
+            message=(
+                f"task {self._task_id} completed unattended under policy "
+                f"{AUTO_APPROVAL_REASON}: no remote, verify passed, review approved"
+            ),
+            evidence={
+                "policy_digest": spec.approval_policy_digest,
+                "policy_mode": "auto_for_low_risk",
+                "park_reason": AUTO_APPROVAL_REASON,
+                "verify_passed": True,
+                "review_verdict": current.review_verdict,
+                "publish_skip": current.publish_skip,
+            },
+        ))
+        self._auto_approved = True
+        return {"auto_approved": True}
+
+    async def _record_auto_approval(self, request: NotifyRequest) -> None:
+        """The same durable notification boundary as other audit events, without swallowing failure."""
+        await workflow_activity(NAME_NOTIFY, request)
 
     def _absorb(self, value: Any) -> None:
         """Adopt a node's state payload, accumulating the spend it added.
@@ -239,12 +287,27 @@ class TaskWorkflow:
         self._decision = None
         identity = str(decision.get("identity") or "")
         approved = decision.get("approved") is True
+        # The reason is the one the graph recorded when it parked (`park_reason`), not a re-derivation
+        # here. `open_pr_ready` used to be the value for ANY non-budget park, which made an approval
+        # granted after three failed verifies indistinguishable in the audit trail from one granted on
+        # work that passed. Re-deriving it here would be a second copy of the rule; the prompt is
+        # already the channel that carries it, and `budget_exhausted` stays a separate field because
+        # it is a property of the budget rather than of the parked step.
+        #
+        # The prompt is absent when this workflow is REPLAYING a park recorded before the prompt
+        # carried the reason, and a missing key must not become `reason: ""` — an empty string is not
+        # in the vocabulary `park_reason` defines, and an approval record with no reason is worse than
+        # the `open_pr_ready` it replaced. So the fallback derives it from the replayed STATE with the
+        # same shared function: that is the rule itself, not a second copy of it, and it is
+        # deterministic on replay because `park_reason` is a pure function of `TaskState`.
+        current = TaskState.from_payload(self._state)
+        parked_reason = str(parked.get("park_reason") or "") or park_reason(current)
         self._approvals.append(
             {
                 "identity": identity,
                 "kind": "approve" if approved else "reject",
-                "turn_seq": TaskState.from_payload(self._state).turn_seq,
-                "reason": "budget_exhausted" if parked.get("budget_exhausted") else "open_pr_ready",
+                "turn_seq": current.turn_seq,
+                "reason": "budget_exhausted" if parked.get("budget_exhausted") else parked_reason,
             }
         )
         if not approved:

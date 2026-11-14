@@ -603,3 +603,102 @@ def test_a_LITERAL_env_value_may_not_enter_history_at_all(tmp_path: Path):
             ],
         ).validate()
     assert "from_env" in str(raised.value)
+
+
+def test_the_ledger_note_names_the_BUILTIN_browser_server_that_effectively_attached(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """THE DEFECT, end to end through a real run: the note must report what ACTUALLY attached.
+
+    Measured twice on installed builds: `CODNA_BROWSER_TOOL=1` appended Codna's built-in `browser` server
+    in `session_mcp_servers` (the ledger even recorded `session.mcp_attached: {servers: ["browser"],
+    tools: 25}` plus dozens of real `browser__browser_*` calls), while this run's ONE human-readable note
+    said "MCP is not attached — no MCP servers are configured for this run". The note read the DECLARED
+    list on the spec and never saw the built-in entry that is added LAST.
+
+    A workflow may not read `os.environ` (the sandbox refuses it), so the answer is asked in the
+    `codna.step.mcp_attachment` activity. This asserts the sentence an operator reads, produced by a real
+    worker running the real workflow — not by calling the note builder directly.
+    """
+    pytest.importorskip("langgraph", reason="the `durable` extra (langgraph) is not installed")
+    pytest.importorskip("codna.durable.graph", reason="the `durable` extra cannot build the task graph")
+
+    from datetime import timedelta
+
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    from codna.durable.activities import ACTIVITIES, activity_executor
+    from codna.durable.workflows import RunWorkflow, registered_workflows
+
+    # The scheduler/worker environment, as the worker process would have it. NO declared servers at all:
+    # the browser server is the ONLY thing that can make this run "attached", which is the point.
+    monkeypatch.setenv("CODNA_BROWSER_TOOL", "1")
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+
+    repo = fakes.make_repo(tmp_path / "repo")
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    harness = fakes.build_harness(repo, runs_root)
+    payload = {
+        "run_id": "run-browser-note",
+        "repo_dir": str(repo),
+        "base_branch": "main",
+        "tasks": [
+            _spec(repo, run_id="run-browser-note", task_id="task-1").to_payload()
+        ],
+        "engine": "plain",
+        "continue_as_new_tasks": 10,
+        "continue_as_new_history_events": 100_000,
+    }
+
+    async def scenario(client: Any) -> Any:
+        handle = await client.start_workflow(
+            RunWorkflow.run,
+            args=[payload, None],
+            id="run-run-browser-note",
+            task_queue="codna-browser-note-tests",
+            run_timeout=timedelta(hours=24),
+        )
+        child = client.get_workflow_handle("task-run-browser-note-task-1")
+        for _ in range(600):
+            try:
+                status = await child.query("status")
+            except Exception:  # noqa: BLE001 - not started yet
+                await asyncio.sleep(0.02)
+                continue
+            if status.get("awaiting_approval"):
+                break
+            await asyncio.sleep(0.02)
+        return await handle.query(RunWorkflow.status)
+
+    async def wrapper() -> Any:
+        env = await WorkflowEnvironment.start_time_skipping()
+        try:
+            with activity_executor() as executor:
+                async with Worker(
+                    env.client,
+                    task_queue="codna-browser-note-tests",
+                    workflows=list(registered_workflows()),
+                    activities=list(ACTIVITIES),
+                    activity_executor=executor,
+                ):
+                    with env.auto_time_skipping_disabled():
+                        return await scenario(env.client)
+        finally:
+            await env.shutdown()
+
+    asyncio.run(wrapper())
+
+    notes = [
+        record.payload
+        for record in harness.ledger("run-browser-note").records()
+        if record.kind == "note" and record.payload.get("event") == "notification"
+    ]
+    mcp_notes = [note for note in notes if "MCP is" in note.get("message", "")]
+    assert len(mcp_notes) == 1, notes
+    message = mcp_notes[0]["message"]
+    # The sentence a human reads to answer "did the browser run?".
+    assert "MCP is attached" in message, message
+    assert "not attached" not in message, message
+    assert "browser" in message, message

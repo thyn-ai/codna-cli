@@ -22,6 +22,7 @@ import math
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -483,6 +484,158 @@ def test_a_screenshot_defaults_to_a_timestamped_name() -> None:
     name, absolute = screenshot_paths("/tmp/out", "")
     assert name.startswith("page-") and name.endswith(".png")
     assert absolute == f"/tmp/out/{name}"
+
+
+# ── a per-call filename can never write into the signed app bundle ─────────────────────────────
+#
+# The measured defect: `browser_take_screenshot` called with a RELATIVE filename wrote two PNGs into
+# `/Applications/Codna.app/Contents/Resources`, because Playwright resolves an EXPLICIT filename against
+# the server's cwd, NOT against `--output-dir` (its own help says so). The seal broke. Two things close
+# it, and both are asserted over the temp directory that stands in for the bundle:
+#
+#   * the launcher hands the server `cwd=<output_dir>` (so nothing inherits the app's cwd), and
+#   * every per-call name is resolved and REFUSED if it would land outside the output directory.
+
+
+def test_the_child_working_directory_is_the_output_directory_not_the_hosts_cwd() -> None:
+    """The launcher half: the workspace root a relative filename resolves against is Codna's, not the app's."""
+    config = browser_tool_config(ON)
+    transport = browser_tool.browser_server_transport(config)
+    assert transport["cwd"] == config.output_dir
+    # It survives the one validator unchanged, so the durable and chat launchers inherit it too.
+    assert browser_mcp_server(config)["transport"]["cwd"] == config.output_dir
+
+
+def test_a_relative_screenshot_name_resolves_inside_the_output_directory(tmp_path) -> None:
+    from codna.browser_tool import screenshot_output_path
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    relative, absolute = screenshot_output_path(str(output_dir), "page.png")
+    assert relative == "page.png"
+    assert absolute == str(output_dir / "page.png")
+
+
+def test_a_nested_relative_name_keeps_its_subdirectory(tmp_path) -> None:
+    from codna.browser_tool import screenshot_output_path
+
+    output_dir = tmp_path / "out"
+    (output_dir / "shots").mkdir(parents=True)
+    relative, absolute = screenshot_output_path(str(output_dir), "shots/page.png")
+    assert relative == "shots/page.png"
+    assert absolute == str(output_dir / "shots" / "page.png")
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "/Applications/Codna.app/Contents/Resources/page.png",
+        "~/page.png",
+        "../page.png",
+        "shots/../../page.png",
+        "./../Codna.app/Contents/Resources/page.png",
+        "../../Resources/page.png",
+    ],
+)
+def test_a_per_call_filename_that_escapes_the_output_directory_is_REFUSED(
+    tmp_path, filename: str,
+) -> None:
+    """The bundle is simulated by `tmp_path`; the offending value must be NAMED in a coded error."""
+    from codna.browser_tool import BrowserToolConfigError, screenshot_output_path
+
+    output_dir = tmp_path / "Codna.app" / "Contents" / "Resources" / "browser"
+    output_dir.mkdir(parents=True)
+    with pytest.raises(BrowserToolConfigError) as caught:
+        screenshot_output_path(str(output_dir), filename)
+    assert caught.value.code == "browser_screenshot_path_invalid"
+    # The refusal names what the user asked for, so it is actionable rather than a silent rewrite.
+    assert filename in str(caught.value)
+    assert caught.value.details["filename"] == filename
+    # Nothing was created anywhere: a refusal is a refusal, not a clamped write.
+    assert not (output_dir / "page.png").exists()
+
+
+def test_the_bridge_refuses_the_escape_before_it_calls_the_server(tmp_path) -> None:
+    """The tool-body half: a browsing session refuses the write instead of handing it to Playwright."""
+    from codna.browser_bridge import BrowserToolError, screenshot_paths
+
+    output_dir = tmp_path / "browser"
+    output_dir.mkdir()
+    for bad in ("../escape.png", "/Applications/Codna.app/Contents/Resources/x.png", "~/x.png"):
+        with pytest.raises(BrowserToolError) as caught:
+            screenshot_paths(str(output_dir), bad)
+        assert caught.value.code == "browser_screenshot_path_invalid"
+        assert bad in str(caught.value)
+    assert not (tmp_path / "escape.png").exists()
+
+
+def test_a_bare_relative_screenshot_name_does_NOT_land_in_the_inherited_cwd(tmp_path) -> None:
+    """THE INCIDENT, reproduced with a simulated bundle.
+
+    Playwright resolves an explicit `filename` against the SERVER'S CWD, not `--output-dir`. The installed
+    app's server inherited `/Applications/Codna.app/Contents/Resources`, so a bare `"page.png"` landed
+    inside the code-signed bundle and `codesign --verify` stopped passing.
+
+    The "bundle" here is a directory whose contents stand for the sealed payload. Before the fix the
+    server was launched with the host's cwd and that is where `page.png` resolved; after the fix the server
+    is launched INSIDE the output directory, so the same call lands in Codna's own state — and the bundle's
+    listing is byte-identical. No real `codesign` is involved (see the PR report for that caveat).
+    """
+    import os
+
+    from codna.browser_bridge import BrowserToolError, screenshot_paths
+
+    bundle = tmp_path / "Codna.app" / "Contents" / "Resources"
+    bundle.mkdir(parents=True)
+    (bundle / "Info.plist").write_bytes(b"sealed")
+    sealed = sorted(path.relative_to(bundle).as_posix() for path in bundle.rglob("*"))
+
+    output_dir = tmp_path / "runtime" / "browser"
+    output_dir.mkdir(parents=True)
+    config = browser_tool_config({
+        **ON, "CODNA_BROWSER_OUTPUT_DIR": str(output_dir),
+    })
+
+    # The workspace root the child gets. A bare name resolves against THIS, so it must be ours.
+    child_cwd = browser_tool.browser_server_transport(config)["cwd"]
+    assert child_cwd == str(output_dir)
+    assert os.path.commonpath([child_cwd, str(bundle)]) != child_cwd, (
+        "a relative screenshot name would resolve into the app bundle"
+    )
+
+    # The escape forms are refused outright, and neither is written.
+    with pytest.raises(BrowserToolError):
+        screenshot_paths(str(output_dir), "../../Codna.app/Contents/Resources/page.png")
+    with pytest.raises(BrowserToolError):
+        screenshot_paths(str(output_dir), str(bundle / "page.png"))
+
+    _, absolute = screenshot_paths(str(output_dir), "page.png")
+    Path(absolute).write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    after = sorted(path.relative_to(bundle).as_posix() for path in bundle.rglob("*"))
+    assert after == sealed == ["Info.plist"]
+    assert (output_dir / "page.png").is_file()
+
+
+def test_an_empty_filename_yields_NO_path_rather_than_the_directory(tmp_path) -> None:
+    """The resolver's documented pair is ``(relative_name, absolute_path)`` — or NONE of it.
+
+    An empty/whitespace name is Playwright's own auto-naming case: the server picks the name, so this
+    function knows neither element. Returning ``("", output_dir)`` would hand a caller the output
+    DIRECTORY as if it were a screenshot path, and a caller that passed that to Playwright (or opened
+    it) would act on a directory. The pair is therefore ``("", "")`` — empty name, empty path — which
+    is unambiguous and keeps the two elements the same kind of thing.
+    """
+    from codna.browser_tool import screenshot_output_path
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    for name in ("", "   ", "\t\n"):
+        relative, absolute = screenshot_output_path(str(output_dir), name)
+        assert relative == ""
+        assert absolute == ""
+        # Explicitly: the output DIRECTORY is never handed back as a file path.
+        assert absolute != str(output_dir)
 
 
 # ── the honest status report ──────────────────────────────────────────────────────────────────

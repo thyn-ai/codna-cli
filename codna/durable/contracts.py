@@ -86,9 +86,12 @@ __all__ = [
     "HEARTBEAT_INTERVAL_S",
     "MAX_STEER_NOTE_CHARS",
     "MAX_STEER_NOTES",
+    "McpAttachmentOutcome",
+    "McpAttachmentRequest",
     "NAME_CHECKPOINT",
     "NAME_DELEGATION_POLICY",
     "NAME_EPISODE",
+    "NAME_MCP_ATTACHMENT",
     "NAME_NOTIFY",
     "NAME_OPEN_PR",
     "NAME_PLAN",
@@ -164,6 +167,8 @@ from .contracts_bookkeeping import (  # noqa: E402
     DelegationPolicyOutcome,
     DelegationPolicyRequest,
     EpisodeRequest,
+    McpAttachmentOutcome,
+    McpAttachmentRequest,
     NotifyRequest,
     WorktreeCleanupOutcome,
     WorktreeCleanupRequest,
@@ -220,6 +225,11 @@ NAME_NOTIFY: Final = "codna.step.notify"
 # say whether the delegation FLAGS the run carried can actually reach the model. It is an activity
 # because it touches the filesystem, which the workflow sandbox refuses.
 NAME_DELEGATION_POLICY: Final = "codna.step.delegation_policy"
+# Run-level, scheduled ONCE at the start of a run beside the delegation-policy read: answers which MCP
+# servers the turns are EFFECTIVELY handed. It is an activity for the same reason as the read above —
+# the answer depends on the WORKER's environment (CODNA_BROWSER_TOOL, CODNA_MCP_SERVERS), and the
+# workflow sandbox refuses os.environ from workflow code.
+NAME_MCP_ATTACHMENT: Final = "codna.step.mcp_attachment"
 
 # D5 goal mode: the ceiling on the plan-side goal block a `TaskSpec` may carry. Generous for an
 # objective plus four episodes, small enough that a run cannot smuggle a transcript into history.
@@ -401,6 +411,10 @@ class TaskSpec:
     # Page: `worktree` must be True for this to have any effect. A shared checkout cannot be on two
     # branches at once, and the run that uses this one must not move the developer's HEAD.
     worktree_branch: str = ""
+    # A validated policy grant for terminal completion only. The CLI reads the repository policy
+    # before starting; workflows never read policy files or infer a grant during replay.
+    auto_approve_local_only: bool = False
+    approval_policy_digest: str = ""
 
     def __post_init__(self) -> None:
         # Canonicalise on construction, so the recorded payload (and therefore history, the ledger and
@@ -537,6 +551,20 @@ class TaskSpec:
             )
         except SwarmConfigError as exc:
             raise ContractError(str(exc), code=exc.code, details=exc.details) from exc
+        if not isinstance(self.auto_approve_local_only, bool):
+            raise ContractError(
+                "auto_approve_local_only must be a boolean",
+                code="contract_invalid",
+                details={"field": "auto_approve_local_only"},
+            )
+        if self.auto_approve_local_only:
+            _require_ref(self.approval_policy_digest, "approval_policy_digest")
+        elif self.approval_policy_digest:
+            raise ContractError(
+                "an approval policy digest requires auto_approve_local_only",
+                code="contract_invalid",
+                details={"field": "approval_policy_digest"},
+            )
         if not isinstance(self.worktree_branch, str):
             raise ContractError(
                 "worktree_branch must be a string",
@@ -693,6 +721,8 @@ class TaskSpec:
             "enable_spawn_agent": self.enable_spawn_agent,
             "enable_agent_teams": self.enable_agent_teams,
             "worktree_branch": self.worktree_branch,
+            "auto_approve_local_only": self.auto_approve_local_only,
+            "approval_policy_digest": self.approval_policy_digest,
         }
 
 
