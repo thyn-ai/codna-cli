@@ -36,6 +36,7 @@ from .contracts import (
     TaskSpec,
 )
 from .state import TaskState
+from .parking import park_reason
 from .workflow_support import (
     approved_outcome,
     task_completion,
@@ -239,12 +240,27 @@ class TaskWorkflow:
         self._decision = None
         identity = str(decision.get("identity") or "")
         approved = decision.get("approved") is True
+        # The reason is the one the graph recorded when it parked (`park_reason`), not a re-derivation
+        # here. `open_pr_ready` used to be the value for ANY non-budget park, which made an approval
+        # granted after three failed verifies indistinguishable in the audit trail from one granted on
+        # work that passed. Re-deriving it here would be a second copy of the rule; the prompt is
+        # already the channel that carries it, and `budget_exhausted` stays a separate field because
+        # it is a property of the budget rather than of the parked step.
+        #
+        # The prompt is absent when this workflow is REPLAYING a park recorded before the prompt
+        # carried the reason, and a missing key must not become `reason: ""` — an empty string is not
+        # in the vocabulary `park_reason` defines, and an approval record with no reason is worse than
+        # the `open_pr_ready` it replaced. So the fallback derives it from the replayed STATE with the
+        # same shared function: that is the rule itself, not a second copy of it, and it is
+        # deterministic on replay because `park_reason` is a pure function of `TaskState`.
+        current = TaskState.from_payload(self._state)
+        parked_reason = str(parked.get("park_reason") or "") or park_reason(current)
         self._approvals.append(
             {
                 "identity": identity,
                 "kind": "approve" if approved else "reject",
-                "turn_seq": TaskState.from_payload(self._state).turn_seq,
-                "reason": "budget_exhausted" if parked.get("budget_exhausted") else "open_pr_ready",
+                "turn_seq": current.turn_seq,
+                "reason": "budget_exhausted" if parked.get("budget_exhausted") else parked_reason,
             }
         )
         if not approved:

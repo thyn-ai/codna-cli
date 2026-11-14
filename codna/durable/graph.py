@@ -142,6 +142,7 @@ from .contracts import (
     implement_prompt,
     task_spec_from_config,
 )
+from .parking import park_reason
 from .routing import DEFAULT_MAX_ATTEMPTS, Route, after_plan, after_review, after_verify
 from .state import TaskState
 from .version import GRAPH_VERSION
@@ -604,6 +605,15 @@ async def wait_for_human(state: dict[str, Any]) -> dict[str, Any]:
         # skipped" instead of "pr: null" and having to guess.
         "publish_skip": current.publish_skip,
         "budget_exhausted": current.budget.exhausted,
+        # WHY the run parked, in the shared vocabulary `park_reason` already defines. Without this the
+        # graph engine cannot tell "the work is ready for a pull request" apart from "verification
+        # failed three times and the attempt budget is spent", and the approval it records says
+        # `open_pr_ready` for both. Measured (`run-20261113T225225Z`): three verify records with
+        # `passed: false` and `returncode: 127`, then an approval whose recorded reason was
+        # `open_pr_ready` — so the human gate reported the work as ready when its own verify had never
+        # passed. The prompt is the only channel that survives into `_await_decision`, which is why
+        # the reason travels here rather than being re-derived there.
+        "park_reason": park_reason(current),
     }
     decision = interrupt(prompt)
     if not isinstance(decision, dict):

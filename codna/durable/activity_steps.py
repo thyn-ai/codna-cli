@@ -530,11 +530,17 @@ def verify_task(request: VerifyRequest) -> "ActivityOutcome":  # noqa: F821 - se
         log_path = getattr(outcome, "log_path", None) or _write_verify_log(
             active, request, plan, outcome
         )
+        environment = ""
+        missing = None
     else:
         result = _run_in_sandbox(request, plan, tree=tree)
         passed = bool(result.accepted())
         returncode = result.returncode
-        log_path = _write_verify_log(active, request, plan, result)
+        # Which PATH this attempt ran under. A `127` is only diagnosable if the attempt records it;
+        # before this, the log showed the shell's error and nothing about where the shell looked.
+        environment = str(getattr(result, "env_note", "") or "")
+        log_path = _write_verify_log(active, request, plan, result, environment=environment)
+        missing = _missing_tool(result)
 
     ref = f"verify/{request.context.task_id}/{plan.digest[:12]}"
     updated = replace(
@@ -552,22 +558,54 @@ def verify_task(request: VerifyRequest) -> "ActivityOutcome":  # noqa: F821 - se
             "returncode": returncode,
             "commands": list(plan.commands),
             "log_path": log_path,
+            # Empty when the injected test seam ran instead of a sandbox: there was no PATH to record.
+            "environment": environment,
         },
     )
+    if missing is not None:
+        # The attempt is LEDGERED before the raise, so the audit trail keeps the evidence a human needs
+        # (`passed: false`, the log path, the PATH and its source) and the error carries the repair.
+        # Raising without recording would trade a silent mis-read for a silent hole.
+        _raise_toolchain_missing(missing, environment=environment)
     return ActivityOutcome(
         state=updated.to_payload(),
-        details={"verify_ref": ref, "passed": passed, "returncode": returncode},
+        details={
+            "verify_ref": ref,
+            "passed": passed,
+            "returncode": returncode,
+            "environment": environment,
+        },
     )
 
 
 def _run_in_sandbox(request: VerifyRequest, plan: VerifyPlan, *, tree: str) -> Any:
-    """Execute each command under the sandbox, in ``tree``, stopping at the first failure."""
-    from ..sandbox import Sandbox, scrub_env
+    """Execute each command under the sandbox, in ``tree``, stopping at the first failure.
 
+    The environment is the worker's own — credential-scrubbed by `scrub_env`, which is the security
+    boundary and stays untouched — with its PATH resolved against the user's login shell first. Without
+    that step a worker started by a launcher inherits a minimal PATH, so `node`, `bun` and `uv` are
+    simply not found and a correct repository verifies as `exit 127` (measured: run
+    ``run-20261113T225225Z``, ``/bin/sh: node: command not found``, three attempts, correct code). The
+    decision, its cache and its failure mode live in `codna.verify_env`; this call only applies it.
+
+    The returned result is the FIRST failing command's, or the last one when every command passed.
+    When it is the shell failing to resolve a program rather than a command that ran and failed,
+    `command_not_found()` on it says so — the caller decides what that means, because it is the caller
+    that must record the attempt before turning it into an error. An ordinary non-zero exit is
+    unchanged and still routes to `implement`.
+    """
+    from ..sandbox import Sandbox, scrub_env
+    from ..verify_env import resolve_verify_environment
+
+    scrubbed = scrub_env(dict(os.environ))
+    environment = resolve_verify_environment(base_env=scrubbed)
     sandbox = Sandbox(
         network="deny",
         timeout_seconds=int(request.timeout_s),
-        env=scrub_env(dict(os.environ)),
+        # A COPY: the resolved env is shared with the process-lifetime cache in `verify_env`, and a
+        # sandbox that mutated it would poison every later attempt in this worker.
+        env=dict(environment.env),
+        env_note=environment.describe(),
     )
     last: Any = None
     for command in plan.commands:
@@ -581,13 +619,76 @@ def _run_in_sandbox(request: VerifyRequest, plan: VerifyPlan, *, tree: str) -> A
     return last
 
 
+def _missing_tool(result: Any) -> tuple[str, str] | None:
+    """``(command, binary)`` when the result is the shell unable to resolve a program.
+
+    Deliberately narrow: exit 127 WITH the shell's own message. The binary is read out of that message
+    rather than guessed from the command line, because ``sh`` may be running a pipeline, an ``&&``
+    chain or a subshell, so the first word of a command is not reliably the missing program.
+
+    The COMMAND comes from the result's own `argv`, not from the plan: the loop stops at the FIRST
+    failing command, so for a multi-command plan `plan.commands[-1]` is usually not the one that
+    failed, and naming the wrong one would tell a user to install a toolchain for a command that may
+    never have run. `Sandbox.run` records the exact argv it executed, which is the only reliable
+    answer.
+    """
+    finder = getattr(result, "command_not_found", None)
+    binary = finder() if callable(finder) else None
+    if binary is None:
+        return None
+    # `/bin/sh -lc <command>` is what the sandbox is given, so the third element is the command. The
+    # fallback names the BINARY rather than returning an empty string: an error reading "could not run
+    # ``" tells a user nothing, and a result shaped unexpectedly is exactly when a diagnosis matters
+    # most. `binary` is always available here — it is what this function returned on.
+    argv = getattr(result, "argv", None) or []
+    command = str(argv[2]) if len(argv) >= 3 else f"(command unavailable; `{binary}` was not found)"
+    return command, str(binary)
+
+
+def _raise_toolchain_missing(missing: tuple[str, str], *, environment: str) -> None:
+    """Raise the coded error a missing TOOLCHAIN deserves, naming what to repair.
+
+    A missing toolchain is not a failing TEST, and the difference decides who can act: a red suite goes
+    back to `implement`, which can fix code, while a binary that was never installed cannot be created
+    by another paid turn. Measured (`run-20261113T225225Z`): the graph read three `127`s as "the tests
+    are red", spent two paid implement turns rewriting a correct app, then parked on an exhausted
+    attempt budget — and a park can be APPROVED, which is how a run whose own verdict had never been
+    true can still finish. The error therefore has to be terminal for the step.
+
+    ``environment`` is `VerifyEnvironment.describe()` — the source, the shell and the PATH itself — so
+    the message and its details answer "was it installed, or just invisible to the sandbox" without a
+    reproduction. That distinction is the whole reason this defect took a manual investigation.
+    """
+    command, binary = missing
+    raise ActivityError(
+        f"verification could not run `{command}`: `{binary}` is not on the PATH the sandbox was given "
+        f"({environment}). This is a missing TOOLCHAIN, not a failing test: install it, or put it "
+        f"where the login shell finds it, or set CODNA_VERIFY_PATH to a directory that has it.",
+        code="activity_verify_toolchain_missing",
+        details={
+            "command": command,
+            "missing": binary,
+            "environment": environment,
+        },
+    )
+
+
 def _write_verify_log(
-    runtime: ActivityRuntime, request: VerifyRequest, plan: VerifyPlan, result: Any
+    runtime: ActivityRuntime,
+    request: VerifyRequest,
+    plan: VerifyPlan,
+    result: Any,
+    *,
+    environment: str = "",
 ) -> str:
     """Persist the output beside the ledger; return a path RELATIVE to the run directory.
 
     Relative because `VerifyRef.log_path` is validated against a reference pattern that refuses
     absolute paths — and because a run directory that moves must not invalidate its own history.
+
+    ``environment`` records which PATH the attempt ran under. A verify that fails should be explainable
+    from its own log: `127 node: not found` plus the PATH that was searched is a diagnosis, while the
+    same `127` alone is a mystery that costs an investigation every time it recurs.
     """
     logs = _run_dir(runtime.runs_root, request.context.run_id) / "verify"
     logs.mkdir(parents=True, exist_ok=True)
@@ -595,7 +696,8 @@ def _write_verify_log(
     path = logs / f"turn-{turn_seq}-{plan.digest[:12]}.log"
     body = "\n".join(f"$ {command}" for command in plan.commands)
     body += f"\n\nreturncode: {getattr(result, 'returncode', '?')}"
-    body += f"\ntimed_out: {bool(getattr(result, 'timed_out', False))}\n"
+    body += f"\ntimed_out: {bool(getattr(result, 'timed_out', False))}"
+    body += f"\nenvironment: {environment or '(injected test seam: no sandbox PATH)'}\n"
     body += "\n-- stdout --\n" + str(getattr(result, "stdout", "")) + "\n"
     body += "-- stderr --\n" + str(getattr(result, "stderr", "")) + "\n"
     path.write_text(body, encoding="utf-8")
