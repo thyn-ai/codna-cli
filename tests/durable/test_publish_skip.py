@@ -472,3 +472,66 @@ def test_a_run_of_a_local_only_repository_completes_and_counts_unpublished_tasks
     ]
     assert len(notes) == 1, notes
     assert "task-1" in notes[0]["message"]
+
+
+def test_a_completed_run_WRITES_its_outcome_on_the_ledger(tmp_path: Path) -> None:
+    """THE WRITE HALF OF THE RUN-LIST DEFECT, proved on a real workflow.
+
+    `GET /runs` reported every completed run as `outcome: null` because the terminal notification the
+    workflow emitted carried no outcome: the workflow decided `completed` and returned it, and the
+    ledger — the only thing the list route reads — never heard it. So `completed` was readable from the
+    workflow's RESULT and nowhere else.
+
+    The assertion is on the LEDGER, not on the completion: a test that checked the returned value would
+    pass against the defect. Both readers are exercised, because "the row says it" and "the route
+    reports it" are different hops and the bug lived in the gap between them.
+    """
+    from codna.durable.run_api_support import outcome_of, terminal_verdict
+
+    repo = fakes.make_repo(tmp_path / "repo", origin=None)
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    harness = fakes.build_harness(repo, runs_root)
+    tasks = tuple(_spec(repo, engine="plain", task_id=f"task-{n}") for n in (1,))
+    payload = {
+        "run_id": "run-1",
+        "repo_dir": str(repo),
+        "base_branch": "main",
+        "tasks": [task.to_payload() for task in tasks],
+        "engine": "plain",
+        "continue_as_new_tasks": 10,
+        "continue_as_new_history_events": 100_000,
+    }
+
+    async def scenario(client: Any) -> Any:
+        handle = await client.start_workflow(
+            RunWorkflow.run,
+            args=[payload, None],
+            id="run-outcome-written",
+            task_queue=TASK_QUEUE,
+            run_timeout=RUN_TIMEOUT,
+        )
+        for _ in range(600):
+            await approve_if_parked(
+                client, "task-run-1-task-1", TaskWorkflowPlain, identity="soak@codna.ai"
+            )
+            described = await handle.describe()
+            if int(described.status) != 1:
+                break
+            await asyncio.sleep(0.02)
+        return await asyncio.wait_for(handle.result(), timeout=60)
+
+    completion = _run(_with_worker("plain", scenario))
+    assert completion.outcome == "completed", completion
+
+    ledger = harness.ledger("run-1")
+    terminals = [
+        record
+        for record in ledger.records()
+        if record.kind == "note" and record.payload.get("kind") == "run.finished"
+    ]
+    assert len(terminals) == 1, terminals
+    assert terminals[0].payload["outcome"] == "completed"
+    # …and the route's own readers agree, which is the pair the sidebar ships.
+    assert terminal_verdict(ledger.path) == (True, "completed")
+    assert outcome_of(ledger.path) == "completed"
