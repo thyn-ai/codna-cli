@@ -48,6 +48,7 @@ from .contracts import (
     NAME_CHECKPOINT,
     NAME_DELEGATION_POLICY,
     NAME_EPISODE,
+    NAME_MCP_ATTACHMENT,
     NAME_NOTIFY,
     NAME_OPEN_PR,
     NAME_PLAN,
@@ -148,6 +149,7 @@ open_pr = _steps.open_pr
 remember_episode = _steps.remember_episode
 notify = _steps.notify
 delegation_policy = _steps.delegation_policy
+resolve_mcp_attachment = _steps.resolve_mcp_attachment
 worktree_cleanup = _steps.worktree_cleanup
 # D5 goal mode. Re-exported on the same rule as the step bodies: the registered activity and the
 # function a test calls must be one object.
@@ -172,6 +174,9 @@ notify_activity = activity.defn(name=NAME_NOTIFY)(notify)
 delegation_policy_activity = activity.defn(name=NAME_DELEGATION_POLICY)(
     delegation_policy
 )
+mcp_attachment_activity = activity.defn(name=NAME_MCP_ATTACHMENT)(
+    resolve_mcp_attachment
+)
 worktree_cleanup_activity = activity.defn(name=NAME_WORKTREE_CLEANUP)(worktree_cleanup)
 watch_ci_activity = activity.defn(name=NAME_WATCH_CI)(watch_ci)
 recall_episodes_activity = activity.defn(name=NAME_RECALL)(recall_episodes)
@@ -186,6 +191,7 @@ ACTIVITY_NAMES: Final[tuple[str, ...]] = (
     NAME_EPISODE,
     NAME_NOTIFY,
     NAME_DELEGATION_POLICY,
+    NAME_MCP_ATTACHMENT,
     NAME_WORKTREE_CLEANUP,
     NAME_WATCH_CI,
     NAME_RECALL,
@@ -201,6 +207,7 @@ ACTIVITIES: Final[tuple[Any, ...]] = (
     remember_episode_activity,
     notify_activity,
     delegation_policy_activity,
+    mcp_attachment_activity,
     worktree_cleanup_activity,
     watch_ci_activity,
     recall_episodes_activity,
@@ -218,6 +225,7 @@ _BODIES: Final[dict[str, Callable[[Any], Any]]] = {
     NAME_EPISODE: remember_episode_activity,
     NAME_NOTIFY: notify_activity,
     NAME_DELEGATION_POLICY: delegation_policy_activity,
+    NAME_MCP_ATTACHMENT: mcp_attachment_activity,
     NAME_WORKTREE_CLEANUP: worktree_cleanup_activity,
     NAME_WATCH_CI: watch_ci_activity,
     NAME_RECALL: recall_episodes_activity,
@@ -264,6 +272,8 @@ _TIMEOUTS: Final[dict[str, int]] = {
     NAME_EPISODE: ACTIVITY_TIMEOUT_S,
     NAME_NOTIFY: ACTIVITY_TIMEOUT_S,
     NAME_DELEGATION_POLICY: ACTIVITY_TIMEOUT_S,
+    # One environment read plus a config resolution and no I/O of its own; the report's own ceiling.
+    NAME_MCP_ATTACHMENT: ACTIVITY_TIMEOUT_S,
     # A sweep of a run's worktrees: one `git worktree remove` per task, each verified against git's own
     # list. It is not a paid step, and a run's task count is bounded, so the ordinary activity ceiling
     # is right; a larger one would only hide a wedged worker behind a longer wait.

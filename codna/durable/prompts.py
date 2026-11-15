@@ -33,6 +33,19 @@ def plan_prompt(brief: str, steer: Sequence[str] = (), goal_context: str = "") -
     deterministic — which is what makes a recorded history replayable. ``goal_context`` (D5 goal mode)
     is the run's objective plus the episodes of earlier tasks, and it is appended LAST so a task-mode
     prompt (empty goal context) is byte-identical to what it always was.
+
+    **THE TWO OUTCOMES, stated rather than assumed.** This turn used to end with "Answer with an
+    ordered list of steps, each naming the files it touches" and nothing else, so the only shape the
+    model was ever offered was a PLAN. A message that is not a task therefore came back as a
+    plan-shaped refusal — measured (`run-20261115T194227Z`, brief ``hi``): *"The task is a greeting
+    ("hi") with no actionable change… Plan: No-op — no changes required… Files touched: none."* The
+    user asked "Hi" and was handed a work plan for doing nothing.
+
+    The prompt does not try to CLASSIFY the brief (a haystack of heuristics is a classifier nobody
+    can test). It states both legitimate outcomes and lets the turn answer with the one that fits,
+    which is a rule that generalises to any non-task message: a greeting, a question, a request for
+    an explanation. "Do not invent work" stays explicit, because the failure on the other side —
+    fabricating a change to satisfy the format — is the one the no-hallucination policy forbids.
     """
     lines = [
         "Produce a plan for this task. Do NOT modify any file: this turn is read-only.",
@@ -40,7 +53,14 @@ def plan_prompt(brief: str, steer: Sequence[str] = (), goal_context: str = "") -
         "Task:",
         brief.strip(),
         "",
-        "Answer with an ordered list of steps, each naming the files it touches.",
+        # The task-branch instruction is unchanged, so a real brief is planned exactly as before.
+        "If the task asks for a change, answer with an ordered list of steps, each naming the files "
+        "it touches.",
+        # …and this is the branch a non-task message takes, instead of the no-op plan it used to get.
+        "If the task asks for NO change — a greeting, a question, or a request you can answer from "
+        "the conversation and your own knowledge — answer it directly and briefly, saying plainly "
+        "that no change is needed. Do not produce a plan for work that was not requested, and do not "
+        "invent work to fill one.",
     ]
     if steer:
         lines.extend(["", "Human steering (oldest first):"])
@@ -51,12 +71,24 @@ def plan_prompt(brief: str, steer: Sequence[str] = (), goal_context: str = "") -
 
 
 def implement_prompt(brief: str, steer: Sequence[str] = ()) -> str:
-    """The implement prompt: the brief, plus whatever the human steered since the last turn."""
+    """The implement prompt: the brief, plus whatever the human steered since the last turn.
+
+    Same two outcomes as `plan_prompt`: a brief that asks for a change is implemented, and one that
+    asks for nothing is ANSWERED. Without this branch the implement turn could only answer a greeting
+    by describing the empty diff it did not write ("a no-op completed… 0 files touched"), which is the
+    same plan-shaped refusal one step later. Nothing is written either way — the no-op is the honest
+    outcome, and saying it in one sentence is the difference between an answer and a work report.
+    """
     lines = [
         "Implement this task in the repository. Keep the diff focused and the tests green.",
         "",
         "Task:",
         brief.strip(),
+        "",
+        "If the task asks for NO change — a greeting, a question, or a request you can answer from "
+        "the conversation and your own knowledge — answer it directly and briefly, saying plainly "
+        "that nothing needed to change. Do not invent a change, and do not write a work report about "
+        "a diff you did not make.",
     ]
     if steer:
         lines.extend(["", "Human steering (oldest first):"])
