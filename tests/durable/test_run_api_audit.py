@@ -24,6 +24,7 @@ import pytest
 pytest.importorskip("temporalio", reason="the `durable` extra (temporalio) is not installed")
 
 from codna.durable.ledger import GENESIS_HASH, RunLedger  # noqa: E402
+from codna.durable.run_contracts import LEDGER_RUN_OUTCOMES  # noqa: E402
 from codna.durable.verify_ledger import (  # noqa: E402
     EXIT_DIVERGED,
     EXIT_INTACT,
@@ -330,6 +331,188 @@ def test_a_notify_actor_wider_than_the_bound_is_refused() -> None:
     assert caught.value.details.get("field") == "actor"
 
 
+# -- 5b. a run terminal SAYS how the run ended -------------------------------------------------
+#
+# THE DEFECT THIS PINS. `GET /runs` reported `outcome: null` for every completed run because the
+# terminal notification carried no outcome — the workflow decided it and then did not write it down.
+# These tests are the WRITE half: the terminal the workflow emits must reach the ledger with its
+# outcome at the payload's top level, which is where `run_api_support` reads it.
+
+
+def _notify_into(ledger: RunLedger, directory: Path, request: Any) -> None:
+    """Run the REAL `notify` step against ``ledger``, wired the way the worker wires it."""
+    from codna.durable import activities, activity_steps
+    from codna.durable.activity_support import ActivityRuntime
+
+    runtime = ActivityRuntime(
+        runs_root=directory,
+        sidecar_factory=lambda owner: None,
+        ledger_factory=lambda run_id: ledger,
+    )
+    previous = activities.DEFAULT_RUNTIME
+    activities.configure_default_runtime(runtime)
+    try:
+        activity_steps.notify(request)
+    finally:
+        activities.DEFAULT_RUNTIME = previous
+        activity_steps._runtime_provider = None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("outcome", sorted(LEDGER_RUN_OUTCOMES))
+def test_a_run_terminal_records_its_outcome_on_the_ledger_row(tmp_path: Path, outcome: str) -> None:
+    """Every outcome the workflow can take is readable back from the row it wrote."""
+    from codna.durable.contracts import NotifyRequest
+    from codna.durable.run_contracts import run_terminal_evidence
+
+    ledger = _ledger(tmp_path, "run-terminal")
+    _notify_into(
+        ledger,
+        tmp_path / "runs",
+        NotifyRequest(
+            run_id="run-terminal",
+            task_id=None,
+            kind="run.finished",
+            message="run run-terminal: 1 task(s) done",
+            evidence=run_terminal_evidence(outcome),
+        ),
+    )
+    assert ledger.tail().payload["outcome"] == outcome
+
+
+def test_the_terminal_outcome_is_a_top_level_field_not_buried_in_evidence(tmp_path: Path) -> None:
+    """One address for the fact. `evidence` is for checks an auditor reads, not for the verdict.
+
+    The reader looks at `payload["outcome"]`; a value left inside `evidence` would be a second place
+    the same fact could live, and the two could disagree.
+    """
+    from codna.durable.contracts import NotifyRequest
+    from codna.durable.run_contracts import run_terminal_evidence
+
+    ledger = _ledger(tmp_path, "run-top-level")
+    _notify_into(
+        ledger,
+        tmp_path / "runs",
+        NotifyRequest(
+            run_id="run-top-level",
+            task_id=None,
+            kind="run.finished",
+            message="done",
+            evidence=run_terminal_evidence("completed"),
+        ),
+    )
+    payload = ledger.tail().payload
+    assert payload["outcome"] == "completed"
+    assert "outcome" not in payload["evidence"]
+
+
+def test_an_approval_keeps_its_evidence_intact(tmp_path: Path) -> None:
+    """Only an ENDING lifts an outcome out. A record that merely mentions one must not be rewritten.
+
+    `approval.granted` describes a decision, not an ending: its evidence is what it is, and a reader
+    scanning for a verdict must not find one on it.
+    """
+    from codna.durable.contracts import NotifyRequest
+
+    ledger = _ledger(tmp_path, "run-approval")
+    _notify_into(
+        ledger,
+        tmp_path / "runs",
+        NotifyRequest(
+            run_id="run-approval",
+            task_id="task-1",
+            kind="approval.granted",
+            message="task task-1 approved",
+            actor="qa@codna.ai",
+            evidence={"outcome": "approved"},
+        ),
+    )
+    payload = ledger.tail().payload
+    assert "outcome" not in payload
+    assert payload["evidence"] == {"outcome": "approved"}
+
+
+def test_a_missing_outcome_is_not_invented_on_the_row(tmp_path: Path) -> None:
+    """A terminal that recorded nothing says nothing: the key is ABSENT, not a plausible default."""
+    from codna.durable.contracts import NotifyRequest
+
+    ledger = _ledger(tmp_path, "run-bare")
+    _notify_into(
+        ledger,
+        tmp_path / "runs",
+        NotifyRequest(run_id="run-bare", task_id=None, kind="run.finished", message="done"),
+    )
+    assert "outcome" not in ledger.tail().payload
+
+
+def test_an_outcome_outside_the_vocabulary_is_refused() -> None:
+    """A value nobody taught the reader is refused at the writer, not guessed at the reader."""
+    from codna.durable.contract_primitives import ContractError
+    from codna.durable.run_contracts import run_terminal_evidence
+
+    with pytest.raises(ContractError) as caught:
+        run_terminal_evidence("succeeded")
+    assert caught.value.details.get("field") == "outcome"
+
+
+def test_the_run_workflow_emits_its_terminal_on_every_exit() -> None:
+    """Structural: every exit that RETURNS a completion first wrote a terminal saying how it ended.
+
+    A behavioural assertion per exit would need a Temporal server per ending (and a killed worker
+    cannot be provoked at all), so what is checked is the rule that can regress silently — an exit
+    returning without saying how it ended, which is precisely how `GET /runs` came to report every
+    completed run as `outcome: null`.
+
+    Read through the AST rather than as text: each ``return self.completion(...)`` must be preceded,
+    inside its own function, by a ``self._finish(...)``. ``_finish`` is the one writer of the terminal,
+    so "one of these comes first" is the whole property.
+    """
+    source = (REPO_ROOT / "cli" / "codna" / "durable" / "run_workflow.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    def returns_completion(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "completion"
+        )
+
+    def calls_finish(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_finish"
+        )
+
+    checked = 0
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        body = list(ast.walk(function))
+        finish_lines = [node.lineno for node in body if calls_finish(node)]
+        for node in body:
+            if not returns_completion(node):
+                continue
+            checked += 1
+            assert any(line < node.lineno for line in finish_lines), (
+                f"{function.name} returns a completion at line {node.lineno} without writing a "
+                "terminal first: the ledger would not say how the run ended"
+            )
+    # Guard against the assertion going vacuous if the exits are ever renamed.
+    assert checked >= 4, f"expected at least four completion exits, found {checked}"
+
+
+def test_the_failure_path_writes_a_terminal_too() -> None:
+    """The exception path is an exit like any other, and it reports `failed`.
+
+    A raised workflow returns no completion at all, so the structural rule above cannot see it. This
+    is the one exit that has to be asserted on its own — it is also the one whose ledger used to end
+    at a turn terminal.
+    """
+    source = (REPO_ROOT / "cli" / "codna" / "durable" / "run_workflow.py").read_text(encoding="utf-8")
+    assert 'self._finish("failed"' in source
+
+
 def test_send_update_refuses_a_payload_without_an_identity() -> None:
     """A second, workflow-independent guarantee: an Update cannot leave the CLI anonymous."""
     import asyncio
@@ -355,7 +538,9 @@ def test_both_engines_stamp_the_actor_on_the_approval_notification() -> None:
 
 def test_the_run_api_identity_and_the_notify_actor_use_the_same_field_name() -> None:
     """One name for one fact, so an auditor's join is a string equality and not a mapping table."""
-    source = (REPO_ROOT / "cli" / "codna" / "durable" / "activity_steps.py").read_text(encoding="utf-8")
+    source = (
+        REPO_ROOT / "cli" / "codna" / "durable" / "activity_notify.py"
+    ).read_text(encoding="utf-8")
     assert 'payload["identity"] = request.actor' in source
 
 

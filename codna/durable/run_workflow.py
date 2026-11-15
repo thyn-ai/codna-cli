@@ -42,6 +42,7 @@ from .contracts import (
     WatchCiRequest,
     WorktreeCleanupRequest,
 )
+from .run_contracts import NOTIFICATION_KIND_RUN_FINISHED, run_terminal_evidence
 from .goal import (
     EpisodeRecap,
     EpisodeRef,
@@ -160,8 +161,32 @@ class RunWorkflow:
             # A run that FAILED is still a run whose worktrees must not leak. `Exception`, not
             # `BaseException`: `continue_as_new` raises a `BaseException`, and that is not an ending —
             # the next generation keeps the same run directory and may still work in those checkouts.
+            #
+            # The terminal is written BEFORE the sweep, and before the re-raise, for two reasons: a
+            # ledger has to say how the run ended (a run that only swept its checkouts would leave the
+            # last record a turn terminal, and the list route would have to DERIVE a verdict from it),
+            # and the ORDER is what a reader's tail sees — the ending first, then the sweep it caused.
+            await self._finish("failed", f"run {spec.run_id}: failed, see the run's error")
             await self._finalize("failed")
             raise
+
+    async def _finish(
+        self, outcome: str, message: str, *, task_id: str | None = None
+    ) -> None:
+        """Write the run's OWN terminal, carrying the outcome the exit took.
+
+        Every exit from a run goes through here, which is what makes "a listed run says how it ended" a
+        property of the code path rather than of one branch somebody remembered.
+
+        ``task_id`` names the task the ending came from. It is not decoration: it is what lets a reader
+        match the terminal to that task's OWN verdict in a ledger written before the terminal carried an
+        outcome, where a "fix CI" attempt's verdict sits in the same window.
+
+        The run's WORKER can still die without reaching this (a killed process has no exit to run), so a
+        ledger ending at a turn terminal remains a real shape; `run_verdict` derives a verdict for it.
+        This makes that derivation the exception rather than the rule.
+        """
+        await self._notify(NOTIFICATION_KIND_RUN_FINISHED, message, task_id=task_id, outcome=outcome)
 
     async def _run_tasks_concurrently(
         self, spec: RunSpec, spec_payload: Mapping[str, Any], remaining: tuple[TaskSpec, ...]
@@ -190,9 +215,17 @@ class RunWorkflow:
         pending: list[tuple[int, Any]] = []
         started = 0
         next_index = 0
+        # The task the run is currently ON. A stop lands wherever the loop happens to be, so the
+        # terminal names the task in the window rather than the next one nobody started.
+        in_flight: str | None = None
         while next_index < len(remaining) or pending:
             await self._respect_pause()
             if self._stopped:
+                await self._finish(
+                    "stopped",
+                    f"run {spec.run_id}: stopped with {len(self._completed)} task(s) done",
+                    task_id=in_flight,
+                )
                 await self._finalize("stopped")
                 return self.completion("stopped")
             # Fill the window. Every guard the sequential loop applies is applied here too, in the
@@ -204,6 +237,11 @@ class RunWorkflow:
                     await self._notify(
                         "note",
                         f"run {spec.run_id}: budget exhausted, not starting {task.task_id}",
+                    )
+                    await self._finish(
+                        "budget_exhausted",
+                        f"run {spec.run_id}: budget exhausted before {task.task_id}",
+                        task_id=task.task_id,
                     )
                     await self._finalize("budget_exhausted")
                     return self.completion("budget_exhausted")
@@ -224,10 +262,12 @@ class RunWorkflow:
                 )
                 next_index += 1
                 started += 1
+                in_flight = task.task_id
             index, handle = pending.pop(0)
             child = await handle
             self._spent += child.cost_usd
             self._completed.append(child.summary())
+            in_flight = None
             if spec.idle_between_tasks_s:
                 await workflow.sleep(timedelta(seconds=spec.idle_between_tasks_s))
 
@@ -237,8 +277,10 @@ class RunWorkflow:
         order = {task.task_id: position for position, task in enumerate(remaining)}
         self._completed.sort(key=lambda summary: order.get(summary.task_id, len(order)))
         await self._report_publish_skips(spec)
-        await self._notify(
-            "run.finished", f"run {spec.run_id}: {len(self._completed)} task(s) done"
+        await self._finish(
+            "completed",
+            f"run {spec.run_id}: {len(self._completed)} task(s) done",
+            task_id=_last_task_id(remaining),
         )
         await self._finalize("completed")
         return self.completion("completed")
@@ -300,6 +342,11 @@ class RunWorkflow:
         for index, task in enumerate(remaining):
             await self._respect_pause()
             if self._stopped:
+                await self._finish(
+                    "stopped",
+                    f"run {spec.run_id}: stopped with {len(self._completed)} task(s) done",
+                    task_id=task.task_id,
+                )
                 await self._finalize("stopped")
                 return self.completion("stopped")
             if self._should_continue_as_new(started):
@@ -328,9 +375,20 @@ class RunWorkflow:
                 await self._notify(
                     "note", f"run {spec.run_id}: budget exhausted, not starting {task.task_id}"
                 )
+                await self._finish(
+                    "budget_exhausted",
+                    f"run {spec.run_id}: budget exhausted before {task.task_id}",
+                    task_id=task.task_id,
+                )
                 await self._finalize("budget_exhausted")
                 return self.completion("budget_exhausted")
             if self._goal_exhausted():
+                await self._finish(
+                    "goal_unmet",
+                    f"run {spec.run_id}: goal exhausted before {task.task_id} "
+                    f"({self._goal_reason})",
+                    task_id=task.task_id,
+                )
                 await self._finalize("goal_unmet")
                 return self.completion("goal_unmet")
             planned = await self._prepare_plan_context(task) if spec.goal is not None else task
@@ -348,22 +406,28 @@ class RunWorkflow:
             # `_after_boundary` has already recorded the verdict and run the CI gate to its bound.
             if self._goal_met():
                 await self._report_publish_skips(spec)
-                await self._notify(
-                    "run.finished",
+                await self._finish(
+                    "completed",
                     f"run {spec.run_id}: goal met after {len(self._completed)} task(s) "
                     f"({self._goal_reason})",
+                    task_id=_last_task_id(remaining),
                 )
                 await self._finalize("completed")
                 return self.completion("completed")
-            await self._notify(
-                "note",
+            await self._finish(
+                "goal_unmet",
                 f"run {spec.run_id}: tasks exhausted with the goal UNMET ({self._goal_reason})",
+                task_id=_last_task_id(remaining),
             )
             await self._finalize("goal_unmet")
             return self.completion("goal_unmet")
 
         await self._report_publish_skips(spec)
-        await self._notify("run.finished", f"run {spec.run_id}: {len(self._completed)} task(s) done")
+        await self._finish(
+            "completed",
+            f"run {spec.run_id}: {len(self._completed)} task(s) done",
+            task_id=_last_task_id(remaining),
+        )
         # AFTER the "finished" notification, so a reader of the ledger sees the run complete before its
         # checkouts disappear — and so the sweep is the last thing that happens, never something a task
         # could still be using.
@@ -447,15 +511,40 @@ class RunWorkflow:
         await self._notify("note", f"run {self._spec.run_id if self._spec else '?'} paused")
         await workflow.wait_condition(lambda: not self._paused or self._stopped)
 
-    async def _notify(self, kind: str, message: str, *, repo_dir: str = "") -> None:
+    async def _notify(
+        self,
+        kind: str,
+        message: str,
+        *,
+        repo_dir: str = "",
+        outcome: str | None = None,
+        task_id: str | None = None,
+    ) -> None:
+        """Report one thing the run did.
+
+        ``outcome`` is for the records that ARE an ending — `run.finished`, `task.finished`,
+        `task.unfinished` — and rides in ``evidence``, which `activity_steps.notify` lifts onto the
+        ledger row's top level. It defaults to None because most notifications are progress; a run that
+        ends its own ledger writes one.
+
+        ``run_terminal_evidence`` refuses a value outside the closed vocabulary, and that refusal is
+        swallowed below like every other notify failure: the run's own work must never be failed by its
+        audit row. ``task_id`` is empty for run-level rows, which is the shape every existing row has.
+        """
         spec = self._spec
         if spec is None:  # pragma: no cover
             return
         try:
+            evidence = {} if outcome is None else run_terminal_evidence(outcome)
             await workflow_activity(
                 NAME_NOTIFY,
                 NotifyRequest(
-                    run_id=spec.run_id, task_id=None, kind=kind, message=message, repo_dir=repo_dir
+                    run_id=spec.run_id,
+                    task_id=task_id,
+                    kind=kind,
+                    message=message,
+                    repo_dir=repo_dir,
+                    evidence=evidence,
                 ),
             )
         except Exception:  # noqa: BLE001 - a notification must never fail a run
@@ -853,8 +942,6 @@ class RunWorkflow:
         self._webhook_payloads.append(dict(payload))
 
 
-
-
 # -- helpers (module level: workflow code must not close over methods) -------------------------
 
 
@@ -870,56 +957,18 @@ def _recap_from_recalled(item: Any) -> EpisodeRecap:
         plan_ref=item.plan_ref,
     )
 
+# The two PURE helpers below are imported from `workflow_support`, where they live beside the rest
+# of the state arithmetic. Re-exported so a caller that reads them from this module (the CI-gate
+# tests do) keeps working, and so "a pure helper belongs in the shared module" is one rule.
+from .workflow_support import _evidence_message, _pr_coordinates  # noqa: E402,F401
 
-def _pr_coordinates(child: Any) -> tuple[int | None, str | None]:
-    """A finished task's pull request: ``(number, head_sha)``, either of which may be None.
 
-    Read from the state rather than from the `TaskSummary`, because the summary carries the URL (what
-    a human reads) and the CI gate needs the NUMBER (what the API takes); deriving one from the other
-    would mean parsing a URL in workflow code.
+def _last_task_id(tasks: tuple[TaskSpec, ...]) -> str | None:
+    """The id of the last task a run's terminal reports on, or None when there is none.
 
-    The head sha falls back to the checkpoint's commit when the PR ref did not record one: that is
-    the commit this run pushed, which is the commit CI judges. A PR opened without a head sha (an
-    older spec, or a provider that omits it) therefore still gates on the right commit.
+    A run's terminal names the task its exit came from, so a reader can match it to THAT task's own
+    verdict in a ledger written before the terminal carried an outcome. ``None`` rather than an
+    exception for an empty list: a resumed run can arrive with every task already `continue_as_new`-ed
+    away, and an ending is not an error just because this execution started none of them.
     """
-    state = getattr(child, "state", None)
-    if not isinstance(state, dict):
-        return None, None
-    pr = state.get("pr")
-    number: int | None = None
-    head_sha: str | None = None
-    if isinstance(pr, dict):
-        raw = pr.get("number")
-        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
-            number = raw
-        if isinstance(pr.get("head_sha"), str) and pr["head_sha"]:
-            head_sha = str(pr["head_sha"])
-    if head_sha is None:
-        checkpoint = state.get("checkpoint_ref")
-        if isinstance(checkpoint, dict) and isinstance(checkpoint.get("sha"), str):
-            head_sha = str(checkpoint["sha"])
-    return number, head_sha
-
-
-
-def _evidence_message(evidence: Mapping[str, Any]) -> str:
-    """A one-line human summary of a structured notification, from the evidence itself.
-
-    Deterministic in the evidence, so the ledger row replays to the same string. Kept small: the
-    evidence is the record, this is the sentence a reader skims.
-    """
-    parts: list[str] = []
-    for key in ("satisfied", "reason", "tasks_done", "tasks_remaining", "ci_state", "ci_attempts"):
-        if key in evidence:
-            parts.append(f"{key}={evidence[key]}")
-    checks = evidence.get("checks")
-    if isinstance(checks, list) and checks:
-        parts.append(
-            "checks="
-            + ",".join(
-                f"{entry[0]}-{entry[1]}"
-                for entry in checks
-                if isinstance(entry, list) and len(entry) == 2
-            )
-        )
-    return " ".join(parts) or "notified"
+    return tasks[-1].task_id if tasks else None
