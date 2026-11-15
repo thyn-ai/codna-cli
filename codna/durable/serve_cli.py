@@ -18,6 +18,7 @@ import os
 import sys
 from typing import Any
 
+from . import serve_guard as serve_guard_module
 from .run_api_backend import RunBackend, RunCapabilities, ledger_only_capabilities
 
 __all__ = ["add_serve_flags", "cmd_serve"]
@@ -52,7 +53,14 @@ def _error(message: str, *, code: str, details: dict[str, object] | None = None,
 
 
 def cmd_serve(args: Any) -> int:
-    """`codna durable serve` / `codna serve`: the loopback Run API the IDE drives a run through.
+    """`codna serve` / `codna durable serve`: the loopback Run API the IDE drives a run through.
+
+    THE GUARD IS ARMED FIRST, from `--guard-parent-pid`, and it is the desktop's supervision contract
+    expressed by the SPAWNER (see `serve_guard.py`): the child watches the app that started it, and stops
+    through the ordinary SIGTERM path when that app goes away — the only mechanism that survives a SIGKILL
+    of the app. It is validated before anything is imported or started, so a mismatched pid refuses rather
+    than guarding a process nobody checked, and it is OPT-IN: a human who typed `codna serve` has no
+    supervisor, and losing a terminal must not abandon an API another window is driving.
 
     A foreground command: it binds, prints ONE banner (the address and the token's PATH, never the
     token), and serves until interrupted. Everything the surface enforces — loopback only, the 0600
@@ -69,6 +77,20 @@ def cmd_serve(args: Any) -> int:
     because a caller keying on its absence should keep working. A mode an operator chose is described
     as a mode — never as a failure to reach something.
     """
+    # VALIDATED BEFORE ANY DEPENDENCY IS TOUCHED. A parent that is gone leaves an orphan whether the
+    # process died before importing Temporal or after binding the socket, so the guard covers startup too.
+    parent_pid = serve_guard_module.guard_parent_pid(getattr(args, "guard_parent_pid", None))
+    with serve_guard_module.arm_parent_guard(parent_pid):
+        # EVERY DEPENDENCY IS IMPORTED INSIDE THE GUARD'S WINDOW, and resolved from its DEFINING module
+        # rather than rebound here. That is not style: `run_api`/`identity` pull in `httpx` and the durable
+        # extra, and importing them at this module's scope is a startup cost on every `codna --help` (the
+        # reason this whole file's imports are local). Reaching the module object per call also means a test
+        # that swaps `run_api.RunApiServer` sees the change, because there is exactly one binding.
+        return _serve(args, config=_cli_module()._config(args))
+
+
+def _serve(args: Any, *, config: Any) -> int:
+    """The serving body, inside the armed guard. Split out so the guard's scope is visible in one place."""
     from . import require_durable
     from .identity import IdentityError, IdentityResolver
     from .run_api import RunApiServer, TemporalRunBackend
@@ -76,7 +98,6 @@ def cmd_serve(args: Any) -> int:
 
     if not getattr(args, "no_temporal", False):
         require_durable()
-    config = _cli_module()._config(args)
     # THE STACK, IN ONE COMMAND. `--start-dev-server` brings Temporal up (idempotently: `ensure_started`
     # adopts a server that is already answering) BEFORE the backend connects, so the very next thing this
     # process does — `TemporalRunBackend(config)` — finds the address live instead of refusing. Refused
@@ -357,6 +378,14 @@ def add_serve_flags(serve: Any) -> None:
                             "durable mode (one command instead of `codna durable dev-server start` + `codna serve`)")
     serve.add_argument("--start-timeout", type=float, default=60.0,
                        help="how long --start-dev-server may take to bring Temporal up (default: 60)")
+    # THE SUPERVISION CONTRACT, the same one `codna worker` carries. The desktop app forks this server and
+    # names its own pid, and the server then stops (through the ordinary SIGTERM/drain path) the moment that
+    # pid is gone — which is what makes "the app owns its run API" true across a SIGKILL of the app rather
+    # than only across a graceful quit. OPT-IN, like the worker's: a human who typed `codna serve` has no
+    # supervisor, and a closed terminal must not abandon an API another window is driving.
+    serve.add_argument("--guard-parent-pid", type=int, default=None, metavar="PID",
+                       help="stop when the process PID (the app that spawned this server) goes away; "
+                            "set by the Codna desktop app, never needed for a hand-run server")
     # -- the identity layer ------------------------------------------------------------------
     #
     # `token` is the default because it is what every existing caller already has. `oidc` is the

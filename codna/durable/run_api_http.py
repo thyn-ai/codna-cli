@@ -570,6 +570,9 @@ class RunApiHandler(BaseHTTPRequestHandler):
         max_parallel_tasks = optional_positive_int(body, "max_parallel_tasks", default=1)
         try:
             repo_dir = durable_cli._http_repo_dir(raw_repo, allowed_roots=self.api.settings.allowed_repo_roots)
+            # Preserve the API's existing missing-policy behavior: no policy means no exemption,
+            # never a refusal invented by this feature. A present policy is still read fail-closed.
+            auto_approve, policy_digest = run_cli._optional_repository_policy(repo_dir)
             payload = run_cli.run_payload_for(
                 config=self.api.config,
                 run_id=run_id,
@@ -591,6 +594,8 @@ class RunApiHandler(BaseHTTPRequestHandler):
                 enable_agent_teams=enable_agent_teams,
                 max_parallel_tasks=max_parallel_tasks,
                 worktree_branch=worktree_branch,
+                auto_approve_local_only=auto_approve,
+                approval_policy_digest=policy_digest,
             )
         except RunApiError:
             raise
