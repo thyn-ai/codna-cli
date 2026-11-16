@@ -406,11 +406,16 @@ def test_plain_engine_walks_the_full_route_the_plan_names(tmp_path: Path):
 
     # The route, exactly — from the ledger, which is what an auditor reads.
     assert harness.route() == FULL_ROUTE, harness.route()
-    # Parked, and `status` says exactly what it is waiting for.
+    # Parked, and `status` says exactly what it is waiting for. THE REASON IS `ready_for_approval`,
+    # not `review_not_approved`: this task's review APPROVED (asserted below), and the gate is asking
+    # a human to RELEASE reviewed work — the normal end of every route. It used to report
+    # `review_not_approved` here, i.e. claim the review had failed while the same status object
+    # carried `review_verdict: "approved"`. That is defect 2 (`run-cancelrepro-before` seq 404 vs 406)
+    # and this assertion is where the contradiction was already written down as expected behaviour.
     assert result["status"]["awaiting_approval"] is True
-    assert result["status"]["parked_on"] == "review_not_approved"
+    assert result["status"]["parked_on"] == "ready_for_approval"
     assert result["status"]["pending_approval"]["kind"] == "approve"
-    assert result["status"]["pending_approval"]["reason"] == "review_not_approved"
+    assert result["status"]["pending_approval"]["reason"] == "ready_for_approval"
     # Exactly one checkpoint per IMPLEMENT turn. The plan is a paid turn too (turn 1), so the three
     # implement turns are 2, 3 and 4 — which is the point of giving the plan its own `turn_seq`: the
     # cost of planning is visible instead of folded into the first implement turn.
@@ -438,7 +443,7 @@ def test_plain_engine_walks_the_full_route_the_plan_names(tmp_path: Path):
         "identity": "alice@example.com",
         "kind": "approve",
         "turn_seq": 4,
-        "reason": "review_not_approved",
+        "reason": "ready_for_approval",
     }
 
 

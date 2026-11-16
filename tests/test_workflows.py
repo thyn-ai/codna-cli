@@ -67,6 +67,65 @@ def test_dependabot_leaves_the_toolchain_pin_to_propagate():
     assert any(name.startswith("thyn-ai/security-toolchain") and name.endswith("*") for name in ignored), ignored
 
 
+# --- package-ide.yml: a tag is a release and must always schedule the macOS leg -------------------------
+
+PACKAGE_IDE = WORKFLOWS / "package-ide.yml"
+_MATRIX_EXPR = re.compile(r"^\$\{\{(.*)\}\}$", re.S)
+
+
+def _matrix_expression() -> str:
+    doc = yaml.safe_load(PACKAGE_IDE.read_text(encoding="utf-8"))
+    raw = doc["jobs"]["package"]["strategy"]["matrix"]["include"]
+    assert isinstance(raw, str), f"matrix.include must be a single expression, got {type(raw).__name__}"
+    match = _MATRIX_EXPR.match(raw.strip())
+    assert match, raw
+    return match.group(1).strip()
+
+
+def _evaluate_matrix(ref_type: str, run_mac):
+    """Evaluate the matrix expression for one trigger, using a translation of the exact subset of the
+    GitHub expression language the line uses (`&&`, `||`, `==`, `fromJSON`). Nothing is retyped: the
+    expression comes from the workflow, so editing the workflow edits what this asserts.
+
+    `run_mac` is None when `github.event.inputs` is null — which is the entire defect: on a tag push
+    the field is absent, so an expression keyed only on it fell through to the ubuntu-only branch.
+    """
+    import json
+
+    source = _matrix_expression()
+    python = source.replace("github.event.inputs.run_mac", "RUN_MAC").replace("github.ref_type", "REF_TYPE")
+    python = python.replace("fromJSON(", "_from_json(").replace("&&", " and ").replace("||", " or ")
+    scope = {"_from_json": json.loads, "REF_TYPE": ref_type, "RUN_MAC": run_mac}
+    legs = eval(python, {"__builtins__": {}}, scope)  # noqa: S307 -- fixed translation of a tracked literal
+    return [leg["os"] for leg in legs]
+
+
+BOTH_LEGS = ["ubuntu-latest", "macos-latest"]
+
+
+def test_package_ide_a_tag_push_always_schedules_the_macos_leg():
+    # Measured defect: a `ide-v*` tag produced an ubuntu-only matrix, so every `if: matrix.os ==
+    # 'macos-latest'` step (signing, notarization, verify-signing, the .dmg build) was skipped and the
+    # release emitted no macOS artifact under ANY credential configuration.
+    assert _evaluate_matrix("tag", None) == BOTH_LEGS
+
+
+def test_package_ide_macos_leg_cases_are_the_three_documented_ones():
+    assert _evaluate_matrix("tag", "true") == BOTH_LEGS             # dispatch targeted at a tag
+    assert _evaluate_matrix("branch", "true") == BOTH_LEGS          # dispatch asking for mac
+    assert _evaluate_matrix("branch", "false") == ["ubuntu-latest"]  # dispatch declining mac
+    assert _evaluate_matrix("branch", None) == ["ubuntu-latest"]     # dispatch with no inputs object
+
+
+def test_package_ide_matrix_does_not_gate_the_mac_leg_on_dispatch_inputs_alone():
+    # The shape of the regression, independent of evaluation: the mac gate must consult the REF.
+    expression = _matrix_expression()
+    gate = expression.split("&&", 1)[0]
+    assert "github.ref_type == 'tag'" in gate, gate
+    assert gate.strip().startswith("(") and gate.strip().endswith(")"), \
+        f"the tag/dispatch condition must stay one explicit parenthesized group: {gate!r}"
+
+
 # --- webhook-ops.yml: the rollout's operator surface --------------------------------------------------
 
 WEBHOOK_OPS = WORKFLOWS / "webhook-ops.yml"
