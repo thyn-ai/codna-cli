@@ -51,6 +51,13 @@ budget:
   max_turn_cost_usd: 0.5
   max_tokens: 250000                     # positive integer
 required_approvals: [run_commands]       # tool names a human must approve every call to
+approval:
+  mode: human                            # or auto_for_low_risk: verified local-only completion only
+```
+
+`approval.mode` defaults to `human`. `auto_for_low_risk` permits only terminal completion after the
+publish step proves there is no `origin` remote, verification passed, review approved and budget
+remains. It does NOT permit a tool call, command, edit or publish: those gates are unchanged.
 ```
 
 Every section is optional at the top level (an absent section permits nothing in that category),
@@ -101,8 +108,13 @@ DEFAULT_POLICY_RELPATH = os.path.join(".codna", "policy.yaml")
 MAX_DOCUMENT_DEPTH = 16
 
 TOP_LEVEL_KEYS: frozenset[str] = frozenset(
-    {"version", "tools", "write_scope", "command_allow_list", "budget", "required_approvals"}
+    {
+        "version", "tools", "write_scope", "command_allow_list", "budget",
+        "required_approvals", "approval",
+    }
 )
+APPROVAL_KEYS: frozenset[str] = frozenset({"mode"})
+APPROVAL_MODES: frozenset[str] = frozenset({"human", "auto_for_low_risk"})
 TOOLS_KEYS: frozenset[str] = frozenset({"allow", "deny"})
 WRITE_SCOPE_KEYS: frozenset[str] = frozenset({"paths", "deny"})
 COMMAND_KEYS: frozenset[str] = frozenset({"commands"})
@@ -158,6 +170,7 @@ class RuntimePermissions:
     max_turn_cost_usd: float | None = None
     max_tokens: int | None = None
     required_approvals: tuple[str, ...] = ()
+    approval_mode: str = "human"
 
     def effective_tools(self) -> tuple[str, ...]:
         """`allow` minus `deny`: deny always wins, which is the only safe precedence."""
@@ -178,6 +191,7 @@ class RuntimePermissions:
                 "max_tokens": self.max_tokens,
             },
             "required_approvals": list(self.required_approvals),
+            "approval_mode": self.approval_mode,
         }
 
 
@@ -553,6 +567,29 @@ def _budget(value: Any, at: str) -> tuple[float | None, float | None, int | None
     )
 
 
+def _approval_mode(value: Any) -> str:
+    """Validate the terminal-completion mode, defaulting every absent section to human."""
+    if value is None:
+        return "human"
+    section = _require_mapping(value, "approval")
+    _reject_unknown_keys(section, APPROVAL_KEYS, "approval")
+    if "mode" not in section:
+        raise _fail("policy_missing_field", "approval.mode is required", "approval.mode")
+    mode = section["mode"]
+    if not isinstance(mode, str):
+        raise _fail(
+            "policy_invalid_type", "approval.mode must be a string", "approval.mode",
+            expected="string", received=type(mode).__name__,
+        )
+    if mode not in APPROVAL_MODES:
+        raise _fail(
+            "policy_invalid_value",
+            f"approval.mode must be one of {', '.join(sorted(APPROVAL_MODES))}",
+            "approval.mode", value=mode,
+        )
+    return mode
+
+
 def _parse_permissions(document: Mapping[str, Any]) -> tuple[int, RuntimePermissions]:
     """Validate a parsed document and return its normalized permissions.
 
@@ -635,6 +672,7 @@ def _parse_permissions(document: Mapping[str, Any]) -> tuple[int, RuntimePermiss
         max_turn_cost_usd=max_turn,
         max_tokens=max_tokens,
         required_approvals=approvals,
+        approval_mode=_approval_mode(document.get("approval")),
     )
 
 

@@ -318,3 +318,92 @@ def test_a_fault_in_the_BUILTIN_browser_entry_is_a_BrowserToolError(monkeypatch)
     assert caught.value.code == "mcp_env_missing"
     assert caught.value.details["variable"] == "NOT_SET_FOR_BROWSER"
     assert caught.value.details["server"] == "browser"
+
+
+# ── the capability note reports the EFFECTIVE server, not the declared list ────────────────────
+#
+# Measured twice on installed builds: the ledger held `session.mcp_attached: {servers: ["browser"],
+# tools: 25}` and dozens of real `browser__browser_*` calls, while the run's ONE human-readable note said
+# "MCP is not attached — no MCP servers are configured for this run". The note was built from the spec's
+# DECLARED `mcp_servers`, and the built-in browser server is appended later, by `session_mcp_servers`.
+#
+# The note is imported from `capability_notes`, NOT `capability_report`, and that is deliberate: the
+# latter schedules activities and imports `temporalio`, so importing it here would make a pure string
+# builder require the OPTIONAL `durable` extra. This file runs on the offline lane (no extra), which is
+# exactly the branch that regressed when the note lived in `capability_report`. The re-export keeps
+# `capability_report.capability_notes` working for callers that already import it.
+
+
+def _run_spec(tmp_path: Path, mcp_servers: tuple = ()):
+    from codna.durable.contracts import RunSpec, TaskSpec
+
+    task = TaskSpec(
+        run_id="run-note",
+        task_id="task-1",
+        task_number=1,
+        brief="Check the page",
+        repo_dir=str(tmp_path),
+        verify_commands=("true",),
+        engine="plain",
+        mcp_servers=mcp_servers,
+    )
+    return RunSpec(run_id="run-note", repo_dir=str(tmp_path), base_branch="main", tasks=(task,))
+
+
+def test_the_capability_note_NAMES_the_builtin_browser_server_when_it_is_on(tmp_path: Path) -> None:
+    """The sentence a human reads to answer "did the browser run?" must say yes when it did."""
+    from codna.durable.capability_notes import capability_notes
+
+    notes = capability_notes(_run_spec(tmp_path), ON)
+    mcp = next(message for kind, message in notes if "MCP is" in message)
+    assert "MCP is attached" in mcp
+    assert "browser" in mcp
+    assert "not attached" not in mcp
+
+
+def test_the_capability_note_still_reports_a_genuine_absence_when_the_tool_is_off(
+    tmp_path: Path,
+) -> None:
+    """The other half: with the switch off and nothing declared, the note must say not attached."""
+    from codna.durable.capability_notes import capability_notes
+
+    notes = capability_notes(_run_spec(tmp_path), OFF)
+    mcp = next(message for kind, message in notes if "MCP is" in message)
+    assert "MCP is not attached" in mcp
+    assert "browser" not in mcp
+
+
+def test_the_capability_note_lists_declared_AND_builtin_servers_together(tmp_path: Path) -> None:
+    """A run that declared its own server AND enabled the browser is reported as carrying both."""
+    from codna.durable.capability_notes import capability_notes
+
+    spec = _run_spec(tmp_path, (
+        {"name": "docs", "transport": {"type": "stdio", "command": "npx", "args": []}},
+    ))
+    mcp = next(message for kind, message in capability_notes(spec, ON) if "MCP is" in message)
+    assert "MCP is attached" in mcp
+    assert "docs" in mcp
+    assert "browser" in mcp
+
+
+def test_the_capability_note_reads_the_environment_by_default(tmp_path: Path, monkeypatch) -> None:
+    """The workflow passes no env, so the note must read the WORKER's switch, not a frozen empty map."""
+    from codna.durable.capability_notes import capability_notes
+
+    monkeypatch.setenv(BROWSER_TOOL_ENV, "1")
+    monkeypatch.setenv("CODNA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    mcp = next(message for kind, message in capability_notes(_run_spec(tmp_path)) if "MCP is" in message)
+    assert "MCP is attached" in mcp
+    assert "browser" in mcp
+
+
+def test_the_capability_note_does_not_hide_a_configuration_fault(tmp_path: Path) -> None:
+    """A broken switch must still name the fault and its CODE — never a plain "not attached"."""
+    from codna.durable.capability_notes import capability_notes
+
+    notes = capability_notes(_run_spec(tmp_path), {**OFF, BROWSER_TOOL_ENV: "maybe"})
+    mcp = next(message for kind, message in notes if "MCP is" in message)
+    assert "MCP is not attached" in mcp
+    # The machine half: the code travels, so a surface can branch without matching on prose.
+    assert "browser_config_invalid" in mcp
+    assert BROWSER_TOOL_ENV in mcp

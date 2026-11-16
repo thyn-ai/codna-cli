@@ -512,16 +512,23 @@ class FakeVerify:
 
 @dataclass
 class FakeReviewReport:
-    """A review report shaped like `ReviewResult`, with a scripted conclusion."""
+    """A review report shaped like `ReviewResult`, with a scripted conclusion and findings.
+
+    ``findings`` is a list of the fields a real `CodnaReviewFinding` carries, so the durable side's
+    claim about a rejection — "the reviewer's findings reach the retry's prompt" — can be asserted on
+    CONTENT (a path, a line, a severity, a title) rather than on a count. A fake that could only
+    report severities made that assertion impossible, which is how the defect it now covers survived
+    a suite that already drove a review rejection.
+    """
 
     conclusion: str = "success"
-    severities: tuple[str, ...] = ()
+    findings: list[dict[str, Any]] = field(default_factory=list)
 
-    @property
-    def findings(self) -> list[Any]:
-        from types import SimpleNamespace
-
-        return [SimpleNamespace(severity=severity) for severity in self.severities]
+    @classmethod
+    def with_findings(
+        cls, conclusion: str, findings: list[dict[str, Any]]
+    ) -> "FakeReviewReport":
+        return cls(conclusion=conclusion, findings=[dict(item) for item in findings])
 
 
 @dataclass
@@ -539,6 +546,11 @@ class Harness:
     runtime: ActivityRuntime
     verify_passes: list[bool] = field(default_factory=lambda: [True])
     review_conclusions: list[str] = field(default_factory=lambda: ["success"])
+    #: The findings each scripted review returns, one list per call (see `run_review`). Separate from
+    #: `review_conclusions` so a test states the CONCLUSION and the REASONS independently: the defect
+    #: this covers was a rejection whose reasons never reached the retry, and a fake that could not
+    #: say what the reasons were could not have detected it.
+    review_findings_script: list[list[dict[str, Any]]] = field(default_factory=list)
     pr_number: int = 1
     verify_calls: int = 0
     review_calls: int = 0
@@ -557,10 +569,18 @@ class Harness:
         return FakeVerify(passed=passed, returncode=0 if passed else 1)
 
     def run_review(self, request: Any, sha: str) -> FakeReviewReport:
-        """Scripted review: pop a conclusion per call, defaulting to a clean review."""
+        """Scripted review: pop a conclusion per call, defaulting to a clean review.
+
+        ``review_findings_script`` is consumed ALONGSIDE the conclusions, one entry per call (an
+        exhausted or absent script means "no findings"), so a scenario can say "reject, and here is
+        exactly what the reviewer said" without the fake inventing findings on its own.
+        """
         self.review_calls += 1
         conclusion = self.review_conclusions.pop(0) if self.review_conclusions else "success"
-        return FakeReviewReport(conclusion=conclusion)
+        findings = (
+            self.review_findings_script.pop(0) if self.review_findings_script else []
+        )
+        return FakeReviewReport(conclusion=conclusion, findings=[dict(item) for item in findings])
 
     def push_and_open(self, request: Any, sha: str) -> dict[str, Any]:
         self.push_calls += 1

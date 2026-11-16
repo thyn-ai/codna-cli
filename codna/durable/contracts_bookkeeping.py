@@ -25,10 +25,61 @@ __all__ = [
     "DelegationPolicyOutcome",
     "DelegationPolicyRequest",
     "EpisodeRequest",
+    "McpAttachmentOutcome",
+    "McpAttachmentRequest",
     "NotifyRequest",
     "WorktreeCleanupOutcome",
     "WorktreeCleanupRequest",
 ]
+
+
+@dataclass(frozen=True)
+class McpAttachmentRequest:
+    """Ask which MCP servers a durable turn is EFFECTIVELY handed, given this worker's environment.
+
+    The DECLARED servers travel in the payload (the run's own tasks' union, disabled entries removed) so
+    the activity needs nothing else from the spec. What it ADDS is the half a workflow cannot see: the
+    worker-wide ``CODNA_MCP_SERVERS`` default and Codna's built-in browser server, which
+    `mcp.session_mcp_servers` appends when ``CODNA_BROWSER_TOOL=1``.
+
+    An activity rather than workflow code because the answer reads ``os.environ``, which the workflow
+    sandbox refuses — the same reason the delegation-policy read is one. The answer also lands in
+    history, so a replay derives the note instead of re-reading an environment that may have changed.
+    """
+
+    run_id: str
+    servers: tuple[dict[str, Any], ...] = ()
+
+    def validate(self) -> None:
+        _require_ref(self.run_id, "run_id")
+        if not isinstance(self.servers, tuple):
+            raise ContractError(
+                "mcp attachment servers must be a tuple",
+                code="contract_invalid",
+                details={"field": "servers"},
+            )
+        for server in self.servers:
+            if not isinstance(server, dict) or not server.get("name"):
+                raise ContractError(
+                    "mcp attachment servers must each be a named mapping",
+                    code="contract_invalid",
+                    details={"field": "servers", "server": repr(server)[:120]},
+                )
+
+
+@dataclass(frozen=True)
+class McpAttachmentOutcome:
+    """What was effectively attached: ON with the server names, or OFF with the reason and a code.
+
+    ``error_code`` is non-empty ONLY when the configuration itself was at fault (an unset ``from_env``
+    variable, an invalid browser switch). It is what lets a surface distinguish "we attach nothing" from
+    "we were asked to attach something and the setting is broken" without matching on prose.
+    """
+
+    attached: bool
+    servers: tuple[str, ...] = ()
+    reason: str = ""
+    error_code: str = ""
 
 
 @dataclass(frozen=True)

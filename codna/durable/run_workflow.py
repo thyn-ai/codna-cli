@@ -7,16 +7,23 @@ rejected. So the workflow carries its progress in its INPUT (`RunProgress`) and 
 history passes 5,000 events. The input is small and fixed-size, so the restart cannot itself grow
 without bound.
 
-**Why the arguments are keyword `args`.** ``workflow.continue_as_new``'s signature is
-``(arg=..., *, args=[...])``, so passing a SECOND positional argument raises ``TypeError`` — which
-fails the workflow task, and Temporal then retries it forever. The run wedges with its later tasks
-never started, and every query on it times out. Measured while building D2.3; `args=[...]` is the only
-correct form for a multi-parameter ``run``.
+**Continue-as-new is how a long run stays replayable.** Temporal history is finite; a run with thirty
+tasks and ten turns each would pass the 10,240-event ceiling, become slow to replay, and eventually be
+rejected. So the workflow carries its progress in its INPUT (`RunProgress`) and restarts itself with
+``continue_as_new`` when either bound is crossed — every 10 completed tasks, or once this execution's
+history passes 5,000 events. The input is small and fixed-size, so the restart cannot itself grow
+without bound. (The keyword-`args` requirement is stated where the call is, because that is where an
+edit would break it.)
 
 **`remaining_usd` is the run's cap minus what its children reported.** A task that exhausts its own cap
 parks on a human; a run whose TOTAL is exhausted stops starting tasks and returns ``budget_exhausted``.
 Two different questions — "may this task spend more?" vs. "may this run buy another task?" — which is
 why the budget is checked in both places.
+
+**A stop is DELIVERED to the in-flight child.** A run cannot return until its `await` on the child
+returns, and a child parked in `wait_for_human` only returns when something sets ITS stop. The run
+keeps that handle and delivers `STOP_SIGNAL` before reporting `stopped`; `stop_delivery.py` carries
+the rationale and the measured stall this closes.
 """
 from __future__ import annotations
 
@@ -24,11 +31,11 @@ from datetime import timedelta
 from typing import Any, Mapping
 
 from temporalio import workflow
+from temporalio.workflow import HandlerUnfinishedPolicy
 
 from .contracts import (
     NAME_NOTIFY,
     NAME_RECALL,
-    NAME_WATCH_CI,
     NAME_WORKTREE_CLEANUP,
     NotifyRequest,
     RecallRequest,
@@ -39,15 +46,17 @@ from .contracts import (
     TaskCompletion,
     TaskSpec,
     TaskSummary,
-    WatchCiRequest,
     WorktreeCleanupRequest,
 )
+from .run_contracts import NOTIFICATION_KIND_RUN_FINISHED, run_terminal_evidence
+from .run_reporting import report_publish_skips
+from .stop_delivery import StopDelivery, StopRouting
+from .ci_fix_loop import CiFixLoop
 from .goal import (
     EpisodeRecap,
     EpisodeRef,
     GoalEvidence,
     StopDecision,
-    build_ci_fix_brief,
     evaluate_stop,
     format_objective_section,
 )
@@ -87,7 +96,7 @@ __all__ = ["RunWorkflow", "workflow_class_for"]
 
 
 @workflow.defn(name="RunWorkflow")
-class RunWorkflow:
+class RunWorkflow(StopRouting, CiFixLoop):
     """A run: one child task per task, a run-level budget, and continue-as-new.
 
     **Continue-as-new is how a long run stays replayable.** Temporal history is finite; a run with
@@ -125,6 +134,12 @@ class RunWorkflow:
         self._deliveries: list[str] = []
         self._duplicate_deliveries: list[str] = []
         self._webhook_payloads: list[dict[str, Any]] = []
+        # The child this run is AWAITING, so a stop can reach a child parked on an approval.
+        # `stop_delivery.py` owns the rationale and the measured stall this closes. SAVED AND
+        # RESTORED around each await: a goal-mode CI fix runs a NESTED `_run_task` inside the outer
+        # child's await, and nulling on the way out would destroy the outer handle.
+        self._in_flight_handle: Any | None = None
+        self._stop_delivery = StopDelivery()
 
     @workflow.run
     async def run(
@@ -160,8 +175,32 @@ class RunWorkflow:
             # A run that FAILED is still a run whose worktrees must not leak. `Exception`, not
             # `BaseException`: `continue_as_new` raises a `BaseException`, and that is not an ending —
             # the next generation keeps the same run directory and may still work in those checkouts.
+            #
+            # The terminal is written BEFORE the sweep, and before the re-raise, for two reasons: a
+            # ledger has to say how the run ended (a run that only swept its checkouts would leave the
+            # last record a turn terminal, and the list route would have to DERIVE a verdict from it),
+            # and the ORDER is what a reader's tail sees — the ending first, then the sweep it caused.
+            await self._finish("failed", f"run {spec.run_id}: failed, see the run's error")
             await self._finalize("failed")
             raise
+
+    async def _finish(
+        self, outcome: str, message: str, *, task_id: str | None = None
+    ) -> None:
+        """Write the run's OWN terminal, carrying the outcome the exit took.
+
+        Every exit from a run goes through here, which is what makes "a listed run says how it ended" a
+        property of the code path rather than of one branch somebody remembered.
+
+        ``task_id`` names the task the ending came from. It is not decoration: it is what lets a reader
+        match the terminal to that task's OWN verdict in a ledger written before the terminal carried an
+        outcome, where a "fix CI" attempt's verdict sits in the same window.
+
+        The run's WORKER can still die without reaching this (a killed process has no exit to run), so a
+        ledger ending at a turn terminal remains a real shape; `run_verdict` derives a verdict for it.
+        This makes that derivation the exception rather than the rule.
+        """
+        await self._notify(NOTIFICATION_KIND_RUN_FINISHED, message, task_id=task_id, outcome=outcome)
 
     async def _run_tasks_concurrently(
         self, spec: RunSpec, spec_payload: Mapping[str, Any], remaining: tuple[TaskSpec, ...]
@@ -190,9 +229,18 @@ class RunWorkflow:
         pending: list[tuple[int, Any]] = []
         started = 0
         next_index = 0
+        # The task the run is currently ON. A stop lands wherever the loop happens to be, so the
+        # terminal names the task in the window rather than the next one nobody started.
+        in_flight: str | None = None
         while next_index < len(remaining) or pending:
             await self._respect_pause()
             if self._stopped:
+                await self._stop_window(pending)
+                await self._finish(
+                    "stopped",
+                    f"run {spec.run_id}: stopped with {len(self._completed)} task(s) done",
+                    task_id=in_flight,
+                )
                 await self._finalize("stopped")
                 return self.completion("stopped")
             # Fill the window. Every guard the sequential loop applies is applied here too, in the
@@ -204,6 +252,11 @@ class RunWorkflow:
                     await self._notify(
                         "note",
                         f"run {spec.run_id}: budget exhausted, not starting {task.task_id}",
+                    )
+                    await self._finish(
+                        "budget_exhausted",
+                        f"run {spec.run_id}: budget exhausted before {task.task_id}",
+                        task_id=task.task_id,
                     )
                     await self._finalize("budget_exhausted")
                     return self.completion("budget_exhausted")
@@ -224,10 +277,27 @@ class RunWorkflow:
                 )
                 next_index += 1
                 started += 1
+                in_flight = task.task_id
             index, handle = pending.pop(0)
-            child = await handle
+            # The awaited child is this run's in-flight work, so a stop can reach it while it is
+            # parked — see `stop_delivery.py`. `_await_in_flight` keeps the run REACHABLE by the stop
+            # and records the REST OF THE WINDOW too, since those children are just as parked.
+            child = await self._await_in_flight(handle, window=tuple(other for _i, other in pending))
             self._spent += child.cost_usd
             self._completed.append(child.summary())
+            in_flight = None
+            # A child that returned BECAUSE it was told to stop leaves the run stopped, not completed:
+            # its summary is kept, and the rest of the window is told so none of them keeps waiting.
+            if self._stopped:
+                await self._stop_window(pending)
+                await self._report_publish_skips(spec)
+                await self._finish(
+                    "stopped",
+                    f"run {spec.run_id}: stopped with {len(self._completed)} task(s) done",
+                    task_id=_last_task_id(remaining),
+                )
+                await self._finalize("stopped")
+                return self.completion("stopped")
             if spec.idle_between_tasks_s:
                 await workflow.sleep(timedelta(seconds=spec.idle_between_tasks_s))
 
@@ -237,33 +307,17 @@ class RunWorkflow:
         order = {task.task_id: position for position, task in enumerate(remaining)}
         self._completed.sort(key=lambda summary: order.get(summary.task_id, len(order)))
         await self._report_publish_skips(spec)
-        await self._notify(
-            "run.finished", f"run {spec.run_id}: {len(self._completed)} task(s) done"
+        await self._finish(
+            "completed",
+            f"run {spec.run_id}: {len(self._completed)} task(s) done",
+            task_id=_last_task_id(remaining),
         )
         await self._finalize("completed")
         return self.completion("completed")
 
     async def _report_publish_skips(self, spec: RunSpec) -> None:
-        """Record ONCE, at the end, which tasks finished without publishing — and why.
-
-        The task's own ledger note (`publish.skipped`, written by the publish step) says what
-        happened to it; this summary is what makes the RUN's ledger answer "did this run open
-        anything?" without a reader walking every task's records. A run whose tasks all published
-        writes nothing new, so an existing history replays with the exact record set it had.
-
-        A notification, never a failure: the work is done, and the reason (no GitHub remote) is a
-        fact about the repository rather than a defect in the run.
-        """
-        skipped = tuple(summary for summary in self._completed if summary.unpublished)
-        if not skipped:
-            return
-        names = ", ".join(summary.task_id for summary in skipped)
-        await self._notify(
-            "note",
-            f"run {spec.run_id}: {len(skipped)} task(s) finished without a pull request "
-            f"({names}): the repository has nothing to publish to (no GitHub remote); the commits "
-            "are on each task's branch.",
-        )
+        """The run's one summary of tasks that could not publish; `run_reporting.py` explains why."""
+        await report_publish_skips(self._completed, spec.run_id, notify=self._notify)
 
     async def _run_tasks(
         self, spec: RunSpec, spec_payload: Mapping[str, Any], remaining: tuple[TaskSpec, ...]
@@ -300,6 +354,14 @@ class RunWorkflow:
         for index, task in enumerate(remaining):
             await self._respect_pause()
             if self._stopped:
+                # A stop that lands BETWEEN children has no child to tell: `_in_flight_handle` was
+                # cleared when the last await returned, so this delivery is a no-op.
+                await self._stop_in_flight()
+                await self._finish(
+                    "stopped",
+                    f"run {spec.run_id}: stopped with {len(self._completed)} task(s) done",
+                    task_id=task.task_id,
+                )
                 await self._finalize("stopped")
                 return self.completion("stopped")
             if self._should_continue_as_new(started):
@@ -328,9 +390,20 @@ class RunWorkflow:
                 await self._notify(
                     "note", f"run {spec.run_id}: budget exhausted, not starting {task.task_id}"
                 )
+                await self._finish(
+                    "budget_exhausted",
+                    f"run {spec.run_id}: budget exhausted before {task.task_id}",
+                    task_id=task.task_id,
+                )
                 await self._finalize("budget_exhausted")
                 return self.completion("budget_exhausted")
             if self._goal_exhausted():
+                await self._finish(
+                    "goal_unmet",
+                    f"run {spec.run_id}: goal exhausted before {task.task_id} "
+                    f"({self._goal_reason})",
+                    task_id=task.task_id,
+                )
                 await self._finalize("goal_unmet")
                 return self.completion("goal_unmet")
             planned = await self._prepare_plan_context(task) if spec.goal is not None else task
@@ -338,6 +411,23 @@ class RunWorkflow:
             self._completed.append(child.summary())
             self._spent += child.cost_usd
             started += 1
+            # A child that returned BECAUSE it was told to stop ends the run stopped: the cancel the
+            # caller already had accepted must not turn into `completed` just because the task managed
+            # to finish its own bookkeeping on the way out.
+            if self._stopped:
+                # A stop that arrived while the child was awaited was RECORDED by the handler and not
+                # yet sent (the handler never sends). Send it here, from this coroutine, before the run
+                # reports `stopped` — that is the invariant "the cancel was accepted means it was
+                # delivered".
+                await self._stop_in_flight()
+                await self._report_publish_skips(spec)
+                await self._finish(
+                    "stopped",
+                    f"run {spec.run_id}: stopped with {len(self._completed)} task(s) done",
+                    task_id=task.task_id,
+                )
+                await self._finalize("stopped")
+                return self.completion("stopped")
             if spec.goal is not None:
                 await self._after_boundary(task, child, remaining=len(remaining) - index - 1)
             if spec.idle_between_tasks_s:
@@ -348,22 +438,28 @@ class RunWorkflow:
             # `_after_boundary` has already recorded the verdict and run the CI gate to its bound.
             if self._goal_met():
                 await self._report_publish_skips(spec)
-                await self._notify(
-                    "run.finished",
+                await self._finish(
+                    "completed",
                     f"run {spec.run_id}: goal met after {len(self._completed)} task(s) "
                     f"({self._goal_reason})",
+                    task_id=_last_task_id(remaining),
                 )
                 await self._finalize("completed")
                 return self.completion("completed")
-            await self._notify(
-                "note",
+            await self._finish(
+                "goal_unmet",
                 f"run {spec.run_id}: tasks exhausted with the goal UNMET ({self._goal_reason})",
+                task_id=_last_task_id(remaining),
             )
             await self._finalize("goal_unmet")
             return self.completion("goal_unmet")
 
         await self._report_publish_skips(spec)
-        await self._notify("run.finished", f"run {spec.run_id}: {len(self._completed)} task(s) done")
+        await self._finish(
+            "completed",
+            f"run {spec.run_id}: {len(self._completed)} task(s) done",
+            task_id=_last_task_id(remaining),
+        )
         # AFTER the "finished" notification, so a reader of the ledger sees the run complete before its
         # checkouts disappear — and so the sweep is the last thing that happens, never something a task
         # could still be using.
@@ -431,15 +527,31 @@ class RunWorkflow:
 
         The child's workflow id is ``task-<run>-<task>``. A "fix CI" attempt needs no suffix: its
         ``task_id`` is already its own (``task-1-ci1``), while its WORKTREE is its parent's — which is
-        exactly the split `TaskSpec.worktree_task_id` exists to express.
+        exactly the split ``TaskSpec.worktree_task_id`` exists to express.
+
+        Started and awaited separately so ``_in_flight_handle`` names the child for the whole time the
+        run is blocked on it; the two calls are command-identical to ``execute_child_workflow``, so
+        recorded histories replay unchanged. `stop_delivery.py` explains why that handle is the route
+        a cancel needs.
+
+        **The handle is SAVED AND RESTORED, never nulled.** This method is nested in practice: a
+        goal-mode CI fix (``CiFixLoop._run_ci_fix``) calls it while the run is already inside the
+        OUTER task's ``await handle``. Setting the field to ``None`` on the way out would clear the
+        outer child's handle, and a stop arriving after a CI fix would then have nothing to deliver
+        to — the exact stall `stop_delivery.py` exists to close. The previous value is restored
+        instead, so each nesting level owns the field only for its own await.
         """
         spec = self._spec
         assert spec is not None
-        return await workflow.execute_child_workflow(
+        handle = await workflow.start_child_workflow(
             workflow_class_for(task.engine).run,
             args=[task.to_payload(), remaining_usd],
             id=f"task-{spec.run_id}-{task.task_id}",
         )
+        # A stop that landed between the start and here is delivered before the first await, so the
+        # child never parks for a decision nobody is going to give. `_await_in_flight` owns the
+        # save/restore of the handle, including for this nesting level.
+        return await self._await_in_flight(handle)
 
     async def _respect_pause(self) -> None:
         if not self._paused:
@@ -447,15 +559,40 @@ class RunWorkflow:
         await self._notify("note", f"run {self._spec.run_id if self._spec else '?'} paused")
         await workflow.wait_condition(lambda: not self._paused or self._stopped)
 
-    async def _notify(self, kind: str, message: str, *, repo_dir: str = "") -> None:
+    async def _notify(
+        self,
+        kind: str,
+        message: str,
+        *,
+        repo_dir: str = "",
+        outcome: str | None = None,
+        task_id: str | None = None,
+    ) -> None:
+        """Report one thing the run did.
+
+        ``outcome`` is for the records that ARE an ending — `run.finished`, `task.finished`,
+        `task.unfinished` — and rides in ``evidence``, which `activity_steps.notify` lifts onto the
+        ledger row's top level. It defaults to None because most notifications are progress; a run that
+        ends its own ledger writes one.
+
+        ``run_terminal_evidence`` refuses a value outside the closed vocabulary, and that refusal is
+        swallowed below like every other notify failure: the run's own work must never be failed by its
+        audit row. ``task_id`` is empty for run-level rows, which is the shape every existing row has.
+        """
         spec = self._spec
         if spec is None:  # pragma: no cover
             return
         try:
+            evidence = {} if outcome is None else run_terminal_evidence(outcome)
             await workflow_activity(
                 NAME_NOTIFY,
                 NotifyRequest(
-                    run_id=spec.run_id, task_id=None, kind=kind, message=message, repo_dir=repo_dir
+                    run_id=spec.run_id,
+                    task_id=task_id,
+                    kind=kind,
+                    message=message,
+                    repo_dir=repo_dir,
+                    evidence=evidence,
                 ),
             )
         except Exception:  # noqa: BLE001 - a notification must never fail a run
@@ -660,124 +797,6 @@ class RunWorkflow:
             task_id=task_id,
         )
 
-    async def _ci_gate(self, task: TaskSpec, child: TaskCompletion) -> None:
-        """Read CI, and while it is red start ONE fix task and read again — bounded twice over.
-
-        **This is the loop, and it has two independent exits.** ``max_ci_attempts`` bounds how many
-        fix tasks one red PR may spend; the RUN's budget bounds how much money it may spend. Either
-        alone stops it: an attempt cap with no budget cap would spend the whole run on one PR, and a
-        budget cap with no attempt cap would keep buying attempts until the run died. Both are
-        checked before every fix task, so the loop cannot outlive either.
-
-        A ``failed`` CI state with no attempts left is not retried and not an error: the state stays
-        ``failed``, `evaluate_stop` reports ``ci=failed``, and ``self._ci_stop`` says WHICH bound
-        ended the loop — the difference between "we tried three times" and "we ran out of money".
-
-        ``infrastructure``, ``pending`` and ``unknown`` never start a fix task. The first two are not
-        this run's code; the third means the rollup could not be read, and patching code to satisfy a
-        check we could not see is the failure `webhook_ci_triage` exists to prevent.
-        """
-        spec = self._spec
-        assert spec is not None and spec.goal is not None
-        while True:
-            pr_number, head_sha = _pr_coordinates(child)
-            if pr_number is None:
-                # No pull request on this task, so there is no head for CI to judge. Leaving the state
-                # alone is deliberate: `evaluate_stop` then reports `ci=failed`, the honest answer for
-                # a goal that requires a green PR and has none.
-                return
-            outcome = await workflow_activity(
-                NAME_WATCH_CI,
-                WatchCiRequest(
-                    run_id=spec.run_id,
-                    repo_dir=spec.repo_dir,
-                    pr_number=pr_number,
-                    head_sha=head_sha,
-                    base_branch=spec.base_branch,
-                ),
-            )
-            self._ci_state = outcome.state
-            if outcome.state != "failed":
-                return
-            if self._ci_attempts >= spec.goal.max_ci_attempts:
-                self._ci_stop = (
-                    f"ci still red after {self._ci_attempts} attempt(s) "
-                    f"(max_ci_attempts={spec.goal.max_ci_attempts})"
-                )
-                await self._notify(
-                    "note",
-                    f"run {spec.run_id}: CI still red on PR #{pr_number} after "
-                    f"{self._ci_attempts} fix attempt(s); not starting another "
-                    f"(max_ci_attempts={spec.goal.max_ci_attempts})",
-                )
-                return
-            budget_left = run_budget_left(spec, self._spent)
-            if budget_left is not None and budget_left <= 0:
-                self._ci_stop = (
-                    f"ci still red and the run budget is exhausted "
-                    f"({self._ci_attempts} attempt(s) of {spec.goal.max_ci_attempts})"
-                )
-                await self._notify(
-                    "note",
-                    f"run {spec.run_id}: CI fix loop stopped by the run budget, not by the attempt cap",
-                )
-                return
-            child = await self._run_ci_fix(
-                task, child, pr_number=pr_number, head_sha=head_sha, checks=outcome.checks,
-                remaining_usd=budget_left,
-            )
-
-    async def _run_ci_fix(
-        self,
-        task: TaskSpec,
-        child: TaskCompletion,
-        *,
-        pr_number: int,
-        head_sha: str | None,
-        checks: Any,
-        remaining_usd: float | None,
-    ) -> TaskCompletion:
-        """Start ONE "fix CI" task on the same branch and consolidate its result into the run.
-
-        The fix task is a REAL child task: its own plan/implement/verify/review/PR steps, against the
-        same worktree and the same pull request. That is what makes the next CI read describe the
-        fix — anything cheaper (a turn with a synthetic prompt) would not produce a commit on the
-        branch the check suite is running against.
-        """
-        spec = self._spec
-        assert spec is not None and spec.goal is not None
-        attempt = self._ci_attempts + 1
-        self._ci_attempts = attempt
-        brief = build_ci_fix_brief(
-            pr_number=pr_number, head_sha=head_sha, checks=checks, attempt=attempt
-        )
-        fix = task.with_ci_fix(
-            task_id=f"{task.task_id}-ci{attempt}", brief=brief, goal_context=task.goal_context
-        )
-        try:
-            completion = await self._run_task(fix, remaining_usd=remaining_usd)
-        except Exception as exc:  # noqa: BLE001 - a failed fix attempt is an ANSWER, not a crash
-            # A fix that cannot even complete (its turn failed, its verify blew up) must not turn the
-            # RUN red: the goal is merely still unmet, and the CI loop's bound decides whether to try
-            # again. Escaping here would lose the run's whole result over one repair attempt — and the
-            # attempt has already been counted, so the loop cannot spin on it.
-            await self._notify(
-                "note",
-                f"run {spec.run_id}: fix CI attempt {attempt} FAILED "
-                f"({type(exc).__name__}) on PR #{pr_number}; counting it against max_ci_attempts",
-            )
-            return child
-        self._completed.append(completion.summary())
-        self._spent += completion.cost_usd
-        episode = await self._recall_episode_ref(fix, completion)
-        if episode is not None:
-            self._episodes.append(episode)
-        await self._notify(
-            "note",
-            f"run {spec.run_id}: fix CI attempt {attempt} finished ({completion.outcome}) "
-            f"on PR #{pr_number}",
-        )
-        return completion
 
     @workflow.query
     def status(self) -> dict[str, Any]:
@@ -817,8 +836,22 @@ class RunWorkflow:
     def resume(self) -> None:
         self._paused = False
 
-    @workflow.signal
+    @workflow.signal(unfinished_policy=HandlerUnfinishedPolicy.ABANDON)
     def stop(self) -> None:
+        """Stop the run — and RECORD that the child it is blocked on must be told.
+
+        **This handler mutates state only.** It is a SYNCHRONOUS Temporal signal handler, so it must
+        not await (an await would suspend the handler until the CHILD's signal resolved, and the child
+        is waiting for this run) and must not spawn work (`asyncio.create_task` here is not gated on a
+        Temporal event, so the command it eventually emits lands at a point a replay has no reason to
+        reproduce). The send is driven from the main coroutine instead, at the boundary this signal
+        always wakes: `_run_task`'s await on the child, or the loop's next `_stop_in_flight`. See
+        `stop_delivery.py` for the replay argument in full.
+
+        ``ABANDON`` says what happens if the run exits while a delivery is still sending: it is
+        abandoned, not warned about. The sends are awaited by `_run_task`/`_stop_window` before the
+        run reports `stopped`.
+        """
         self._stopped = True
         self._paused = False
 
@@ -853,8 +886,6 @@ class RunWorkflow:
         self._webhook_payloads.append(dict(payload))
 
 
-
-
 # -- helpers (module level: workflow code must not close over methods) -------------------------
 
 
@@ -870,56 +901,18 @@ def _recap_from_recalled(item: Any) -> EpisodeRecap:
         plan_ref=item.plan_ref,
     )
 
+# The two PURE helpers below are imported from `workflow_support`, where they live beside the rest
+# of the state arithmetic. Re-exported so a caller that reads them from this module (the CI-gate
+# tests do) keeps working, and so "a pure helper belongs in the shared module" is one rule.
+from .workflow_support import _evidence_message, _pr_coordinates  # noqa: E402,F401
 
-def _pr_coordinates(child: Any) -> tuple[int | None, str | None]:
-    """A finished task's pull request: ``(number, head_sha)``, either of which may be None.
 
-    Read from the state rather than from the `TaskSummary`, because the summary carries the URL (what
-    a human reads) and the CI gate needs the NUMBER (what the API takes); deriving one from the other
-    would mean parsing a URL in workflow code.
+def _last_task_id(tasks: tuple[TaskSpec, ...]) -> str | None:
+    """The id of the last task a run's terminal reports on, or None when there is none.
 
-    The head sha falls back to the checkpoint's commit when the PR ref did not record one: that is
-    the commit this run pushed, which is the commit CI judges. A PR opened without a head sha (an
-    older spec, or a provider that omits it) therefore still gates on the right commit.
+    A run's terminal names the task its exit came from, so a reader can match it to THAT task's own
+    verdict in a ledger written before the terminal carried an outcome. ``None`` rather than an
+    exception for an empty list: a resumed run can arrive with every task already `continue_as_new`-ed
+    away, and an ending is not an error just because this execution started none of them.
     """
-    state = getattr(child, "state", None)
-    if not isinstance(state, dict):
-        return None, None
-    pr = state.get("pr")
-    number: int | None = None
-    head_sha: str | None = None
-    if isinstance(pr, dict):
-        raw = pr.get("number")
-        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
-            number = raw
-        if isinstance(pr.get("head_sha"), str) and pr["head_sha"]:
-            head_sha = str(pr["head_sha"])
-    if head_sha is None:
-        checkpoint = state.get("checkpoint_ref")
-        if isinstance(checkpoint, dict) and isinstance(checkpoint.get("sha"), str):
-            head_sha = str(checkpoint["sha"])
-    return number, head_sha
-
-
-
-def _evidence_message(evidence: Mapping[str, Any]) -> str:
-    """A one-line human summary of a structured notification, from the evidence itself.
-
-    Deterministic in the evidence, so the ledger row replays to the same string. Kept small: the
-    evidence is the record, this is the sentence a reader skims.
-    """
-    parts: list[str] = []
-    for key in ("satisfied", "reason", "tasks_done", "tasks_remaining", "ci_state", "ci_attempts"):
-        if key in evidence:
-            parts.append(f"{key}={evidence[key]}")
-    checks = evidence.get("checks")
-    if isinstance(checks, list) and checks:
-        parts.append(
-            "checks="
-            + ",".join(
-                f"{entry[0]}-{entry[1]}"
-                for entry in checks
-                if isinstance(entry, list) and len(entry) == 2
-            )
-        )
-    return " ".join(parts) or "notified"
+    return tasks[-1].task_id if tasks else None
