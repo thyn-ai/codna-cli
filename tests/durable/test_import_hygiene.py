@@ -119,6 +119,12 @@ EXTRA_FREE_MODULES = (
     # which made a PURE function need the extra to be tested; the note moved here (the activity body
     # came with it) and the split is what this pins.
     "codna.durable.delegation_policy",
+    # The MCP/delegation capability sentences and the pure environment read behind them. Same
+    # regression, second occurrence: they were defined in `capability_report` (→ temporalio) and the
+    # four note tests in `tests/test_browser_tool_wiring.py` failed on the offline lane with
+    # `ModuleNotFoundError: No module named 'temporalio'`. Moved out rather than skipping the tests,
+    # because the sentence is the thing the lane exists to check.
+    "codna.durable.capability_notes",
 )
 
 

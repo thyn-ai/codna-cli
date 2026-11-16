@@ -24,6 +24,7 @@ from .activity_support import (
     owner_for,
 )
 from .ledger import LedgerRecord
+from .provider import KEYLESS_PROVIDERS
 from .session_spec import _session_spec
 from .state import TaskState
 from .turn_guard import TOOL_LOOP_EVENT, TurnGuard
@@ -278,6 +279,16 @@ class _Spend:
     priced: bool = True
 
 
+def is_keyless_provider(provider: str | None) -> bool:
+    """Whether this provider bills nothing (a local server or self-hosted proxy), per the shared set.
+
+    The same predicate the engine's `isKeylessProvider` and the IDE's `KEYLESS_PROVIDERS` answer, so a
+    run's spend accounting and the engine's own `totalCost: 0` cannot disagree about who is free.
+    An absent provider is NOT keyless: "we were not told" is not "there is no bill".
+    """
+    return bool(provider) and str(provider).strip().lower() in KEYLESS_PROVIDERS
+
+
 def _token_total(usage: Mapping[str, Any]) -> int:
     """Sum the token fields the engine may report, tolerating any of them being absent."""
     total = 0
@@ -295,20 +306,40 @@ def _token_total(usage: Mapping[str, Any]) -> int:
     return total
 
 
-def _spend_from_event(payload: Mapping[str, Any], *, state: TaskState) -> _Spend:
+def _spend_from_event(
+    payload: Mapping[str, Any], *, state: TaskState, provider: str | None
+) -> _Spend:
     """Per-turn spend from the terminal event's CUMULATIVE usage.
 
     The sidecar reports cumulative session usage on the terminal event (verified in `execution.ts`),
     so this turn's delta is that snapshot minus what the state already accounts for. A payload with
     no cost at all is recorded as UNPRICED rather than free: a run that cannot price a turn must be
     able to say "this much is unknown" (`Budget.unpriced_tokens`).
+
+    **A keyless provider is the one exception, and it is stated rather than inferred.** Ollama, LM
+    Studio and an OpenAI-compatible/self-hosted endpoint bill nothing Codna can see — the compute is
+    the operator's own machine — so the engine prices their turns at `totalCost: 0`. `0` is therefore
+    a REAL PRICE here, not the absence of one, and reading it as "unpriced" made every local-model
+    turn report its whole token count as unknown spend (`run-20261115T194545Z`: 9,402 tokens, all
+    `unpriced_tokens`, on a run that cost nothing). Only a `> 0` figure was accepted as a price,
+    which is exactly the case a local provider never produces.
+
+    So the rule is: a NON-NEGATIVE reported cost is a price (0 included); a keyless provider with no
+    cost figure at all is free by definition; anything else is unpriced.
     """
     usage = payload.get("usage")
     if not isinstance(usage, Mapping):
-        return _Spend(0.0, 0, False)
+        # No usage object at all: nothing was reported. A keyless provider is still free; anyone else
+        # is a blind spot rather than a free turn.
+        return _Spend(0.0, 0, is_keyless_provider(provider))
     raw_cost = usage.get("totalCost", usage.get("total_cost"))
-    priced = isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool) and raw_cost > 0
-    cost_delta = max(0.0, float(raw_cost) - float(state.budget.spent_usd)) if priced else 0.0
+    reported = (
+        raw_cost
+        if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool) and raw_cost >= 0
+        else None
+    )
+    priced = reported is not None or is_keyless_provider(provider)
+    cost_delta = max(0.0, float(reported or 0.0) - float(state.budget.spent_usd)) if priced else 0.0
     token_delta = max(0, _token_total(usage) - int(state.budget.spent_tokens))
     return _Spend(cost_delta, token_delta, priced)
 
@@ -429,6 +460,7 @@ def _resume_in_flight(
         phase=phase,
         start_from=max(recorded.high_water, 0),
         resumed=True,
+        provider=context.provider,
     )
 
 
@@ -444,6 +476,7 @@ def _stream(
     phase: str,
     start_from: int,
     resumed: bool,
+    provider: str | None,
 ) -> TurnOutcome:
     """Consume the turn's stream to its terminal event, ledgering and heartbeating as it arrives."""
     last_index = int(start_from)
@@ -490,7 +523,7 @@ def _stream(
             )
         if event.is_terminal:
             terminal = event.event_type
-            spend = _spend_from_event(event.payload, state=state)
+            spend = _spend_from_event(event.payload, state=state, provider=provider)
             # D4: did this turn stop because a HUMAN owes it an answer? The engine says so on its
             # terminal event (`finish_reason: "ask"` + the ask itself). Read here, at the one place a
             # turn ends, so no caller has to infer it from the absence of work.
@@ -695,6 +728,7 @@ def _start_turn(
         phase=phase,
         start_from=int(state.last_event_index),
         resumed=bool(start.replayed),
+        provider=context.provider,
     )
 
 

@@ -42,19 +42,22 @@ from .contracts import (
     TaskContext,
     TaskOutcome,
     TaskSpec,
-    implement_prompt,
+    implement_prompt_for_state,
     pr_title,
 )
+from .approval_policy import AUTO_APPROVAL_REASON, auto_approval_eligible
 from .routing import after_plan, after_review, after_verify
 from .state import TaskState
 from .workflow_support import (
     adopt,
     approved_outcome,
+    is_completed_task_outcome,
     task_completion,
     approver_identity,
     initial_state,
     steer_note,
     park_approval,
+    park_message,
     park_reason,
     raised_cap,
     run_id_of,
@@ -112,6 +115,10 @@ class TaskWorkflowPlain:
         outcome = self._outcome or "rejected"
         episode = await self._remember(state, outcome)
         await self._notify("task.finished", f"task {self._task_id} finished: {outcome}")
+        if not is_completed_task_outcome(outcome):
+            await self._notify(
+                "task.unfinished", f"task {self._task_id} ended without its work: {outcome}"
+            )
         return task_completion(
             state,
             outcome,
@@ -170,9 +177,15 @@ class TaskWorkflowPlain:
             )
             return adopt(state, outcome, self._spend)
         if node == "implement":
+            payload = state.to_payload()
             outcome = await workflow_activity(
                 NAME_TURN,
-                context.turn_request(implement_prompt(spec.brief, steer), state.to_payload(), steer),
+                # Through the STATE, not just the spec: a retry after a rejected review carries the
+                # reviewer's findings in `review_feedback`, and this is where they reach the prompt.
+                # Built identically to the graph engine's request, which is what keeps parity a fact.
+                context.turn_request(
+                    implement_prompt_for_state(payload, spec.brief, steer), payload, steer
+                ),
             )
             moved = adopt(state, outcome, self._spend)
             # The checkpoint names the turn that just advanced, so it must receive the POST-turn
@@ -195,18 +208,55 @@ class TaskWorkflowPlain:
         raise ValueError(f"unknown node {node!r}")  # pragma: no cover
 
     async def _park(self, state: TaskState) -> TaskState:
-        """Suspend until a human decides.
+        """Complete under the explicit local-only policy, or suspend until a human decides.
 
-        The suspension is a `wait_condition` on workflow state, so it survives a worker restart with
-        nothing but history: no polling, no timer, no external store. `self._parked_on` keeps WHY we
-        are waiting, which is what `status` reports to the IDE's "needs input" card.
+        The exemption records its own ledger kind and never invents an approver identity.
         """
+        spec = self._spec
+        assert spec is not None
+        if auto_approval_eligible(state, enabled=spec.auto_approve_local_only):
+            self._approvals.append({
+                "identity": None,
+                "kind": "auto_approved",
+                "turn_seq": state.turn_seq,
+                "reason": AUTO_APPROVAL_REASON,
+                "policy_digest": spec.approval_policy_digest,
+            })
+            self._outcome = approved_outcome(state)
+            await self._notify(
+                "auto_approved",
+                f"task {self._task_id} completed unattended under policy "
+                f"{AUTO_APPROVAL_REASON}: no remote, verify passed, review approved",
+                evidence={
+                    "policy_digest": spec.approval_policy_digest,
+                    "policy_mode": "auto_for_low_risk",
+                    "park_reason": AUTO_APPROVAL_REASON,
+                    "verify_passed": True,
+                    "review_verdict": state.review_verdict,
+                    "publish_skip": state.publish_skip,
+                },
+            )
+            return state
+
+        # The human suspension is a `wait_condition` on workflow state, so it survives a worker
+        # restart with nothing but history: no polling, timer, or external store. `self._parked_on`
+        # keeps WHY we are waiting, which is what `status` reports on the IDE's input card.
+        #
+        # `park_reason` now reads the REVIEWER'S verdict rather than falling back to the literal
+        # `review_not_approved`: this gate used to record "review not approved" for a task whose
+        # review record, one ledger row above, said `verdict: "approved"` (run-cancelrepro-before
+        # seq 404 vs 406). The park itself is RIGHT — releasing reviewed work is a human's decision —
+        # so the reason is `ready_for_approval` for exactly that state, and `review_not_approved` is
+        # reserved for a verdict that is not an approval.
         reason = park_reason(state)
         self._parked_on = reason
         self._decision = None
         state = state.awaiting(park_approval(state, reason))
         self._state = state.to_payload()
-        await self._notify("approval.requested", f"task {self._task_id} is waiting on a human ({reason})")
+        await self._notify(
+            "approval.requested",
+            f"task {self._task_id} is waiting on a human ({reason}): {park_message(state, reason)}",
+        )
         await workflow.wait_condition(lambda: self._decision is not None or self._stopped)
         self._parked_on = None
         if self._stopped:
@@ -278,7 +328,10 @@ class TaskWorkflowPlain:
             workflow.logger.warning("task %s: recording the episode failed", self._task_id)
             return EpisodeOutcome(path="", digest="", ledger_seq=None)
 
-    async def _notify(self, kind: str, message: str, *, actor: str = "") -> None:
+    async def _notify(
+        self, kind: str, message: str, *, actor: str = "",
+        evidence: Mapping[str, Any] | None = None,
+    ) -> None:
         try:
             await workflow_activity(
                 NAME_NOTIFY,
@@ -288,6 +341,7 @@ class TaskWorkflowPlain:
                     kind=kind,
                     message=message,
                     actor=actor,
+                    evidence=dict(evidence or {}),
                 ),
             )
         except Exception:  # noqa: BLE001 - a notification must never fail a task

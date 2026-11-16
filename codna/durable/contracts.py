@@ -86,9 +86,12 @@ __all__ = [
     "HEARTBEAT_INTERVAL_S",
     "MAX_STEER_NOTE_CHARS",
     "MAX_STEER_NOTES",
+    "McpAttachmentOutcome",
+    "McpAttachmentRequest",
     "NAME_CHECKPOINT",
     "NAME_DELEGATION_POLICY",
     "NAME_EPISODE",
+    "NAME_MCP_ATTACHMENT",
     "NAME_NOTIFY",
     "NAME_OPEN_PR",
     "NAME_PLAN",
@@ -126,6 +129,7 @@ __all__ = [
     "WorktreeCleanupOutcome",
     "WorktreeCleanupRequest",
     "implement_prompt",
+    "implement_prompt_for_state",
     "plan_prompt",
     "provider_env_key_names",
     "provider_session_spec",
@@ -164,6 +168,8 @@ from .contracts_bookkeeping import (  # noqa: E402
     DelegationPolicyOutcome,
     DelegationPolicyRequest,
     EpisodeRequest,
+    McpAttachmentOutcome,
+    McpAttachmentRequest,
     NotifyRequest,
     WorktreeCleanupOutcome,
     WorktreeCleanupRequest,
@@ -171,7 +177,12 @@ from .contracts_bookkeeping import (  # noqa: E402
 # The PROMPT builders — "what text does the model receive", as opposed to "what shape crosses the
 # wire". Split out for the same ceiling and the same review reason: a prompt change is read as a
 # prompt. Re-exported so a caller that imports `implement_prompt` from here still works.
-from .prompts import implement_prompt, plan_prompt, pr_title  # noqa: E402
+from .prompts import (  # noqa: E402
+    implement_prompt,
+    implement_prompt_for_state,
+    plan_prompt,
+    pr_title,
+)
 # The graph-config decoders. Re-exported here because `graph.py` and both engines import the ONE
 # contracts module, and a caller should not have to know which file a decoder landed in.
 from .task_config import (  # noqa: E402
@@ -197,7 +208,6 @@ from .run_contracts import (  # noqa: E402
     TaskSummary,
 )
 
-
 # Registered activity type names. Explicit and stable, and they live HERE (a sandbox-clean leaf)
 # because both the graph and the plain workflow name them: `activities.py` registers under these
 # names, `graph.py` schedules them, and a module rename must not silently orphan in-flight runs.
@@ -220,6 +230,11 @@ NAME_NOTIFY: Final = "codna.step.notify"
 # say whether the delegation FLAGS the run carried can actually reach the model. It is an activity
 # because it touches the filesystem, which the workflow sandbox refuses.
 NAME_DELEGATION_POLICY: Final = "codna.step.delegation_policy"
+# Run-level, scheduled ONCE at the start of a run beside the delegation-policy read: answers which MCP
+# servers the turns are EFFECTIVELY handed. It is an activity for the same reason as the read above —
+# the answer depends on the WORKER's environment (CODNA_BROWSER_TOOL, CODNA_MCP_SERVERS), and the
+# workflow sandbox refuses os.environ from workflow code.
+NAME_MCP_ATTACHMENT: Final = "codna.step.mcp_attachment"
 
 # D5 goal mode: the ceiling on the plan-side goal block a `TaskSpec` may carry. Generous for an
 # objective plus four episodes, small enough that a run cannot smuggle a transcript into history.
@@ -401,6 +416,10 @@ class TaskSpec:
     # Page: `worktree` must be True for this to have any effect. A shared checkout cannot be on two
     # branches at once, and the run that uses this one must not move the developer's HEAD.
     worktree_branch: str = ""
+    # A validated policy grant for terminal completion only. The CLI reads the repository policy
+    # before starting; workflows never read policy files or infer a grant during replay.
+    auto_approve_local_only: bool = False
+    approval_policy_digest: str = ""
 
     def __post_init__(self) -> None:
         # Canonicalise on construction, so the recorded payload (and therefore history, the ledger and
@@ -537,6 +556,20 @@ class TaskSpec:
             )
         except SwarmConfigError as exc:
             raise ContractError(str(exc), code=exc.code, details=exc.details) from exc
+        if not isinstance(self.auto_approve_local_only, bool):
+            raise ContractError(
+                "auto_approve_local_only must be a boolean",
+                code="contract_invalid",
+                details={"field": "auto_approve_local_only"},
+            )
+        if self.auto_approve_local_only:
+            _require_ref(self.approval_policy_digest, "approval_policy_digest")
+        elif self.approval_policy_digest:
+            raise ContractError(
+                "an approval policy digest requires auto_approve_local_only",
+                code="contract_invalid",
+                details={"field": "approval_policy_digest"},
+            )
         if not isinstance(self.worktree_branch, str):
             raise ContractError(
                 "worktree_branch must be a string",
@@ -693,6 +726,8 @@ class TaskSpec:
             "enable_spawn_agent": self.enable_spawn_agent,
             "enable_agent_teams": self.enable_agent_teams,
             "worktree_branch": self.worktree_branch,
+            "auto_approve_local_only": self.auto_approve_local_only,
+            "approval_policy_digest": self.approval_policy_digest,
         }
 
 
