@@ -40,15 +40,105 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .goal import EpisodeRef, GoalSpec
 
 __all__ = [
+    "APPROVED_UNPUBLISHED",
+    "LEDGER_RUN_OUTCOMES",
+    "LedgerRunOutcome",
+    "NOTIFICATION_KIND_RUN_FINISHED",
+    "NOTIFICATION_KIND_TASK_FINISHED",
+    "NOTIFICATION_KIND_TASK_UNFINISHED",
+    "OUTCOME_PAYLOAD_KEY",
     "RunCompletion",
     "RunOutcome",
     "RunProgress",
     "RunSpec",
     "TaskCompletion",
     "TaskSummary",
+    "run_terminal_evidence",
+    "validated_ledger_outcome",
 ]
 
+# The outcome `RunWorkflow` RETURNS. It is the run's RESULT, which is what `codna run --wait` exits on
+# and what the CLI prints, so a value here must be one the CLI can read back (`run_wait.workflow_outcome`).
 RunOutcome = Literal["completed", "budget_exhausted", "stopped", "goal_unmet"]
+
+# The outcome a run's LEDGER records on its terminal `run.finished` notification: `RunOutcome` plus the
+# `failed` a run whose workflow raised ends with.
+#
+# The two vocabularies are kept apart ON PURPOSE, and the history says why. The terminal notification
+# used to carry no outcome at all, so every completed run's `GET /runs` row read `outcome: null` while
+# its detail row (which reads the workflow's RESULT) said `completed` — the whole list looked failed or
+# stuck. The obvious repair is to push `RunOutcome` onto the notification and be done, but three of
+# `RunOutcome`'s four values are returned from exits that write nothing: `stopped`/`budget_exhausted`
+# return straight after `_finalize`, and a workflow that RAISES returns nothing at all.
+#
+# So each terminal notification carries the outcome of the exit THAT EMITTED IT, in this vocabulary:
+#
+#   * `completed`  — the two `completed` exits;
+#   * `goal_unmet` — a goal run whose condition the evidence did not satisfy;
+#   * `failed`     — the workflow raised;
+#   * `stopped` / `budget_exhausted` — the run was stopped or ran out of money.
+#
+# Asserting a terminal's outcome is in `RunOutcome` would be the wrong invariant: it would force the
+# last three to claim `completed`. `LEDGER_RUN_OUTCOMES` is the honest closed set, and both readers
+# (`run_verdict` and `run_wait`) work from it rather than from their own copy.
+LedgerRunOutcome = Literal[
+    "completed", "budget_exhausted", "stopped", "goal_unmet", "failed"
+]
+# The runtime form of `LedgerRunOutcome`, for code that must CHECK a value rather than type it.
+LEDGER_RUN_OUTCOMES: Final[frozenset[str]] = frozenset(
+    {"completed", "budget_exhausted", "stopped", "goal_unmet", "failed"}
+)
+
+# A TASK that finished its work with nothing to publish. Defined here, beside the run vocabulary,
+# because the run READER needs it to decide what a task's episode outcome implies for the run, and
+# `contracts.TaskOutcome` (the fuller vocabulary) lives in `contracts`, which imports THIS module. The
+# value is therefore spelled here and referenced from `contracts`/`workflow_support`, so it exists once.
+APPROVED_UNPUBLISHED: Final = "approved_unpublished"
+
+# The ledger records a run's own ending writes. `RunWorkflow` emits `run.finished` on EVERY exit a
+# caller can reach — the two `completed` ones, `budget_exhausted`, `goal_unmet`, `stopped` and the
+# exception path — so a run always ends its own ledger instead of leaving a bare turn terminal behind.
+# A run whose WORKER died writes none, which is the distinction `run_verdict` preserves.
+NOTIFICATION_KIND_RUN_FINISHED: Final = "run.finished"
+NOTIFICATION_KIND_TASK_FINISHED: Final = "task.finished"
+# A task that ended WITHOUT its work: rejected, out of budget, or stopped. Emitted BESIDE the generic
+# `task.finished`, never instead of it, so every existing consumer of that kind keeps reading exactly
+# what it read before; this one exists so a reader can tell "this task produced the run's work" from
+# "this task ended and produced nothing" without parsing the message.
+NOTIFICATION_KIND_TASK_UNFINISHED: Final = "task.unfinished"
+
+# The payload key the terminal carries its outcome under. A constant because three places must agree:
+# the writer (`activity_notify`), the reader (`run_verdict`) and the workflow.
+OUTCOME_PAYLOAD_KEY: Final = "outcome"
+
+
+def run_terminal_evidence(outcome: str) -> dict[str, str]:
+    """The evidence a run's terminal notification carries: the run's outcome, structured.
+
+    Carried in ``evidence`` rather than as a sibling of ``kind`` so the ledger row keeps the shape a
+    notification has always had (``event``/``evidence``/``kind``/``message``). `activity_notify` lifts
+    it onto the row's top level on write, which is where the reader looks.
+
+    Derived ENTIRELY from the exit the workflow took — never from a clock or an activity result — so a
+    replay produces the same value. That is what lets it be written by an exit rather than tracked as
+    state.
+    """
+    return {OUTCOME_PAYLOAD_KEY: validated_ledger_outcome(outcome)}
+
+
+def validated_ledger_outcome(outcome: str) -> str:
+    """``outcome`` if it is in `LEDGER_RUN_OUTCOMES`, else a `ContractError`.
+
+    Refused rather than passed through: a terminal whose outcome is outside the closed set is a ledger
+    row a reader would have to guess about, which is the defect this field exists to remove.
+    """
+    if not isinstance(outcome, str) or outcome not in LEDGER_RUN_OUTCOMES:
+        raise ContractError(
+            f"a run terminal outcome must be one of {', '.join(sorted(LEDGER_RUN_OUTCOMES))}",
+            code="contract_invalid",
+            details={"field": OUTCOME_PAYLOAD_KEY, "value": repr(outcome)},
+        )
+    return outcome
 
 
 @dataclass(frozen=True)
