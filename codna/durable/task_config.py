@@ -124,6 +124,8 @@ def task_spec_from_config(config: Mapping[str, Any] | None) -> Any:
         # Absent before run-from-a-branch existed: `""` is "my own branch", which is exactly what such
         # a run worked on, so its replay adopts nothing.
         worktree_branch=str(raw.get("worktree_branch") or ""),
+        auto_approve_local_only=raw.get("auto_approve_local_only", False),
+        approval_policy_digest=raw.get("approval_policy_digest", ""),
     )
     spec.validate()
     return spec

@@ -2146,15 +2146,276 @@ def test_work_after_a_run_terminal_cannot_unfinish_it(config: Any) -> None:
 def test_a_terminal_without_an_outcome_is_still_ended(config: Any) -> None:
     """The ending is a fact even when the cause was never written down.
 
-    Production `_notify` carries no `outcome` — measured on a real 24h soak, all 9 `run.finished`
+    Production `_notify` carried no `outcome` — measured on a real 24h soak, all 9 `run.finished`
     notes had keys `event/evidence/kind/message` and 0 had an outcome. So `ended` must not depend on
     it, or every completed production run would still read as in progress.
+
+    ``None`` is now the answer only when NOTHING in the window states an outcome: this ledger holds a
+    bare terminal and no task verdict at all, which is a run that ended without anybody recording why.
+    The sibling test below is the shape that actually shipped, where the verdict IS in the window.
     """
     ledger = RunLedger.for_run(config.paths, "run-no-outcome")
     ledger.append("note", payload={"event": "notification", "kind": "run.finished", "message": "done"})
     path = config.ledger_path("run-no-outcome")
     assert support.terminal_verdict(path)[0] is True
     assert outcome_of(path) is None
+
+
+# -- a terminal that does not say how the run ended ---------------------------------------------
+#
+# THE DEFECT THIS PINS. Every completed run on this host read `outcome: null` in `GET /runs` while
+# its detail row said `completed`, because the terminal `run.finished` carried no outcome and the
+# reader had nothing else to read. The real tail is reproduced here byte for byte, in the order the
+# workflow writes it (`run-20261114T135809Z`): the task's episode, its `task.finished` note, the run's
+# publish summary, then the terminal. The verdict lives in the episode record, not in the terminal.
+
+
+def _shipped_tail(config: Any, run_id: str, *, task_outcome: str) -> Any:
+    """One task's ending as the product writes it, ending at a terminal with NO outcome."""
+    ledger = RunLedger.for_run(config.paths, run_id)
+    ledger.append(
+        "note",
+        task_id="task-1",
+        payload={
+            "event": "episode.remembered",
+            "outcome": task_outcome,
+            "digest": "d" * 64,
+            "path": "episodes/task-1.json",
+        },
+    )
+    ledger.append(
+        "note",
+        payload={
+            "event": "notification",
+            "kind": "task.finished",
+            "message": f"task task-1 finished: {task_outcome}",
+            "evidence": {},
+        },
+    )
+    ledger.append(
+        "note",
+        payload={
+            "event": "notification",
+            "kind": "note",
+            "message": "run run-1: 1 task(s) finished without a pull request (task-1)",
+            "evidence": {},
+        },
+    )
+    ledger.append(
+        "note",
+        payload={
+            "event": "notification",
+            "kind": "run.finished",
+            "message": f"run {run_id}: 1 task(s) done",
+            "evidence": {},
+        },
+    )
+    return config.ledger_path(run_id)
+
+
+def test_the_shipped_terminal_shape_now_reports_the_verdict_it_could_not_say(config: Any) -> None:
+    """VERIFIED FAILING BEFORE THE FIX: this expectation was `None` for every completed run.
+
+    A ledger whose terminal carries no outcome is not silent — it holds the task's own structured
+    verdict — and that verdict is what the run list must report. Reading the terminal in isolation is
+    what made every success look like a failure.
+    """
+    path = _shipped_tail(config, "run-shipped", task_outcome="approved_unpublished")
+    assert support.terminal_verdict(path) == (True, "completed")
+    assert outcome_of(path) == "completed"
+
+
+def test_a_published_task_reports_completed_too(config: Any) -> None:
+    """`approved` and `approved_unpublished` are the same run-level fact: the work was done."""
+    path = _shipped_tail(config, "run-published", task_outcome="approved")
+    assert outcome_of(path) == "completed"
+
+
+@pytest.mark.parametrize(
+    ("task_outcome", "expected"),
+    [("rejected", "failed"), ("stopped", "stopped"), ("budget_exhausted", "budget_exhausted")],
+)
+def test_a_task_that_did_not_finish_its_work_is_never_completed(
+    config: Any, task_outcome: str, expected: str
+) -> None:
+    """The distinction the route exists to make: ending is not succeeding.
+
+    A run only reaches `completed` when its task's work passed review. A rejected, stopped or
+    out-of-budget task keeps its own ending, so a closed workflow is never reported as a success.
+    """
+    path = _shipped_tail(config, f"run-{task_outcome}", task_outcome=task_outcome)
+    assert support.terminal_verdict(path) == (True, expected)
+
+
+def test_a_multi_task_tail_takes_the_newest_verdict(config: Any) -> None:
+    """Newest first wins, so the task the run finished ON speaks for the run.
+
+    Two tasks' episodes in one window: the later one is the run's last work, and the order in the
+    ledger is the order of the facts. The terminal NAMES that task, which is the shape `_finish`
+    writes — and what makes the answer attributable.
+    """
+    ledger = RunLedger.for_run(config.paths, "run-two-tasks")
+    ledger.append(
+        "note", task_id="task-1", payload={"event": "episode.remembered", "outcome": "rejected"}
+    )
+    ledger.append(
+        "note", task_id="task-2", payload={"event": "episode.remembered", "outcome": "approved"}
+    )
+    ledger.append(
+        "note",
+        task_id="task-2",
+        payload={"event": "notification", "kind": "run.finished", "message": "done"},
+    )
+    assert outcome_of(config.ledger_path("run-two-tasks")) == "completed"
+
+
+def test_a_run_level_terminal_with_two_tasks_cannot_attribute_either_to_the_run(
+    config: Any,
+) -> None:
+    """VERIFIED FAILING BEFORE THE FIX: this reported `completed`, borrowed from task-1.
+
+    A run-level terminal names no task, so a window holding TWO tasks' verdicts does not say which
+    one the run ended on. The newest of them may be a task that finished EARLIER — here task-1 is
+    approved while the run went on to task-2 and ended without recording why. Picking the newest is a
+    guess, and a guess that reports the run as `completed` is exactly the "a closed workflow is a
+    success" inference this module refuses. `None` is the honest answer: it ended, the ledger does
+    not say how.
+    """
+    ledger = RunLedger.for_run(config.paths, "run-two-tasks-unnamed")
+    ledger.append(
+        "note", task_id="task-1", payload={"event": "episode.remembered", "outcome": "approved"}
+    )
+    ledger.append(
+        "note", task_id="task-2", payload={"event": "episode.remembered", "outcome": "rejected"}
+    )
+    ledger.append(
+        "note", payload={"event": "notification", "kind": "run.finished", "message": "done"}
+    )
+    assert support.terminal_verdict(config.ledger_path("run-two-tasks-unnamed")) == (True, None)
+
+
+@pytest.mark.parametrize(
+    ("first_task_id", "second_task_id"),
+    [(None, None), (None, ""), ("", "")],
+)
+def test_a_run_level_terminal_cannot_bucket_two_unnamed_tasks_as_one(
+    config: Any, first_task_id: str | None, second_task_id: str | None
+) -> None:
+    """VERIFIED FAILING BEFORE THE FIX: this reported the first candidate's outcome.
+
+    `task_id` is nullable on `LedgerRecord`, and a record can predate the field. Two verdict records
+    that do NOT name their task cannot be PROVEN to be the same task, so they must never collapse
+    into one bucket. The reader that keyed candidates on ``record.task_id or ""`` mapped `None` and
+    `""` to the same key, so two different tasks' verdicts merged, ``any(...)`` saw one key, and the
+    run-level terminal answered with the newest one's outcome — the ambiguity guard defeated by
+    exactly the input it exists for. Erring toward `None` is the rule: an honest unknown beats a
+    wrong `completed`.
+    """
+    ledger = RunLedger.for_run(config.paths, f"run-unnamed-{first_task_id}-{second_task_id}")
+    ledger.append(
+        "note",
+        task_id=first_task_id,
+        payload={"event": "episode.remembered", "outcome": "approved"},
+    )
+    ledger.append(
+        "note",
+        task_id=second_task_id,
+        payload={"event": "episode.remembered", "outcome": "rejected"},
+    )
+    ledger.append(
+        "note", payload={"event": "notification", "kind": "run.finished", "message": "done"}
+    )
+    path = config.ledger_path(f"run-unnamed-{first_task_id}-{second_task_id}")
+    assert support.terminal_verdict(path) == (True, None)
+
+
+def test_a_task_scoped_terminal_only_reads_its_own_task(config: Any) -> None:
+    """A terminal that names a task answers from THAT task, never from a sibling's verdict.
+
+    A goal run's "fix CI" attempt has its own task id. If the terminal names the parent, an attempt's
+    approval must not be borrowed as the parent's outcome.
+    """
+    ledger = RunLedger.for_run(config.paths, "run-scoped")
+    ledger.append(
+        "note", task_id="task-1-ci1", payload={"event": "episode.remembered", "outcome": "approved"}
+    )
+    ledger.append(
+        "note",
+        task_id="task-1",
+        payload={"event": "notification", "kind": "run.finished", "message": "done"},
+    )
+    assert outcome_of(config.ledger_path("run-scoped")) is None
+
+
+def test_an_unfinished_task_notification_reports_failed(config: Any) -> None:
+    """VERIFIED FAILING BEFORE THE FIX: this ledger reported `None`, never `failed`.
+
+    A notification's `event` is always the literal `"notification"`; the specific fact lives in
+    `kind` — the same place `task.finished` is read from. A `task.unfinished` row therefore has to be
+    matched on its KIND, and the old reader compared `event` to `"task.unfinished"`, which can never
+    hold. This is the writer's exact payload (`TaskWorkflow*.run` emits it with no outcome), so the
+    branch is reached the way production reaches it, and the run is the one the fix exists for: a task
+    that ended without its work, under a terminal that does not say how the run ended.
+
+    No `outcome` key is present anywhere, and the message deliberately reads like a success: a reader
+    that parsed prose would call this completed. It is the kind that decides.
+    """
+    ledger = RunLedger.for_run(config.paths, "run-unfinished-task")
+    ledger.append(
+        "note",
+        task_id="task-1",
+        payload={
+            "event": "notification",
+            "kind": "task.unfinished",
+            "message": "task task-1 finished: approved",
+            "evidence": {},
+        },
+    )
+    ledger.append(
+        "note",
+        task_id="task-1",
+        payload={"event": "notification", "kind": "run.finished", "message": "done"},
+    )
+    assert support.terminal_verdict(config.ledger_path("run-unfinished-task")) == (True, "failed")
+
+
+def test_the_writer_never_lifts_an_outcome_for_task_unfinished(config: Any, tmp_path: Path) -> None:
+    """`task.unfinished` is not an outcome-carrying kind, and a caller's evidence survives intact.
+
+    The writer emits this row with no `outcome`, so listing the kind among `_OUTCOME_KINDS` described
+    a field nothing writes — and POPPED a caller's `evidence["outcome"]`, silently discarding it
+    instead of leaving it where it was put. The reader decides the kind by `kind` alone, so the set
+    and the reader now agree: no key is lifted, and nothing is dropped.
+    """
+    from codna.durable.activity_notify import notify
+    from codna.durable.activity_support import ActivityRuntime
+    from codna.durable.contracts import NotifyRequest
+
+    runtime = ActivityRuntime(
+        runs_root=tmp_path,
+        sidecar_factory=lambda _owner: None,
+        ledger_factory=lambda run_id: RunLedger.for_run(config.paths, run_id),
+    )
+    notify(
+        NotifyRequest(
+            run_id="run-unfinished-write",
+            task_id="task-1",
+            kind="task.unfinished",
+            message="task task-1 ended without its work: rejected",
+            evidence={"outcome": "rejected", "reason": "review"},
+        ),
+        runtime=runtime,
+    )
+    record = RunLedger.for_run(config.paths, "run-unfinished-write").records()[-1]
+    assert "outcome" not in record.payload, "no outcome is lifted for a kind that never carries one"
+    assert record.payload["evidence"] == {"outcome": "rejected", "reason": "review"}
+
+
+def test_the_reader_outcome_set_equals_the_contract_vocabulary() -> None:
+    """The reader is a LEAF, so its copy of the vocabulary is asserted equal to the contract's."""
+    from codna.durable.run_contracts import LEDGER_RUN_OUTCOMES
+
+    assert support.LEDGER_OUTCOMES == LEDGER_RUN_OUTCOMES
 
 
 def test_stalled_threshold_is_twice_the_longest_activity() -> None:

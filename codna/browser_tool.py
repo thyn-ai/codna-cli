@@ -43,6 +43,14 @@ unavailable and build the session WITHOUT it. The session then has no browser to
 the outside, indistinguishable from a model that chose not to browse. This module therefore always emits
 ``timeout``. See ``DEFAULT_CONNECT_TIMEOUT_S`` for the value and why it is that value.
 
+**A per-call filename is NOT governed by ``--output-dir``, and that was a shipped defect.** Playwright's
+own help says an explicitly named file "is resolved against the workspace root instead and is not affected
+by this option"; the workspace root is the server's cwd, and a server spawned by the installed app inherits
+``/Applications/Codna.app/Contents/Resources``. A relative ``browser_take_screenshot`` filename therefore
+wrote a PNG into the code-signed bundle and broke its seal. Every launcher now sets the child's ``cwd`` to
+the output directory as well (``browser_server_transport``), and ``screenshot_output_path`` is the ONE
+resolver/refuser for any per-call name — see its docstring.
+
 **Determinism.** Every value below is resolved from an explicit setting or a documented default; nothing
 reads the clock or the filesystem to decide what to launch, so two launches of one configuration are
 byte-identical. The output directory is ``$CODNA_RUNTIME_ROOT/browser`` (else ``~/.codna/browser``), like
@@ -82,6 +90,7 @@ __all__ = [
     "browser_tool_enabled",
     "browser_tool_state",
     "playwright_tool_for",
+    "screenshot_output_path",
     "with_browser_tool",
 ]
 
@@ -212,6 +221,58 @@ class BrowserToolConfigError(ValueError):
 
     def as_dict(self) -> dict[str, Any]:
         return {"error": {"code": self.code, "message": str(self), "details": self.details}}
+
+
+def screenshot_output_path(output_dir: str, filename: str) -> tuple[str, str]:
+    """Resolve a PER-CALL screenshot name INSIDE ``output_dir``, or refuse it with a coded error.
+
+    **Why this exists at the config layer.** Playwright resolves an EXPLICIT ``filename`` against the
+    workspace root, not against ``--output-dir``: upstream ``Response.resolveClientOutputFile`` calls
+    ``workspaceFile(filename)``, which is ``path.resolve(cwd, fileName)``, and only an UNNAMED screenshot
+    goes through ``outputFile``/``--output-dir``. The launched server inherits the host's cwd — on the
+    installed app that is ``/Applications/Codna.app/Contents/Resources`` — so a model calling
+    ``browser_take_screenshot`` with a bare ``"page.png"`` wrote an unsealed file into the CODE-SIGNED
+    bundle and ``codesign --verify`` stopped passing. ``--output-dir`` never governed that write.
+
+    Every launcher therefore passes the resolved ABSOLUTE path, and a name that would land outside the
+    output directory is REFUSED rather than rewritten:
+
+    * an absolute path (including ``~``) is refused;
+    * ``..`` traversal, or any other name whose resolution escapes ``output_dir``, is refused.
+
+    Returns ``(relative_name, absolute_path)``. The containment CHECK resolves symlinks on both sides
+    (``realpath``), so a symlinked output directory — ``/tmp`` on macOS is one — cannot make a legitimate
+    in-root name look like an escape, and a symlink pointing out of the root cannot be used to smuggle a
+    write out. The RETURNED path is the lexical join, so callers keep the spelling they configured.
+
+    An empty/whitespace name is Playwright's own auto-naming case, and it yields ``("", "")``: the
+    server chooses the name, so BOTH elements are unknown. It must NOT yield ``("", output_dir)`` —
+    the second element is documented as an absolute FILE path, and handing a caller the directory
+    would let it pass a directory to Playwright. No clock is read, so the answer is deterministic.
+    """
+    root = os.path.abspath(os.path.expanduser(output_dir))
+    name = (filename or "").strip()
+    if not name:
+        return "", ""
+    if os.path.isabs(name) or name.startswith("~") or (
+            re.match(r"^[A-Za-z]:[\\/]", name) or name.startswith(("\\\\", "//"))):
+        raise BrowserToolConfigError(
+            f"screenshot filenames are relative to the browser output directory ({root}); "
+            f"an absolute path is refused: {name!r}",
+            code="browser_screenshot_path_invalid",
+            details={"filename": name, "output_dir": root},
+        )
+    absolute = os.path.abspath(os.path.join(root, name))
+    real_root = os.path.realpath(root)
+    real_resolved = os.path.realpath(absolute)
+    if os.path.commonpath([real_root, real_resolved]) != real_root:
+        raise BrowserToolConfigError(
+            f"screenshot filenames must stay inside the browser output directory ({root}); "
+            f"{name!r} resolves to {absolute}, which is outside it",
+            code="browser_screenshot_path_invalid",
+            details={"filename": name, "output_dir": root, "resolved": absolute},
+        )
+    return name, absolute
 
 
 @dataclass(frozen=True)
@@ -462,9 +523,22 @@ def browser_server_args(config: BrowserToolConfig | None = None) -> list[str]:
 
 
 def browser_server_transport(config: BrowserToolConfig | None = None) -> dict[str, Any]:
-    """The canonical stdio transport, in the shape ``codna.durable.mcp`` represents one."""
+    """The canonical stdio transport, in the shape ``codna.durable.mcp`` represents one.
+
+    ``cwd`` is the output directory, DELIBERATELY and in addition to ``--output-dir``: a per-call
+    screenshot filename is resolved against the workspace root, which is the child's cwd — never against
+    ``--output-dir``. Without this the server inherited the host's cwd, which on the installed app is
+    inside the signed bundle, and a relative screenshot name wrote into it. Setting it here (rather than
+    only in ``browser_bridge``) covers the durable and chat launchers, which build their child process from
+    this entry and no longer have a chance to pass a per-call filename through a Python guard.
+    """
     config = config or browser_tool_config()
-    return {"type": "stdio", "command": "npx", "args": browser_server_args(config)}
+    return {
+        "type": "stdio",
+        "command": "npx",
+        "args": browser_server_args(config),
+        "cwd": config.output_dir,
+    }
 
 
 def browser_mcp_server(config: BrowserToolConfig | None = None) -> dict[str, Any]:
