@@ -26,13 +26,17 @@ import os
 import re
 from typing import Any, Callable, Final, Mapping
 
+from .contracts_bookkeeping import McpAttachmentOutcome, McpAttachmentRequest
+
 __all__ = [
     "MAX_MCP_SERVERS",
     "McpAttachment",
     "McpConfigError",
+    "effective_mcp_servers",
     "expand_mcp_servers",
     "mcp_attachment_state",
     "normalize_mcp_servers",
+    "resolve_mcp_attachment",
 ]
 
 # Mirrors the engine's own cap (`algenta/mcp-servers.ts`). Kept identical so a spec this side accepts
@@ -369,6 +373,69 @@ def mcp_attachment_state(context: Any = None) -> McpAttachment:
             "needs one sets `mcp_servers` on its TaskSpec (or CODNA_MCP_SERVERS on the worker)."
         ),
     )
+
+
+def effective_mcp_servers(
+    context: Any = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """The servers a turn is ACTUALLY handed, not merely the ones the spec declares.
+
+    The run's DECLARED list is not the whole answer: `session_mcp_servers` also honours the worker-wide
+    ``CODNA_MCP_SERVERS`` default and appends Codna's built-in browser server when ``CODNA_BROWSER_TOOL``
+    is on. A capability note built from the declared list alone therefore said "MCP is not attached" for a
+    run whose ledger was full of real ``browser__browser_*`` calls — measured twice on installed builds.
+
+    This resolves through the SAME `session_mcp_servers` the session request uses, so the note and the
+    session cannot disagree. A configuration fault (an unset ``from_env`` variable, a malformed browser
+    switch) PROPAGATES with its own code; it is never flattened into "not attached", because a note that
+    hides the reason a server is missing is the same defect pointed the other way.
+
+    **Workflow code must not call this.** It reads the worker's environment, and the Temporal workflow
+    sandbox refuses that (measured: importing the browser modules from a workflow tripped
+    ``RestrictedWorkflowAccessError`` on ``threading.Lock``). `resolve_mcp_attachment` is the activity
+    body a workflow schedules instead.
+    """
+    return tuple(session_mcp_servers(context, os.environ if env is None else env))
+
+
+def resolve_mcp_attachment(
+    request: McpAttachmentRequest | Mapping[str, Any],
+    env: Mapping[str, str] | None = None,
+) -> McpAttachmentOutcome:
+    """The EFFECTIVE MCP answer for a run — the runtime-free ACTIVITY BODY for the capability note.
+
+    The answer depends on the WORKER's environment (``CODNA_BROWSER_TOOL``, ``CODNA_MCP_SERVERS``), and a
+    workflow may not read ``os.environ``: the sandbox refuses it. So the question is asked in an activity,
+    for the same reason the delegation-policy read is one — and the answer then lives in history, so a
+    replay derives the report instead of re-reading a variable that may have changed since.
+
+    A configuration fault is reported as a coded ``reason`` with ``attached=False`` rather than raised: a
+    report about a run must never fail the run, and "not attached, because <the switch is invalid>" is the
+    truthful sentence. The code travels so a surface can branch without matching on prose.
+
+    ``request`` may arrive as the contract OR as its decoded mapping: the workflow sandbox's converter
+    resolves annotations from its own module namespace, so an activity argument can reach a body as a
+    plain dict. Accepting the payload shape here keeps this function correct on BOTH paths rather than
+    relying on which converter a given worker happens to use.
+    """
+    servers = (
+        request.get("servers", ()) if isinstance(request, Mapping)
+        else getattr(request, "servers", ())
+    ) or ()
+    declared = tuple(server for server in servers if server.get("disabled") is not True)
+    view = type("_McpView", (), {"mcp_servers": declared})()
+    try:
+        effective = effective_mcp_servers(view, env)
+    except Exception as exc:  # noqa: BLE001 - a report must never fail a run
+        code = str(getattr(exc, "code", "") or type(exc).__name__)
+        return McpAttachmentOutcome(attached=False, reason=str(exc), error_code=code)
+    if effective:
+        return McpAttachmentOutcome(
+            attached=True,
+            servers=tuple(str(server["name"]) for server in effective),
+        )
+    return McpAttachmentOutcome(attached=False, reason=mcp_attachment_state(view).reason)
 
 
 def mcp_servers_from_env(env: Mapping[str, str] | None = None) -> tuple[dict[str, Any], ...]:

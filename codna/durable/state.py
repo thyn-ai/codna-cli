@@ -31,13 +31,22 @@ import re
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Final, Literal, Mapping
 
-from ..sandbox import WRITE_TOKEN_NAMES, WRITE_TOKEN_VALUE
 from .publish import (
     PublishSkipReason,
     publish_skip_from_payload,
     validate_publish_skip,
 )
+from .review_feedback import ReviewFeedback, review_feedback_from_payload
 from .state_coercion import Coercion
+# The size + secret guards moved to their own LEAF module when `ReviewFindings` landed, for the same
+# reason `state_coercion` and `publish` did: `state.py` is at the repository's 1000-line ceiling and
+# these are pure functions over a decoded payload. Re-exported here because they are part of this
+# module's public surface (activities, contracts and tests import them from `.state`), and the two
+# `assert_state_encodable` call sites below keep using THIS module's `MAX_STATE_BYTES`, which is what
+# makes the documented `monkeypatch.setattr(state_module, "MAX_STATE_BYTES", …)` seam keep working.
+from .state_guards import MAX_STATE_BYTES as _MAX_STATE_BYTES_GUARD
+from .state_guards import assert_state_encodable as _assert_state_encodable
+from .state_guards import find_secret_like_strings  # noqa: F401 - re-exported public surface
 
 __all__ = [
     "MAX_STATE_BYTES",
@@ -57,49 +66,11 @@ __all__ = [
 ]
 
 STATE_SCHEMA_VERSION: Final = 1
-MAX_STATE_BYTES: Final = 2 * 1024 * 1024
+# Kept as this module's OWN binding (not a re-export of the guard's) so a test can shrink it and see
+# the guard below honour the shrink: `assert_state_encodable` passes this value through explicitly.
+MAX_STATE_BYTES: Final = _MAX_STATE_BYTES_GUARD
 
 ReviewVerdict = Literal["approved", "rejected", "changes_requested"]
-
-# Beyond the GitHub token patterns codna.sandbox already owns, a state can also leak a provider
-# key. These are the shapes that actually get pasted into prompts and env files:
-#   sk-...            OpenAI/Anthropic-style (Anthropic uses sk-ant-..., OpenAI sk-proj-...)
-#   sk-ant-api03-...  Anthropic
-#   AIza...           Google
-#   xai-...           xAI
-#   hf_...            Hugging Face
-#   glpat-...         GitLab
-#   AKIA...           AWS access key id
-_SECRET_VALUE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    WRITE_TOKEN_VALUE,
-    re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,}"),
-    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"),
-    re.compile(r"\bxai-[A-Za-z0-9]{16,}"),
-    re.compile(r"\bhf_[A-Za-z0-9]{20,}"),
-    re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*", re.IGNORECASE),
-)
-
-# Field NAMES that must never appear in a state payload at all — a caller passing one is not
-# smuggling a value, it is telling us the design was violated. Kept separate from the value
-# patterns because the name alone is the error, whatever the value looks like.
-_FORBIDDEN_FIELD_NAMES: Final[frozenset[str]] = frozenset(
-    name.lower()
-    for name in (
-        *WRITE_TOKEN_NAMES,
-        "api_key",
-        "apikey",
-        "provider_api_key",
-        "authorization",
-        "auth_token",
-        "bearer",
-        "password",
-        "secret",
-        "private_key",
-        "client_secret",
-    )
-)
 
 _REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./-]{0,254}$")
 # The engine's turn id alphabet: `turn_<session id>_<seq>` with session ids restricted to the same
@@ -121,37 +92,6 @@ class TaskStateError(ValueError):
         return {"error": {"code": self.code, "message": str(self), "details": self.details}}
 
 
-def find_secret_like_strings(payload: Any, *, path: str = "") -> list[dict[str, str]]:
-    """Return every secret-looking finding in an already-decoded payload, with its JSON path.
-
-    Walks dicts, lists and strings. Returning the path (not the value) keeps the report itself
-    safe to log — the whole point is that this text is already too sensitive to repeat.
-    """
-    findings: list[dict[str, str]] = []
-
-    def walk(node: Any, where: str) -> None:
-        if isinstance(node, Mapping):
-            for key, value in node.items():
-                key_text = str(key)
-                child = f"{where}.{key_text}" if where else key_text
-                if key_text.lower() in _FORBIDDEN_FIELD_NAMES:
-                    findings.append({"path": child, "reason": "forbidden_field_name"})
-                walk(value, child)
-            return
-        if isinstance(node, (list, tuple)):
-            for index, value in enumerate(node):
-                walk(value, f"{where}[{index}]")
-            return
-        if isinstance(node, str):
-            for pattern in _SECRET_VALUE_PATTERNS:
-                if pattern.search(node):
-                    findings.append({"path": where or "$", "reason": "secret_value_pattern"})
-                    return
-
-    walk(payload, path)
-    return findings
-
-
 def validated_state(raw: Any) -> dict[str, Any]:
     """Re-validate a state payload through `TaskState` and return its canonical form.
 
@@ -167,44 +107,12 @@ def validated_state(raw: Any) -> dict[str, Any]:
 def assert_state_encodable(payload: Mapping[str, Any]) -> int:
     """Enforce the size + secret invariants on a state payload. Returns the serialized size.
 
-    Callers get one function for both rules because they must always hold together: a check that
-    can be run alone is a check that will be run alone.
+    Callers get ONE function for both rules because they must always hold together: a check that can
+    be run alone is a check that will be run alone. The rules live in `state_guards.py` (a leaf); this
+    wrapper exists only to bind them to this module's error type and to read `MAX_STATE_BYTES` from
+    here at CALL time, which is what keeps that constant's documented monkeypatch seam working.
     """
-    try:
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=_reject_non_json)
-    except TypeError as exc:
-        raise TaskStateError(
-            f"task state is not JSON-serializable: {exc}",
-            code="state_not_serializable",
-            details={"error": str(exc)},
-        ) from exc
-    size = len(encoded.encode("utf-8"))
-    if size > MAX_STATE_BYTES:
-        raise TaskStateError(
-            f"task state is {size} bytes, over the {MAX_STATE_BYTES}-byte limit: store a reference, "
-            "not the payload.",
-            code="state_too_large",
-            details={"bytes": size, "limit": MAX_STATE_BYTES},
-        )
-    findings = find_secret_like_strings(payload)
-    if findings:
-        raise TaskStateError(
-            "task state contains secret-like data and may not enter workflow history: "
-            + ", ".join(sorted({finding["path"] for finding in findings}))
-            + ".",
-            code="state_contains_secret",
-            details={"findings": findings},
-        )
-    return size
-
-
-def _reject_non_json(value: Any) -> Any:
-    """`json.dumps` default hook: refuse rather than stringify an unexpected object.
-
-    Stringifying would let a `Path`, a model object or a bytes blob slip into history in a form
-    nobody can decode back, which is worse than a loud failure here.
-    """
-    raise TypeError(f"{type(value).__name__} is not JSON-serializable")
+    return _assert_state_encodable(payload, limit=MAX_STATE_BYTES, fail=TaskStateError)
 
 
 @dataclass(frozen=True)
@@ -748,6 +656,22 @@ class TaskState:
     # request was opened, or the publish step has not run). Without this field a SKIP and "never ran"
     # would both be ``pr is None``. A REFUSAL is NOT recorded — it is an error the user must fix.
     publish_skip: "PublishSkipReason | None" = None
+    # WHY the last review rejected the change, in the reviewer's own findings (`review_feedback.py`).
+    #
+    # This is the field whose ABSENCE made a rejected review unable to converge. `after_review` routes
+    # a `changes_requested` verdict back to `implement`, but the implement prompt was built from the
+    # brief and human steering alone, so the retry was asked to "try again" with no new information:
+    # measured (`run-20261116T005743Z`, build `6f7a904d`) the 3rd and 4th implement prompts in the
+    # ledger were BYTE-IDENTICAL while review rejected the same unchanged SHA `8cce0fa1` three times.
+    #
+    # It lives in the STATE, not in `details` on the review outcome, because the state is what a
+    # replayed workflow rebuilds: the retry's prompt must be reconstructible from history alone, and
+    # `implement_prompt` is a pure function of what this field carries.
+    #
+    # Cleared by an APPROVAL: `review_task` writes ``None`` when the review passes, so a stale
+    # rejection can never ride along with a later attempt. Bounded by `MAX_FINDINGS_RECORDED`, so the
+    # prompt it feeds stays small no matter how many findings a reviewer returns.
+    review_feedback: "ReviewFeedback | None" = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not self.run_id:
@@ -850,6 +774,8 @@ class TaskState:
             self.pending_approval.validate()
         if self.ask is not None:
             self.ask.validate()
+        if self.review_feedback is not None:
+            self.review_feedback.validate(fail=TaskStateError)
         # The publish-skip rules live in `publish.py` with the error type INJECTED, the same way
         # `state_coercion` does it: `TaskStateError` is defined HERE, so importing it back is a cycle.
         validate_publish_skip(self.publish_skip, pr=self.pr, fail=TaskStateError)
@@ -878,6 +804,7 @@ class TaskState:
             "attempts": self.attempts.to_payload(),
             "ask": self.ask.to_payload() if self.ask else None,
             "publish_skip": self.publish_skip,
+            "review_feedback": self.review_feedback.to_payload() if self.review_feedback else None,
         }
         assert_state_encodable(payload)
         return payload
@@ -915,6 +842,11 @@ class TaskState:
             # Absent in a payload recorded before publishing could be skipped: `None` is what such a
             # history meant (its `open_pr` either opened a pull request or failed).
             publish_skip=publish_skip_from_payload(data.get("publish_skip"), fail=TaskStateError),
+            # Absent in every payload recorded before a rejection could tell a retry anything: `None`
+            # is what such a history meant (the retry was blind), so decoding one is unchanged.
+            review_feedback=review_feedback_from_payload(
+                data.get("review_feedback"), fail=TaskStateError
+            ),
         )
         state.validate()
         _ = size  # already enforced; kept for the reader: the decode path checks the same bound

@@ -28,6 +28,7 @@ from .contracts import (
     NAME_CHECKPOINT,
     NAME_DELEGATION_POLICY,
     NAME_EPISODE,
+    NAME_MCP_ATTACHMENT,
     NAME_NOTIFY,
     NAME_OPEN_PR,
     NAME_PLAN,
@@ -43,6 +44,14 @@ from .contracts import (
     TaskSummary,
 )
 from .graph import ACTIVITY_RETRIES, STEP_TIMEOUT_S
+# The one task-level outcome that means "work done, nothing to publish". Declared in `run_contracts`
+# beside the run vocabulary the READER needs (see its own comment), and imported here rather than
+# respelled so the two cannot disagree.
+from .run_contracts import APPROVED_UNPUBLISHED
+# The park vocabulary lives in a LEAF module (`parking`) so the workflow-facing `graph.py` can read it
+# without importing this one — whose `codna.runtime` reach the workflow sandbox refuses. Re-exported
+# here because every existing caller imports it from this module.
+from .parking import park_kind, park_message, park_reason
 from .state import Budget, PendingApproval, TaskState
 
 __all__ = [
@@ -50,10 +59,12 @@ __all__ = [
     "BOOKKEEPING_ACTIVITIES",
     "approved_outcome",
     "park_kind",
+    "park_message",
     "park_reason",
     "workflow_activity",
     "task_completion",
     "history_length",
+    "is_completed_task_outcome",
     "approver_identity",
     "initial_state",
     "steer_note",
@@ -77,6 +88,8 @@ ACTIVITY_NAMES: Final[tuple[str, ...]] = (
     NAME_OPEN_PR,
     NAME_EPISODE,
     NAME_NOTIFY,
+    NAME_DELEGATION_POLICY,
+    NAME_MCP_ATTACHMENT,
     # Run-level, but listed here so `activity_timeout` can answer for it: `RunWorkflow` schedules it
     # through this module's helper like every other activity, and a name missing from this tuple is a
     # `ValueError` at schedule time rather than a silently untimed step.
@@ -119,11 +132,13 @@ def result_type(name: str) -> type:
         NotifyOutcome,
         PullRequestOutcome,
     )
-    from .contracts import DelegationPolicyOutcome, WorktreeCleanupOutcome
+    from .contracts import DelegationPolicyOutcome, McpAttachmentOutcome, WorktreeCleanupOutcome
     from .goal_contracts import RecallOutcome, WatchCiOutcome
 
     if name == NAME_DELEGATION_POLICY:
         return DelegationPolicyOutcome
+    if name == NAME_MCP_ATTACHMENT:
+        return McpAttachmentOutcome
     if name == NAME_CHECKPOINT:
         return CheckpointOutcome
     if name == NAME_OPEN_PR:
@@ -215,6 +230,21 @@ def approved_outcome(state: TaskState) -> TaskOutcome:
     ``pr`` (or with the old hard failure, which never produced a completion at all).
     """
     return "approved_unpublished" if state.publish_skip is not None else "approved"
+
+
+def is_completed_task_outcome(outcome: str) -> bool:
+    """Whether a task's outcome means the WORK was done — `approved` or `approved_unpublished`.
+
+    Used by both engines to decide whether a task's ending also needs the `task.unfinished` record.
+    It exists because a task ending and a task SUCCEEDING are different facts: a rejected,
+    out-of-budget or stopped task writes the same ``task.finished`` record as an approved one, so a
+    reader that took "this task finished" as "this run's work is done" would report a rejected run as
+    a success.
+
+    PURE and total over `TaskOutcome`: an outcome this does not recognize is NOT success, which is the
+    only safe reading of a value nobody taught it.
+    """
+    return outcome in ("approved", APPROVED_UNPUBLISHED)
 
 
 def approver_identity(payload: Any, *, handler: str) -> str:
@@ -339,6 +369,8 @@ def spec_from(payload: Mapping[str, Any]) -> TaskSpec:
         # Absent before run-from-a-branch existed: `""` is "my own branch", so such a run replays
         # adopting nothing rather than being pointed at a branch it never used.
         worktree_branch=str(payload.get("worktree_branch") or ""),
+        auto_approve_local_only=payload.get("auto_approve_local_only", False),
+        approval_policy_digest=payload.get("approval_policy_digest", ""),
     )
     spec.validate()
     return spec
@@ -421,31 +453,6 @@ def run_id_of(workflow_id: str) -> str:
     return workflow_id.split(":", 1)[1] if ":" in workflow_id else workflow_id
 
 
-def park_reason(state: TaskState) -> str:
-    """Why a task is parking, in the vocabulary `status` and the ledger use."""
-    # `answer_required` first: it is the only reason that is NOT a judgement about the work — the work
-    # has not happened yet, because the agent is waiting for a decision. Reporting it as
-    # `plan_not_produced` would send a human looking for a broken plan.
-    if state.ask is not None:
-        return "answer_required"
-    if state.budget.exhausted:
-        return "budget_exhausted"
-    if state.plan_ref is None:
-        return "plan_not_produced"
-    if state.verify_ref is None or not state.verify_ref.passed:
-        return "verify_failed"
-    return "review_not_approved"
-
-
-def park_kind(state: TaskState) -> str:
-    # `ask` is the third kind `PendingApproval` already declares: a parked run whose approval releases a
-    # specific tool call, not a whole task. Keeping it distinct is what lets a UI render the engine's
-    # question instead of a generic "approve this task".
-    if state.ask is not None:
-        return "ask"
-    return "budget" if state.budget.exhausted else "approve"
-
-
 def park_approval(state: TaskState, reason: str) -> PendingApproval:
     return PendingApproval(
         kind=park_kind(state), reason=reason, requested_at_index=state.last_event_index
@@ -455,3 +462,56 @@ def park_approval(state: TaskState, reason: str) -> PendingApproval:
 def remaining_tasks(spec: Any, completed: list[TaskSummary]) -> tuple[TaskSpec, ...]:
     """The tasks not yet done, in order. Keyed by id, never by position."""
     return spec.remaining(tuple(completed))
+
+
+def _pr_coordinates(child: Any) -> tuple[int | None, str | None]:
+    """A finished task's pull request: ``(number, head_sha)``, either of which may be None.
+
+    Read from the state rather than from the `TaskSummary`, because the summary carries the URL (what
+    a human reads) and the CI gate needs the NUMBER (what the API takes); deriving one from the other
+    would mean parsing a URL in workflow code.
+
+    The head sha falls back to the checkpoint's commit when the PR ref did not record one: that is
+    the commit this run pushed, which is the commit CI judges. A PR opened without a head sha (an
+    older spec, or a provider that omits it) therefore still gates on the right commit.
+    """
+    state = getattr(child, "state", None)
+    if not isinstance(state, dict):
+        return None, None
+    pr = state.get("pr")
+    number: int | None = None
+    head_sha: str | None = None
+    if isinstance(pr, dict):
+        raw = pr.get("number")
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            number = raw
+        if isinstance(pr.get("head_sha"), str) and pr["head_sha"]:
+            head_sha = str(pr["head_sha"])
+    if head_sha is None:
+        checkpoint = state.get("checkpoint_ref")
+        if isinstance(checkpoint, dict) and isinstance(checkpoint.get("sha"), str):
+            head_sha = str(checkpoint["sha"])
+    return number, head_sha
+
+
+def _evidence_message(evidence: Mapping[str, Any]) -> str:
+    """A one-line human summary of a structured notification, from the evidence itself.
+
+    Deterministic in the evidence, so the ledger row replays to the same string. Kept small: the
+    evidence is the record, this is the sentence a reader skims.
+    """
+    parts: list[str] = []
+    for key in ("satisfied", "reason", "tasks_done", "tasks_remaining", "ci_state", "ci_attempts"):
+        if key in evidence:
+            parts.append(f"{key}={evidence[key]}")
+    checks = evidence.get("checks")
+    if isinstance(checks, list) and checks:
+        parts.append(
+            "checks="
+            + ",".join(
+                f"{entry[0]}-{entry[1]}"
+                for entry in checks
+                if isinstance(entry, list) and len(entry) == 2
+            )
+        )
+    return " ".join(parts) or "notified"

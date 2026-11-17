@@ -67,6 +67,282 @@ def test_dependabot_leaves_the_toolchain_pin_to_propagate():
     assert any(name.startswith("thyn-ai/security-toolchain") and name.endswith("*") for name in ignored), ignored
 
 
+# --- package-ide.yml: a tag is a release and must always schedule the macOS leg -------------------------
+
+PACKAGE_IDE = WORKFLOWS / "package-ide.yml"
+_MATRIX_EXPR = re.compile(r"^\$\{\{(.*)\}\}$", re.S)
+
+
+def _matrix_expression() -> str:
+    doc = yaml.safe_load(PACKAGE_IDE.read_text(encoding="utf-8"))
+    raw = doc["jobs"]["package"]["strategy"]["matrix"]["include"]
+    assert isinstance(raw, str), f"matrix.include must be a single expression, got {type(raw).__name__}"
+    match = _MATRIX_EXPR.match(raw.strip())
+    assert match, raw
+    return match.group(1).strip()
+
+
+def _evaluate_matrix(ref_type: str, run_mac):
+    """Evaluate the matrix expression for one trigger, using a translation of the exact subset of the
+    GitHub expression language the line uses (`&&`, `||`, `==`, `fromJSON`). Nothing is retyped: the
+    expression comes from the workflow, so editing the workflow edits what this asserts.
+
+    `run_mac` is None when `github.event.inputs` is null — which is the entire defect: on a tag push
+    the field is absent, so an expression keyed only on it fell through to the ubuntu-only branch.
+    """
+    import json
+
+    source = _matrix_expression()
+    python = source.replace("github.event.inputs.run_mac", "RUN_MAC").replace("github.ref_type", "REF_TYPE")
+    python = python.replace("fromJSON(", "_from_json(").replace("&&", " and ").replace("||", " or ")
+    scope = {"_from_json": json.loads, "REF_TYPE": ref_type, "RUN_MAC": run_mac}
+    legs = eval(python, {"__builtins__": {}}, scope)  # noqa: S307 -- fixed translation of a tracked literal
+    return [leg["os"] for leg in legs]
+
+
+BOTH_LEGS = ["ubuntu-latest", "macos-latest"]
+
+
+def test_package_ide_a_tag_push_always_schedules_the_macos_leg():
+    # Measured defect: a `ide-v*` tag produced an ubuntu-only matrix, so every `if: matrix.os ==
+    # 'macos-latest'` step (signing, notarization, verify-signing, the .dmg build) was skipped and the
+    # release emitted no macOS artifact under ANY credential configuration.
+    assert _evaluate_matrix("tag", None) == BOTH_LEGS
+
+
+def test_package_ide_macos_leg_cases_are_the_three_documented_ones():
+    assert _evaluate_matrix("tag", "true") == BOTH_LEGS             # dispatch targeted at a tag
+    assert _evaluate_matrix("branch", "true") == BOTH_LEGS          # dispatch asking for mac
+    assert _evaluate_matrix("branch", "false") == ["ubuntu-latest"]  # dispatch declining mac
+    assert _evaluate_matrix("branch", None) == ["ubuntu-latest"]     # dispatch with no inputs object
+
+
+def test_package_ide_matrix_does_not_gate_the_mac_leg_on_dispatch_inputs_alone():
+    # The shape of the regression, independent of evaluation: the mac gate must consult the REF.
+    expression = _matrix_expression()
+    gate = expression.split("&&", 1)[0]
+    assert "github.ref_type == 'tag'" in gate, gate
+    assert gate.strip().startswith("(") and gate.strip().endswith(")"), \
+        f"the tag/dispatch condition must stay one explicit parenthesized group: {gate!r}"
+
+
+# --- package-ide.yml: the E2E scenario suite runs on a dispatch, and a tag is unaffected -----------------
+
+def _evaluate_step_if(if_expression: str, *, os_name: str, ref_type: str, event_name: str, run_e2e):
+    """Evaluate the subset of the expression language a step's `if:` uses (`||`, `&&`, `==`, `inputs.*`).
+
+    `run_e2e` is None on a tag push, which is the whole point: `github.event.inputs` is null there, so the switch
+    must read false and the macOS leg must still run the suite.
+    """
+    source = if_expression.replace("matrix.os", "OS").replace("github.ref_type", "REF_TYPE")
+    source = source.replace("github.event_name", "EVENT").replace("inputs.run_e2e", "RUN_E2E")
+    source = source.replace("&&", " and ").replace("||", " or ")
+    scope = {"OS": os_name, "REF_TYPE": ref_type, "EVENT": event_name, "RUN_E2E": run_e2e}
+    return bool(eval(source, {"__builtins__": {}}, scope))  # noqa: S307 -- fixed translation of a tracked literal
+
+
+def test_package_ide_e2e_suite_skips_an_ordinary_dispatch_and_runs_when_asked():
+    # Measured defect: the step's only condition was `matrix.os == 'macos-latest'`, so a dispatch with `run_mac:
+    # false` scheduled no leg that could run it and the green run reported it `skipped`.
+    step = _package_ide_step("E2E scenario suite")
+    condition = step["if"]
+    assert "inputs.run_e2e" in condition, condition
+    assert _evaluate_step_if(condition, os_name="ubuntu-latest", ref_type="branch",
+                             event_name="workflow_dispatch", run_e2e=True) is True
+    assert _evaluate_step_if(condition, os_name="ubuntu-latest", ref_type="branch",
+                             event_name="workflow_dispatch", run_e2e=False) is False
+    assert _evaluate_step_if(condition, os_name="ubuntu-latest", ref_type="branch",
+                             event_name="workflow_dispatch", run_e2e=None) is False
+
+
+def test_package_ide_e2e_suite_still_runs_on_a_tag_and_on_the_mac_leg():
+    # A tag push must not depend on the dispatch switch: `github.event.inputs` is null there, so a condition keyed
+    # on it alone would skip the suite on every release.
+    condition = _package_ide_step("E2E scenario suite")["if"]
+    assert _evaluate_step_if(condition, os_name="macos-latest", ref_type="tag",
+                             event_name="push", run_e2e=None) is True
+    assert _evaluate_step_if(condition, os_name="macos-latest", ref_type="branch",
+                             event_name="workflow_dispatch", run_e2e=False) is True
+
+
+def test_package_ide_e2e_suite_follows_the_libraries_the_packaged_app_needs():
+    # On Linux the packaged app dies before a window exists without them, so a step that launches it cannot precede
+    # the install. This is ordering, asserted by position rather than by a comment.
+    names = [str(s.get("name", "")) for s in _package_ide_steps()]
+    e2e = names.index(_package_ide_step("E2E scenario suite")["name"])
+    libraries = names.index(_package_ide_step("Electron runtime libraries for the boot smoke")["name"])
+    assert libraries < e2e, names
+
+
+# --- package-ide.yml: `yarn package` runs `bundle:telys`, so the job must supply a runtime -----------
+
+def _package_ide_steps() -> list[dict]:
+    doc = yaml.safe_load(PACKAGE_IDE.read_text(encoding="utf-8"))
+    return doc["jobs"]["package"]["steps"]
+
+
+def _package_ide_step(named: str) -> dict:
+    hits = [s for s in _package_ide_steps() if named in str(s.get("name", ""))]
+    assert len(hits) == 1, (named, [s.get("name") for s in hits])
+    return hits[0]
+
+
+def test_package_ide_provisions_python_312_by_pinned_sha():
+    # `package` is `… && bundle:telys && …`, and bundle-telys.js resolves a CPython by EXACT minor
+    # (`REQUIRED_PYTHON_MINOR`), first trying `python3.12` on PATH. Nothing provided one, so the step
+    # depended on whichever interpreter the runner image happened to carry — the same fragility
+    # ide-test.yml answers by provisioning the minor rather than assuming it.
+    step = _package_ide_step("Python 3.12 (the minor `bundle-telys.js` probes the payload closure under)")
+    assert step["uses"] == "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0", step["uses"]
+    assert step["with"]["python-version"] == "3.12", step["with"]
+    # The comment is not YAML, so it survives only in the file's text — the same check security.yml's
+    # toolchain pin gets.
+    assert re.search(
+        r"uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v\d+\.\d+\.\d+",
+        PACKAGE_IDE.read_text(encoding="utf-8"),
+    ), "the pin must carry a version comment"
+
+
+def test_package_ide_references_the_telys_bundle_credential_and_url():
+    # The measured defect: `package` has run `bundle:telys` since it entered the script, and this
+    # workflow contained no TELYS reference at all, so every leg would have died with
+    # `runtime_source_missing`. Both the credential and the URL use the names the bundler and
+    # download_telys_runtime_bundle.py already read — not new ones.
+    text = PACKAGE_IDE.read_text(encoding="utf-8")
+    assert "${{ secrets.CODNA_TELYS_OEM_DOWNLOAD_TOKEN }}" in text
+    assert "${{ vars.CODNA_TELYS_RUNTIME_MACOS_ARM64_BUNDLE_URL }}" in text
+    guard = _package_ide_step("Telys runtime source")["run"]
+    assert "CODNA_TELYS_OEM_DOWNLOAD_TOKEN" in guard
+    assert "CODNA_TELYS_RUNTIME_BUNDLE_URL" in guard      # what bundle-telys.js reads to download
+    assert "runtime_source_missing" in guard              # the failure being prevented is named
+
+
+def test_package_ide_default_bundle_urls_are_the_published_shape():
+    # The default is not invented: it is the `packages.telys.ai/runtime/latest/<platform>.bundle`
+    # shape publish-cli.yml and ci.yml already use, for the platform tags
+    # `stage_codna_telys_runtime.py` names (NOT electron-builder's `darwin-arm64`).
+    guard = _package_ide_step("Telys runtime source")["run"]
+    for platform in ("macos-arm64", "linux-x86_64"):
+        assert f"https://packages.telys.ai/runtime/latest/{platform}.bundle" in guard, platform
+    assert "darwin-arm64.bundle" not in guard
+
+
+def test_package_ide_a_tag_without_the_credential_fails_loudly(tmp_path):
+    """The guard step, run for real: a tag exits 1 with an actionable ::error, a branch dispatch
+    proceeds but MARKS the artifact, and a credential-bearing run needs no marking."""
+    import os
+    import subprocess
+
+    guard = _package_ide_step("Telys runtime source")
+    names = {"CODNA_TELYS_OEM_DOWNLOAD_TOKEN", "CODNA_TELYS_RUNTIME_BUNDLE_URL", "MACOS_ARM64_BUNDLE_URL",
+             "LINUX_X86_64_BUNDLE_URL", "IS_TAG", "MATRIX_OS", "MATRIX_ARCH"}
+
+    def run(matrix_os: str, **env) -> tuple[int, str, str]:
+        env_file = tmp_path / f"env-{matrix_os}-{len(env)}.txt"
+        env_file.write_text("")
+        scope = {k: v for k, v in os.environ.items() if k not in names}
+        scope.update(env, GITHUB_ENV=str(env_file), GITHUB_STEP_SUMMARY=str(tmp_path / "summary.md"),
+                     MATRIX_OS=matrix_os, MATRIX_ARCH="arm64" if matrix_os == "macos-latest" else "x64")
+        proc = subprocess.run(["bash", "-c", guard["run"]], env=scope, capture_output=True, text=True, check=False)
+        return proc.returncode, proc.stdout + proc.stderr, env_file.read_text()
+
+    for os_name in ("macos-latest", "ubuntu-latest"):
+        rc, out, env_text = run(os_name, IS_TAG="1")
+        assert rc != 0, (os_name, out)
+        assert "::error title=No Telys runtime bundle credential::" in out
+        assert "CODNA_TELYS_OEM_DOWNLOAD_TOKEN is not set" in out
+        assert env_text == "", "a failed tag must not export a runtime source it does not have"
+
+        # NOT A TAG: allowed to proceed, but ONLY as a declared, marked artifact.
+        rc, out, env_text = run(os_name)
+        assert rc == 0, (os_name, out)
+        assert "::warning title=Packaging WITHOUT Telys::" in out
+        exported = dict(line.split("=", 1) for line in env_text.splitlines() if "=" in line)
+        assert exported["CODNA_TELYS_ARTIFACT_VARIANT"] == "lacking-runtime", exported
+        assert exported["CODNA_TELYS_ARTIFACT_SUFFIX"] == "-no-telys", exported
+        assert "CODNA_TELYS_RUNTIME_BUNDLE_URL" not in exported, "no URL without a credential to fetch it"
+
+        # WITH THE CREDENTIAL: the URL is exported for `bundle:telys` and nothing is marked.
+        rc, out, env_text = run(os_name, CODNA_TELYS_OEM_DOWNLOAD_TOKEN="token-value")
+        assert rc == 0, (os_name, out)
+        exported = dict(line.split("=", 1) for line in env_text.splitlines() if "=" in line)
+        platform = "macos-arm64" if os_name == "macos-latest" else "linux-x86_64"
+        assert exported["CODNA_TELYS_RUNTIME_BUNDLE_URL"] == \
+            f"https://packages.telys.ai/runtime/latest/{platform}.bundle", exported
+        assert "CODNA_TELYS_ARTIFACT_VARIANT" not in exported, exported
+        assert "token-value" not in out, "the guard must never echo the credential"
+
+
+# --- package-ide.yml: an ABSENT certificate must not abort the pack -----------------------------------
+
+def _unsigned_mac_pack_env(tmp_path, **env):
+    """Run the `Package` step's preamble and report the certificate variables electron-builder would inherit.
+
+    Only the preamble is executed (everything above the package chain it then runs), because the question is
+    which variables REACH the packer, not what the packer then does. An unset variable is reported as `<unset>`
+    so "removed" and "exported empty" cannot be confused.
+    """
+    import os
+    import subprocess
+
+    run = _package_ide_step("Package (electron-builder")["run"]
+    preamble = run.split("# THE NORMAL PATH IS THE CANONICAL SCRIPT", 1)[0]
+    names = ("CSC_LINK", "CSC_KEY_PASSWORD", "WIN_CSC_LINK", "WIN_CSC_KEY_PASSWORD")
+    marker = tmp_path / "env.txt"
+    probe = [
+        # `set -u` is what the step opens with, so each probe uses the `${x-<unset>}` form: an UNSET variable is
+        # the outcome under test and must not abort the probe.
+        "set -euo pipefail",
+        preamble.replace("set -euo pipefail", "", 1),
+        *(f'printf "%s\\n" "${{{name}-<unset>}}" >> "{marker}"' for name in names),
+    ]
+    scope = {k: v for k, v in os.environ.items() if k not in names}
+    scope.update(env)
+    subprocess.run(["bash", "-c", "\n".join(probe)], env=scope, capture_output=True, text=True, check=True)
+    return dict(zip(names, marker.read_text().splitlines()))
+
+
+def test_package_ide_unsets_an_empty_certificate_before_packing(tmp_path):
+    """An EMPTY `CSC_LINK` is a PATH to electron-builder, not "no certificate".
+
+    Measured on run 43983496200 — the first dispatch that ever scheduled the macOS leg. `MAC_CSC_LINK` was unset,
+    so GitHub defined `CSC_LINK=""`; `MacPackager.codeSigningInfo` saw a non-null link, `resolveCscLinkPath("")`
+    resolved it to the project directory, and the pack died in `importCertificate` with
+
+        ⨯ /…/ide/applications/electron not a file
+
+    before any signing decision, so the unsigned build never got the chance to produce a `.dmg`. The step must
+    therefore UNSET an empty variable rather than export an empty one.
+    """
+    exported = _unsigned_mac_pack_env(tmp_path, CSC_LINK="", CSC_KEY_PASSWORD="", WIN_CSC_LINK="",
+                                      WIN_CSC_KEY_PASSWORD="")
+    assert exported == {"CSC_LINK": "<unset>", "CSC_KEY_PASSWORD": "<unset>",
+                        "WIN_CSC_LINK": "<unset>", "WIN_CSC_KEY_PASSWORD": "<unset>"}, exported
+
+
+def test_package_ide_passes_a_supplied_certificate_through_untouched(tmp_path):
+    # The signed path is NOT weakened by the unset: a value that is present reaches electron-builder verbatim,
+    # so a release still signs with the identity it was given (and still fails closed in `scripts/notarize.js`
+    # when `CODNA_REQUIRE_NOTARIZATION=1` has no Apple credentials).
+    exported = _unsigned_mac_pack_env(tmp_path, CSC_LINK="base64-cert", CSC_KEY_PASSWORD="pw",
+                                      WIN_CSC_LINK="win-cert", WIN_CSC_KEY_PASSWORD="")
+    assert exported["CSC_LINK"] == "base64-cert", exported
+    assert exported["CSC_KEY_PASSWORD"] == "pw", exported
+    assert exported["WIN_CSC_LINK"] == "win-cert", exported
+    assert exported["WIN_CSC_KEY_PASSWORD"] == "<unset>", "only the empty variable is removed"
+
+
+def test_package_ide_marked_dispatch_runs_the_chain_minus_bundle_telys():
+    # The marked path may not retype `package`: it strips the ONE failing segment from the tracked script,
+    # so a new step in `scripts.package` keeps flowing into a dispatch build.
+    run = _package_ide_step("Package (electron-builder")["run"]
+    assert "require(\"./package.json\").scripts.package" in run, "the chain must be READ from package.json"
+    assert 'segment="yarn bundle:telys && "' in run
+    assert "exec yarn package" in run, "the canonical script must still run unmodified on the normal path"
+    assert 'CODNA_TELYS_ARTIFACT_VARIANT' in run
+    assert "check:packaged-app" in run, "removing the segment must not remove the artifact gate"
+
+
 # --- webhook-ops.yml: the rollout's operator surface --------------------------------------------------
 
 WEBHOOK_OPS = WORKFLOWS / "webhook-ops.yml"

@@ -8,9 +8,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import tomllib
 import zipfile
 
@@ -232,28 +234,300 @@ def test_sidecar_build_collapses_duplicate_sdk_copies_and_minifies():
     assert "packages" in plugin_source and '"src"' in plugin_source
 
 
-def test_cline_postbuild_is_concurrency_safe():
-    script = ROOT / "agent-core" / "vendor" / "cline" / "algenta" / "postbuild.sh"
+POSTBUILD = ROOT / "agent-core" / "vendor" / "cline" / "algenta" / "postbuild.sh"
+CLINE_SCOPE_LINK_TARGET = "../../sdk/packages/{}"
+
+#: A `mkdir` that does not exclude, reproduced as an executable so the script can be driven down that
+#: path on ANY host. See `test_the_postbuild_lock_is_atomic_under_a_mkdir_that_does_not_exclude` for
+#: the measurements this behaviour is taken from. The optional barrier (`MKCOL_BARRIER_DIR`) is the
+#: test instrument that makes the two racers reach `mkdir` together; the sleep widens the window
+#: between the existence check and the create so both checks land before either create. Neither is a
+#: claim about uutils' timing.
+_MKDIR_WITHOUT_EXCLUSION = '''\
+#!{python}
+"""A `mkdir` that lets two racers BOTH exit 0 -- the defect measured in uutils coreutils 0.10.0."""
+import os
+import sys
+import time
+
+WINDOW_S = float(os.environ.get("MKCOL_RACE_WINDOW_S", "0.05"))
+BARRIER_DIR = os.environ.get("MKCOL_BARRIER_DIR")
+BARRIER_PARTIES = int(os.environ.get("MKCOL_BARRIER_PARTIES", "0"))
+
+
+def wait_for_racers():
+    """Hold every racer at the same point until the whole field has arrived.
+
+    This is what makes the two-racer check a REAL race: without it, one racer can finish entirely
+    before the other starts, and this shim's `File exists` -> exit 0 branch would make the pair
+    look like a race that never happened. A marker file per process, then spin until
+    `BARRIER_PARTIES` markers exist. It is a no-op unless the test opts in, so `postbuild.sh`
+    (which invokes the shim as `mkdir -p`) is unaffected.
+    """
+    if not BARRIER_DIR or BARRIER_PARTIES <= 1:
+        return
+    open(os.path.join(BARRIER_DIR, str(os.getpid())), "w").close()
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if len(os.listdir(BARRIER_DIR)) >= BARRIER_PARTIES:
+            return
+        time.sleep(0.001)
+    raise SystemExit("mkdir shim: barrier timed out waiting for " + str(BARRIER_PARTIES) + " racers")
+
+
+def main(argv):
+    if "--version" in argv:
+        print("mkdir (no-exclusion shim) 0")
+        return 0
+    create_parents = any(a in ("-p", "--parents") for a in argv)
+    wait_for_racers()
+    for path in [a for a in argv if not a.startswith("-")]:
+        if os.path.isdir(path) and create_parents:
+            continue
+        if os.path.isdir(path):
+            print("mkdir: " + path + ": File exists", file=sys.stderr)
+            continue
+        time.sleep(WINDOW_S)
+        try:
+            if create_parents:
+                os.makedirs(path, exist_ok=True)
+            else:
+                os.mkdir(path)
+        except FileExistsError:
+            # THE SECOND HALF OF THE DEFECT: the loser reports SUCCESS anyway.
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'''
+
+
+def _postbuild_workspace(tmp_path: Path) -> Path:
+    """A throwaway cline root: the real `postbuild.sh`, plus the `sdk/packages/*` it links."""
+    cline_root = tmp_path / "cline"
+    (cline_root / "algenta").mkdir(parents=True)
+    shutil.copy2(POSTBUILD, cline_root / "algenta" / "postbuild.sh")
+    for package in ("shared", "llms", "agents", "core", "sdk"):
+        (cline_root / "sdk" / "packages" / package).mkdir(parents=True)
+    return cline_root
+
+
+def _race_postbuild(
+    cline_root: Path, count: int, *, path_prefix: str | None = None, reset: bool = False
+) -> list[str]:
+    """Run `count` copies of postbuild.sh at once; return a failure message per non-zero exit.
+
+    `reset` removes `node_modules` first, so a round starts from the same state CI does. It is OFF by
+    default and only ever passed for a throwaway workspace: this helper must never delete the real
+    vendored `node_modules`, which is a developer's built SDK and unavailable offline.
+    """
+    if reset:
+        shutil.rmtree(cline_root / "node_modules", ignore_errors=True)
+    (cline_root / "node_modules").mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ)
+    if path_prefix is not None:
+        env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
+
+    script = str(cline_root / "algenta" / "postbuild.sh")
     processes = [
         subprocess.Popen(
-            ["bash", str(script)],
-            cwd=ROOT,
+            ["bash", script],
+            cwd=cline_root,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
+        )
+        for _ in range(count)
+    ]
+    failures = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=60)
+        if process.returncode != 0:
+            failures.append(f"exit {process.returncode}: {stdout}{stderr}".strip())
+    return failures
+
+
+def _assert_links_are_exactly_the_five_packages(cline_root: Path) -> None:
+    """No nesting, no strays: the race must not be able to produce `@cline/shared/shared`."""
+    scope = cline_root / "node_modules" / "@cline"
+    entries = sorted(path.name for path in scope.iterdir())
+    assert entries == ["agents", "core", "llms", "sdk", "shared"], entries
+    for package in entries:
+        dest = scope / package
+        assert dest.is_symlink(), f"{dest} is not a symlink"
+        assert os.readlink(dest) == CLINE_SCOPE_LINK_TARGET.format(package), os.readlink(dest)
+
+
+def test_cline_postbuild_is_concurrency_safe():
+    """Eight concurrent runs, in the REAL vendored tree, all succeed and leave exactly five links.
+
+    Raised from 2 to 8 because 2 is not where this broke: CI failed with
+    `ln: .../@cline/shared: Already exists` at 2 processes on ubuntu-26.04. The count is what the
+    test can honestly claim; the CAUSE is pinned separately by
+    `test_the_postbuild_lock_is_atomic_under_a_mkdir_that_does_not_exclude`, which is deterministic.
+
+    What this test deliberately does NOT claim: that it can fail on a developer's machine. On a GNU
+    coreutils host the lock works, and the race is invisible — which is exactly why the shipped
+    failure (ubuntu-26.04) went undiagnosed. It is still worth running: it is the shape CI exercises,
+    and it is the assertion that the eight links are the FIVE links.
+    """
+    cline_root = ROOT / "agent-core" / "vendor" / "cline"
+    # A lock FILE left by a killed run is the other thing that can wedge this test — and unlike the
+    # old directory lock there is no rmdir trick for it, because a file cannot be distinguished from
+    # a live holder. Clear it here so a previous interrupted run cannot make THIS test the failure.
+    (cline_root / "node_modules" / ".cline-postbuild.lock").unlink(missing_ok=True)
+    failures = _race_postbuild(cline_root, 8)
+    assert failures == [], "\n".join(failures)
+
+    _assert_links_are_exactly_the_five_packages(cline_root)
+
+
+def _assert_the_shim_actually_races(shim: Path, workdir: Path) -> None:
+    """Prove the instrument reproduces the defect before believing a single word it says.
+
+    THE VACUITY THIS REPLACES. The old check spawned two racers for one path and asserted only that
+    both exited 0. That shim also exits 0 when the path ALREADY EXISTS — it prints `File exists` and
+    continues — so the assertion held in the SEQUENTIAL case where racer A finished before racer B
+    started. It therefore could not tell "the shim does not exclude" from "the second racer never
+    raced", and a shim that genuinely started excluding would still have passed it, silently turning
+    the lock test below into a no-op.
+
+    THE FIX. The racers are held on a BARRIER: each writes a marker, then spins until both markers
+    exist, and only then calls `mkdir`. That guarantees both reach the existence check before either
+    creates, so the outcome is a real contest rather than a race the scheduler may have refused to
+    run. On top of the exit codes — the loser must still claim success — NEITHER racer may print the
+    pre-existing-directory branch, which is the one that only a sequential (non-racing) run reaches.
+
+    Both failure directions are covered: a shim that excludes by RETURNING NONZERO fails the exit-code
+    assertion, and a shim that "excludes" by letting the loser see the finished directory fails the
+    stderr assertion. The contested path must also be absent up front, so no racer can start from the
+    state the check is meant to rule out.
+    """
+    contested = workdir / "contested"
+    assert not contested.exists(), f"{contested} must not exist before the contest"
+    barrier_dir = workdir / "barrier"
+    barrier_dir.mkdir()
+
+    env = dict(os.environ)
+    env["MKCOL_BARRIER_DIR"] = str(barrier_dir)
+    env["MKCOL_BARRIER_PARTIES"] = "2"
+    racers = [
+        subprocess.Popen(
+            [str(shim), str(contested)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
         )
         for _ in range(2)
     ]
+    streams = [racer.communicate(timeout=30) for racer in racers]
+    both = [racer.returncode for racer in racers]
+    stderrs = [stderr for _stdout, stderr in streams]
 
-    for process in processes:
-        stdout, stderr = process.communicate(timeout=20)
-        assert process.returncode == 0, stdout + stderr
+    assert both == [0, 0], (
+        f"the shim no longer lets two racers through: exit codes {both}; stderr {stderrs}"
+    )
+    # The pre-existing-directory branch is the tell that this pair did NOT race: the barrier forces
+    # both racers to the existence check first, so neither may ever see an existing path.
+    preexisting = [stderr for stderr in stderrs if "File exists" in stderr or "Already exists" in stderr]
+    assert preexisting == [], (
+        "the shim took its pre-existing-directory branch, so these racers did not reach `mkdir` "
+        f"together and prove nothing: {preexisting}"
+    )
+    assert contested.is_dir(), f"the contest left no directory at {contested}"
+    shutil.rmtree(contested)
 
-    cline_scope = ROOT / "agent-core" / "vendor" / "cline" / "node_modules" / "@cline"
-    for package in ("shared", "llms", "agents", "core", "sdk"):
-        dest = cline_scope / package
-        assert dest.is_symlink()
-        assert os.readlink(dest) == f"../../sdk/packages/{package}"
+
+def test_the_postbuild_lock_is_atomic_under_a_mkdir_that_does_not_exclude(tmp_path: Path):
+    """THE ROOT CAUSE OF THE CI FLAKE, pinned deterministically.
+
+    THE FAILURE. `cli secure subsystem (python)` failed with
+
+        ln: failed to create symbolic link '.../@cline/shared': Already exists
+
+    on an unrelated PR, intermittently, while passing on this Mac. The tell is the WORDING: GNU
+    coreutils says `File exists`; uutils says `Already exists`. `ubuntu-latest` now resolves to
+    ubuntu-26.04, which ships uutils coreutils 0.10.0 — so CI and a developer's machine run different
+    `mkdir`, and the lock was written against only one of them.
+
+    THE MEASUREMENT. uutils 0.10.0's `mkdir` does not exclude: two concurrent `mkdir <same path>`
+    BOTH exit 0 in 91/400 rounds. GNU 9.4 and the raw mkdir(2) syscall both do so in 0/400. The old
+    lock was `while ! mkdir "$lock_dir"`, so both racers entered the critical section, both ran
+    `ln -s` on the same destination, and the loser died — 37/200 rounds of the real script under the
+    real uutils binary, and 0/200 under GNU.
+
+    WHY THIS TEST USES A SHIM. The defect is in the TOOLCHAIN, not in this repo, so no amount of
+    process racing reproduces it on a GNU host — that is why 200 rounds on macOS found nothing. The
+    shim reproduces the measured behaviour (no exclusion, loser exits 0) so the script is exercised
+    against it everywhere. The assertion is on the LOCK PRIMITIVE, so it fails for the old
+    `mkdir`-directory lock and passes for an atomic one.
+
+    THE INSTRUMENT IS ITSELF VERIFIED, and that is not ceremony. An earlier version of this test
+    proved the shim only by asserting two racers both exit 0 — which the shim also does when the
+    path already exists, so a run where one racer finished before the other started passed and
+    proved nothing. `_assert_the_shim_actually_races` now holds both racers on a barrier and
+    requires that NEITHER takes the pre-existing-directory branch, so the check fails both when the
+    shim starts returning nonzero and when it silently stops racing.
+
+    What it does NOT claim: that the shim IS uutils. It reproduces the one measured behaviour that
+    breaks this script; the real binary is what the measurements above were taken against.
+    """
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "mkdir"
+    shim.write_text(_MKDIR_WITHOUT_EXCLUSION.format(python=sys.executable), encoding="utf-8")
+    shim.chmod(0o755)
+    # Prove the instrument actually reproduces the defect before believing anything it says.
+    _assert_the_shim_actually_races(shim, shim_dir)
+
+    cline_root = _postbuild_workspace(tmp_path)
+    failures: list[str] = []
+    # Repeat: the shim makes each round decide the outcome, and one clean round is not a lock.
+    for _ in range(6):
+        failures = _race_postbuild(cline_root, 4, path_prefix=str(shim_dir), reset=True)
+        if failures:
+            break
+    assert failures == [], (
+        "postbuild.sh does not exclude under a mkdir that does not exclude:\n" + "\n".join(failures)
+    )
+    _assert_links_are_exactly_the_five_packages(cline_root)
+
+
+def test_a_lock_left_by_the_old_mkdir_lock_does_not_wedge_the_new_one(tmp_path: Path):
+    """The migration case: the previous lock was a DIRECTORY, and a killed run leaves it behind.
+
+    This is not hypothetical — it is what happens on a machine that ran the old script and was
+    interrupted (a cancelled build, a CI job at its timeout). The new lock is a FILE, so it can never
+    acquire a path an empty directory occupies, and without the explicit cleanup it would spin to the
+    30-second timeout and then exit 1. That failure mode is DISTINCT from the one this change fixes
+    and is asserted separately so it cannot be confused with it.
+    """
+    cline_root = _postbuild_workspace(tmp_path)
+    stale = cline_root / "node_modules" / ".cline-postbuild.lock"
+    stale.parent.mkdir(parents=True)
+    stale.mkdir()
+
+    started = time.monotonic()
+    completed = subprocess.run(
+        ["bash", str(cline_root / "algenta" / "postbuild.sh")],
+        cwd=cline_root,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    # The point is that it did not wait out the lock timeout.
+    assert elapsed < 20, f"blocked for {elapsed:.1f}s: the stale directory was not cleared"
+    assert not stale.exists(), "the lock must not be left behind after a successful run"
+    _assert_links_are_exactly_the_five_packages(cline_root)
 
 
 def test_setuptools_includes_runtime_package():
