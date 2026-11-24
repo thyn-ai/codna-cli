@@ -34,7 +34,7 @@ langgraph==1.2.24
 langgraph-checkpoint==4.3.1
 langgraph-sdk==0.4.14
 langgraph-prebuilt==1.1.3
-langchain-core==1.7.0
+langchain-core==1.8.4
 
 # OIDC verification is part of the durable Run API, so PyJWT is a direct runtime dependency rather
 # than a test-only install. Keep the implementation we exercise pinned with the rest of the stack.

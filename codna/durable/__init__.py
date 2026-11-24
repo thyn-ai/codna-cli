@@ -92,7 +92,7 @@ DURABLE_PINS: Final[tuple[Requirement, ...]] = (
     Requirement(
         distribution="langchain-core",
         module="langchain_core",
-        pin="1.7.0",
+        pin="1.8.4",
         minimum=(1,),
         maximum=(2,),
     ),
