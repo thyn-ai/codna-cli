@@ -30,10 +30,10 @@ temporalio==1.35.0
 # vendored). Requiring it there would refuse a combination the extra still declares as supported. The
 # test suite asserts this pin instead, the same way it asserts `pyjwt`'s.
 temporalio-langgraph==0.1.0
-langgraph==1.2.20
+langgraph==1.2.24
 langgraph-checkpoint==4.3.1
 langgraph-sdk==0.4.14
-langgraph-prebuilt==1.1.1
+langgraph-prebuilt==1.1.3
 langchain-core==1.7.0
 
 # OIDC verification is part of the durable Run API, so PyJWT is a direct runtime dependency rather
