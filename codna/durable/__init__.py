@@ -92,7 +92,7 @@ DURABLE_PINS: Final[tuple[Requirement, ...]] = (
     Requirement(
         distribution="langchain-core",
         module="langchain_core",
-        pin="1.7.0",
+        pin="1.8.4",
         minimum=(1,),
         maximum=(2,),
     ),
@@ -105,8 +105,8 @@ DURABLE_PINS: Final[tuple[Requirement, ...]] = (
     ),
 )
 
-# The plugin itself. It IS the Public-Preview surface — the code that decides how a graph node
-# becomes a Temporal activity, and therefore the workflow's history semantics.
+# The plugin itself. It decides how a graph node becomes a Temporal activity, and therefore the
+# workflow's history semantics.
 #
 # Up to ``temporalio`` 1.34 the plugin was code INSIDE the ``temporalio`` distribution, so pinning
 # ``temporalio`` pinned it and there was nothing else to check. From 1.35 it is a separately
@@ -122,12 +122,12 @@ PLUGIN_DISTRIBUTION: Final = "temporalio-langgraph"
 # 1.34 install it is absent and the ``temporalio`` pin above is what guards the plugin. Where it IS
 # present it is the highest-risk surface in the stack, so it is range-checked like the rest.
 #
-# ``>=0.1,<0.2``: a 0.x minor is allowed to break, so moving off 0.1 must be a deliberate, tested
+# ``>=1.0,<2``: a major version is allowed to break, so moving off 1.x must be a deliberate, tested
 # bump rather than something a resolver can do unnoticed.
-PLUGIN_PIN: Final = "0.1.0"
-PLUGIN_RANGE: Final = ">=0.1,<0.2"
-PLUGIN_MINIMUM: Final[tuple[int, ...]] = (0, 1)
-PLUGIN_MAXIMUM: Final[tuple[int, ...]] = (0, 2)
+PLUGIN_PIN: Final = "1.0.0"
+PLUGIN_RANGE: Final = ">=1.0,<2"
+PLUGIN_MINIMUM: Final[tuple[int, ...]] = (1, 0)
+PLUGIN_MAXIMUM: Final[tuple[int, ...]] = (2,)
 
 
 def _plugin_accepts(version: tuple[tuple[int, ...], bool]) -> bool:
@@ -137,7 +137,7 @@ def _plugin_accepts(version: tuple[tuple[int, ...], bool]) -> bool:
     ``Requirement`` of its own — see ``PLUGIN_DISTRIBUTION`` for why it is not in ``DURABLE_PINS``.
 
     The prerelease flag is unpacked but deliberately not special-cased: a prerelease is in-window
-    iff its release component is, so ``0.1.0b1`` is accepted and ``0.2.0a1`` is not (asserted by
+    iff its release component is, so ``1.0.0b1`` is accepted and ``2.0.0a1`` is not (asserted by
     the window matrix). Unpacking keeps this structurally identical to ``Requirement.accepts`` and
     makes a malformed version tuple a ``ValueError`` here rather than a silently wrong comparison.
     """

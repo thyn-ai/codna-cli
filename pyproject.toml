@@ -100,7 +100,7 @@ memory-rerank = [
 # task graph, and PyJWT verifies OIDC tokens for the Run API. Kept OUT of the base install — the
 # stack is ~40 MB, pulls a workflow sandbox, and a plain `pip install codna` never runs a durable
 # workflow. `codna.durable.require_durable()` fails fast with this extra's install hint.
-# `temporalio[langgraph]` carries the Public-Preview plugin, which is why it is pinned by range here
+# `temporalio[langgraph]` carries the replay-sensitive plugin, which is why it is pinned by range here
 # and by exact version in cli/constraints-durable.txt.
 durable = [
   "temporalio[langgraph]>=1.34,<2",
