@@ -2,6 +2,8 @@
 
 <!-- mcp-name: io.github.thyn-ai/codna -->
 
+[![thyn-ai/codna-cli MCP server](https://glama.ai/mcp/servers/thyn-ai/codna-cli/badges/score.svg)](https://glama.ai/mcp/servers/thyn-ai/codna-cli)
+
 **Understand. Fix. Evolve.**
 
 Agents read your code. Codna understands it.
