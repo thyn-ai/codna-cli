@@ -16,7 +16,7 @@
 # LangGraph's checkpoint package is pinned and explicitly ranged too:
 # `interrupt()`/`Command(resume=...)` semantics live there, and `InMemorySaver` is mandatory inside
 # a workflow (D2.0 spike finding 3).
-temporalio==1.35.0
+temporalio==1.36.1
 # The LangGraph plugin is no longer code INSIDE `temporalio`: 1.35 moved every integration into
 # separately versioned distributions under `temporalio/ai-integrations`, so the `temporalio[langgraph]`
 # extra now installs `temporalio-langgraph` instead of vendoring the plugin. `temporalio.contrib.langgraph`
