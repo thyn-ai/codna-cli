@@ -78,7 +78,7 @@ DURABLE_PINS: Final[tuple[Requirement, ...]] = (
     Requirement(
         distribution="temporalio",
         module="temporalio",
-        pin="1.35.0",
+        pin="1.36.1",
         minimum=(1, 34),
         maximum=(2,),
     ),
