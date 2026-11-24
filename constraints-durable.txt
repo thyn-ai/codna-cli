@@ -6,12 +6,12 @@
 #
 #     pip install -e 'cli[durable]' -c cli/constraints-durable.txt
 #
-# Why exact pins for a Public-Preview surface: `temporalio.contrib.langgraph` is experimental, and
-# its behaviour IS the workflow's history semantics. A minor bump can change how a node is mapped to
-# an activity, which turns an in-flight run into a replay failure that only appears on a worker
-# restart — the exact class of bug a durable system must never have. `codna.durable.require_durable`
-# refuses a version outside the extra's window; `tests/durable/test_durable_extra.py` asserts these
-# pins are the ones the module expects, so a bump here without a code change fails the suite.
+# Why exact pins for this replay-sensitive surface: `temporalio.contrib.langgraph` defines the
+# workflow's history semantics. A minor bump can change how a node is mapped to an activity, which
+# turns an in-flight run into a replay failure that only appears on a worker restart — the exact
+# class of bug a durable system must never have. `codna.durable.require_durable` refuses a version
+# outside the extra's window; `tests/durable/test_durable_extra.py` asserts these pins are the ones
+# the module expects, so a bump here without a code change fails the suite.
 #
 # LangGraph's checkpoint package is pinned and explicitly ranged too:
 # `interrupt()`/`Command(resume=...)` semantics live there, and `InMemorySaver` is mandatory inside
@@ -21,20 +21,21 @@ temporalio==1.36.1
 # separately versioned distributions under `temporalio/ai-integrations`, so the `temporalio[langgraph]`
 # extra now installs `temporalio-langgraph` instead of vendoring the plugin. `temporalio.contrib.langgraph`
 # still imports — it forwards to `temporalio.langgraph` — so codna's import path is unchanged, but the code
-# that decides how a node maps to an activity now lives in a 0.x package with its own release cadence.
-# That is exactly the surface this file exists to hold still: left to resolve, a 0.x minor could change the
-# mapping and replay-break an in-flight run. Pinned for the same reason as everything else here.
+# that decides how a node maps to an activity now lives in a separately versioned package with its own
+# release cadence. That is exactly the surface this file exists to hold still: left to resolve, a plugin
+# update could change the mapping and replay-break an in-flight run. Pinned for the same reason as
+# everything else here.
 #
 # NOT added to `DURABLE_PINS`: that tuple is the version GATE `require_durable()` enforces, and its
 # `temporalio>=1.34` window still admits 1.34, where this distribution does not exist (the plugin was
 # vendored). Requiring it there would refuse a combination the extra still declares as supported. The
 # test suite asserts this pin instead, the same way it asserts `pyjwt`'s.
-temporalio-langgraph==0.1.0
+temporalio-langgraph==1.0.0
 langgraph==1.2.24
 langgraph-checkpoint==4.3.1
 langgraph-sdk==0.4.14
 langgraph-prebuilt==1.1.3
-langchain-core==1.7.0
+langchain-core==1.8.4
 
 # OIDC verification is part of the durable Run API, so PyJWT is a direct runtime dependency rather
 # than a test-only install. Keep the implementation we exercise pinned with the rest of the stack.
